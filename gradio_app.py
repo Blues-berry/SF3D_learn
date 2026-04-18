@@ -32,6 +32,14 @@ intrinsic, intrinsic_normed_cond = sf3d_utils.create_intrinsic_from_fov_deg(
 )
 
 generated_files = []
+GRADIO_SERVER_NAME = os.environ.get("SF3D_GRADIO_SERVER_NAME", "127.0.0.1")
+GRADIO_SERVER_PORT = int(os.environ.get("SF3D_GRADIO_SERVER_PORT", "7860"))
+GRADIO_SHARE = os.environ.get("SF3D_GRADIO_SHARE", "0").lower() in {"1", "true", "yes"}
+MODEL_PATH = (
+    "/home/ubuntu/ssd_work/models/sf3d_hf"
+    if os.path.exists("/home/ubuntu/ssd_work/models/sf3d_hf")
+    else "stabilityai/stable-fast-3d"
+)
 
 # Delete previous gradio temp dir folder
 if os.path.exists(os.environ["GRADIO_TEMP_DIR"]):
@@ -43,7 +51,7 @@ if os.path.exists(os.environ["GRADIO_TEMP_DIR"]):
 device = sf3d_utils.get_device()
 
 model = SF3D.from_pretrained(
-    "stabilityai/stable-fast-3d",
+    MODEL_PATH,
     config_name="config.yaml",
     weight_name="model.safetensors",
 )
@@ -366,4 +374,8 @@ with gr.Blocks() as demo:
         ],
     )
 
-demo.queue().launch(share=False)
+demo.queue().launch(
+    server_name=GRADIO_SERVER_NAME,
+    server_port=GRADIO_SERVER_PORT,
+    share=GRADIO_SHARE,
+)

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -8,16 +11,11 @@ import sys
 
 import numpy as np
 import requests
-import torch
 from PIL import Image, ImageDraw, ImageFilter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from sf3d.system import SF3D
-from abo_material_visualize import generate_visualizations
-
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "abo_material_probe"
 DEFAULT_MODEL_PATH = (
@@ -33,36 +31,42 @@ OBJECTS = [
     {
         "id": "B073P3562J",
         "label": "lamp_metal_glass",
+        "category": "lamp",
         "name": "Rivet Lux Bendable Arm Marble and Brass Table Desk Lamp",
         "path": "J/B073P3562J.glb",
     },
     {
         "id": "B07MF1SRH5",
         "label": "ceramic_stool",
+        "category": "stool",
         "name": "Ravenna Home Damask Ceramic Garden Stool",
         "path": "5/B07MF1SRH5.glb",
     },
     {
         "id": "B07L8DQQ4Q",
         "label": "leather_metal_stool",
+        "category": "stool",
         "name": "Phoenix Home Lotusville Vintage PU Leather Counter Stool",
         "path": "Q/B07L8DQQ4Q.glb",
     },
     {
         "id": "B07B8NW6GG",
         "label": "wood_iron_mirror",
+        "category": "mirror",
         "name": "Stone & Beam Rustic Farmhouse Wood Iron Mirror",
         "path": "G/B07B8NW6GG.glb",
     },
     {
         "id": "B07QX2BYDH",
         "label": "metal_desk",
+        "category": "desk",
         "name": "AmazonBasics Gaming Computer Desk",
         "path": "H/B07QX2BYDH.glb",
     },
     {
         "id": "B0764W75LL",
         "label": "faux_linen_headboard",
+        "category": "headboard",
         "name": "AmazonBasics Faux Linen Tufted Headboard",
         "path": "L/B0764W75LL.glb",
     },
@@ -97,13 +101,25 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--object-manifest", type=Path, default=None)
     parser.add_argument("--blender-bin", type=Path, default=DEFAULT_BLENDER_BIN)
     parser.add_argument("--pretrained-model", type=str, default=str(DEFAULT_MODEL_PATH))
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--cuda-device-index",
+        type=str,
+        default="1",
+        help="Physical CUDA device index to isolate for Blender/SF3D work.",
+    )
     parser.add_argument("--render-resolution", type=int, default=512)
     parser.add_argument("--cycles-samples", type=int, default=32)
     parser.add_argument("--texture-resolution", type=int, default=512)
-    parser.add_argument("--max-objects", type=int, default=len(OBJECTS))
+    parser.add_argument(
+        "--max-objects",
+        type=int,
+        default=None,
+        help="Maximum objects to process. Defaults to all manifest rows, or all built-in samples when no manifest is provided.",
+    )
     parser.add_argument("--skip-render", action="store_true")
     parser.add_argument("--skip-inference", action="store_true")
     parser.add_argument("--skip-visualize", action="store_true")
@@ -116,7 +132,31 @@ def ensure_dir(path: Path):
     return path
 
 
+def load_objects(manifest_path: Path | None) -> list[dict]:
+    if manifest_path is None:
+        return OBJECTS
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing object manifest: {manifest_path}")
+    if manifest_path.suffix.lower() == ".json":
+        data = json.loads(manifest_path.read_text())
+        if not isinstance(data, list):
+            raise RuntimeError("Object manifest JSON must be a list")
+        return data
+    if manifest_path.suffix.lower() == ".csv":
+        with manifest_path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    raise RuntimeError(f"Unsupported object manifest format: {manifest_path}")
+
+
 def download_glb(obj: dict, cache_dir: Path) -> Path:
+    local_keys = ["local_path", "source_model_path", "object_path"]
+    for key in local_keys:
+        local_path = obj.get(key)
+        if local_path:
+            local_path = Path(local_path)
+            if local_path.exists():
+                return local_path
+
     out_path = cache_dir / f"{obj['id']}.glb"
     if out_path.exists():
         return out_path
@@ -136,6 +176,7 @@ def run_blender_render(
     object_out_dir: Path,
     resolution: int,
     cycles_samples: int,
+    cuda_device_index: str,
 ):
     views_json = object_out_dir / "views.json"
     views_json.write_text(json.dumps(VIEWS, indent=2))
@@ -158,11 +199,16 @@ def run_blender_render(
         str(cycles_samples),
     ]
     env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "1")
+    env["CUDA_VISIBLE_DEVICES"] = cuda_device_index
+    # Once a single device is made visible, Blender should use device index 0 internally.
+    env["BLENDER_CUDA_DEVICE_INDEX"] = "0"
     subprocess.run(cmd, check=True, env=env)
 
 
 def load_sf3d(pretrained_model: str, device: str):
+    import torch
+    from sf3d.system import SF3D
+
     model = SF3D.from_pretrained(
         pretrained_model,
         config_name="config.yaml",
@@ -182,6 +228,7 @@ def infer_sf3d(
     mesh_out_path: Path | None,
     texture_resolution: int,
 ):
+    import torch
     image = Image.open(image_path).convert("RGBA")
     with torch.no_grad():
         context = (
@@ -255,15 +302,14 @@ def categorize_case(row: dict):
 
     if row["gt_metallic_mean"] < 0.15 and row["pred_metallic"] > 0.35:
         tags.append("metal_nonmetal_confusion")
-    elif row["gt_metallic_mean"] > 0.55 and row["pred_metallic"] < 0.25:
+    elif row["gt_metallic_mean"] > 0.20 and row["pred_metallic"] < 0.08:
         tags.append("metal_nonmetal_confusion")
 
-    if (
-        row["highlight_fraction"] > 0.015
-        and row["gt_metallic_mean"] < 0.2
-        and (row["pred_metallic"] - row["gt_metallic_mean"] > 0.15 or row["pred_roughness"] + 0.15 < row["gt_roughness_mean"])
-    ):
-        tags.append("highlight_misread")
+    if row["brightness_p99"] > 0.82 and row["gt_metallic_mean"] < 0.30:
+        rough_error = abs(row["pred_roughness"] - row["gt_roughness_mean"])
+        metal_error = abs(row["pred_metallic"] - row["gt_metallic_mean"])
+        if rough_error > 0.12 or metal_error > 0.12:
+            tags.append("highlight_misread")
 
     metallic_edge_gap = abs(row["gt_metallic_edge_mean"] - row["gt_metallic_interior_mean"])
     roughness_edge_gap = abs(row["gt_roughness_edge_mean"] - row["gt_roughness_interior_mean"])
@@ -371,7 +417,11 @@ def main():
     sf3d_dir = ensure_dir(output_dir / "sf3d")
     rows = []
 
-    selected_objects = OBJECTS[: args.max_objects]
+    objects = load_objects(args.object_manifest)
+    if args.max_objects is None:
+        selected_objects = list(objects)
+    else:
+        selected_objects = list(objects[: args.max_objects])
     for obj in selected_objects:
         object_dir = ensure_dir(render_dir / obj["id"])
         glb_path = download_glb(obj, cache_dir)
@@ -382,11 +432,14 @@ def main():
                 object_dir,
                 resolution=args.render_resolution,
                 cycles_samples=args.cycles_samples,
+                cuda_device_index=args.cuda_device_index,
             )
 
     model = None
     device = args.device
     if not args.skip_inference:
+        if device.startswith("cuda"):
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_device_index
         model, device = load_sf3d(args.pretrained_model, args.device)
 
     for obj in selected_objects:
@@ -404,10 +457,11 @@ def main():
                 "object_id": obj["id"],
                 "object_label": obj["label"],
                 "object_name": obj["name"],
+                "category": obj.get("category", "other"),
                 "view_name": view["name"],
-                "rgba_path": str(rgba_path),
-                "roughness_path": str(roughness_path),
-                "metallic_path": str(metallic_path),
+                "rgba_path": str(rgba_path.resolve()),
+                "roughness_path": str(roughness_path.resolve()),
+                "metallic_path": str(metallic_path.resolve()),
                 "gt_roughness_mean": gt_rough["mean"],
                 "gt_roughness_std": gt_rough["std"],
                 "gt_roughness_p10": gt_rough["p10"],
@@ -456,6 +510,8 @@ def main():
 
     viz_outputs = None
     if not args.skip_visualize:
+        from abo_material_visualize import generate_visualizations
+
         viz_outputs = generate_visualizations(rows_path, output_dir)
 
     print(f"Wrote {len(rows)} rows to {rows_path}")

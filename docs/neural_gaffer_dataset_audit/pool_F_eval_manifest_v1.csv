@@ -1,0 +1,3 @@
+pool_name,source_name,license_bucket,download_status,planned_use,notes
+pool_F_real_world_eval_holdout,Stanford-ORB,benchmark_project_terms_unstated,not_started,real_world_eval_holdout,benchmark-only until terms are reviewed
+pool_F_real_world_eval_holdout,OmniObject3D,portal_terms_plus_dataset_specific,portal_login_likely_required,real_world_eval_holdout,real capture complement; keep separate from train release packages

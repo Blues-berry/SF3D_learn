@@ -96,15 +96,25 @@ def configure_render(engine: str, resolution: int, cycles_samples: int):
     prefs = bpy.context.preferences.addons["cycles"].preferences
     prefs.get_devices()
     prefs.compute_device_type = "CUDA"
-    for device in prefs.devices:
-        device.use = True
+    requested_index = os.environ.get("BLENDER_CUDA_DEVICE_INDEX")
+    for idx, device in enumerate(prefs.devices):
+        if requested_index is None:
+            device.use = True
+        else:
+            device.use = str(idx) == requested_index
 
 
 def load_object(path: str):
     if path.endswith(".glb") or path.endswith(".gltf"):
         bpy.ops.import_scene.gltf(filepath=path, merge_vertices=True)
-    else:
-        raise ValueError(f"Unsupported object path: {path}")
+        return
+    if path.endswith(".obj"):
+        bpy.ops.import_scene.obj(filepath=path)
+        return
+    if path.endswith(".fbx"):
+        bpy.ops.import_scene.fbx(filepath=path)
+        return
+    raise ValueError(f"Unsupported object path: {path}")
 
 
 def normalize_scene():
