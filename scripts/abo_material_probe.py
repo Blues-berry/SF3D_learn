@@ -5,9 +5,9 @@ import csv
 import json
 import os
 import subprocess
+import sys
 from contextlib import nullcontext
 from pathlib import Path
-import sys
 
 import numpy as np
 import requests
@@ -108,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--cuda-device-index",
         type=str,
-        default="1",
+        default="0",
         help="Physical CUDA device index to isolate for Blender/SF3D work.",
     )
     parser.add_argument("--render-resolution", type=int, default=512)
@@ -207,6 +207,7 @@ def run_blender_render(
 
 def load_sf3d(pretrained_model: str, device: str):
     import torch
+
     from sf3d.system import SF3D
 
     model = SF3D.from_pretrained(
@@ -222,7 +223,7 @@ def load_sf3d(pretrained_model: str, device: str):
 
 
 def infer_sf3d(
-    model: SF3D,
+    model,
     device: str,
     image_path: Path,
     mesh_out_path: Path | None,

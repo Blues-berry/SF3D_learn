@@ -11,7 +11,6 @@ import numpy as np
 import requests
 from PIL import Image, ImageFilter
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "abo_rm_mini"
 DEFAULT_BLENDER_BIN = Path(
@@ -62,6 +61,12 @@ def parse_args():
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--object-manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
     parser.add_argument("--blender-bin", type=Path, default=DEFAULT_BLENDER_BIN)
+    parser.add_argument(
+        "--cuda-device-index",
+        type=str,
+        default="0",
+        help="Physical CUDA device index to isolate for Blender rendering.",
+    )
     parser.add_argument("--render-resolution", type=int, default=512)
     parser.add_argument("--cycles-samples", type=int, default=32)
     parser.add_argument("--max-objects", type=int, default=200)
@@ -199,6 +204,7 @@ def run_blender_render(
     resolution: int,
     cycles_samples: int,
     *,
+    cuda_device_index: str,
     allow_env_proxy: bool,
 ):
     views_json = object_out_dir / "views.json"
@@ -222,7 +228,8 @@ def run_blender_render(
         str(cycles_samples),
     ]
     env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "1")
+    env["CUDA_VISIBLE_DEVICES"] = cuda_device_index
+    env["BLENDER_CUDA_DEVICE_INDEX"] = "0"
     env = scrub_proxy_env(env, allow_env_proxy=allow_env_proxy)
     subprocess.run(cmd, check=True, env=env)
 
@@ -354,6 +361,7 @@ def main():
                     object_dir,
                     resolution=args.render_resolution,
                     cycles_samples=args.cycles_samples,
+                    cuda_device_index=args.cuda_device_index,
                     allow_env_proxy=args.allow_env_proxy,
                 )
 

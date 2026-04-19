@@ -1,12 +1,14 @@
 import argparse
 import os
 from contextlib import nullcontext
+from pathlib import Path
 
 import rembg
 import torch
 from PIL import Image
 from tqdm import tqdm
 
+from sf3d.material_refine import MaterialRefinementPipeline
 from sf3d.system import SF3D
 from sf3d.utils import get_device, remove_background, resize_foreground
 
@@ -60,6 +62,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", default=1, type=int, help="Batch size for inference"
     )
+    parser.add_argument(
+        "--cuda-device-index",
+        default=1,
+        type=int,
+        help="Physical CUDA device index to use when CUDA is enabled. Default: 1",
+    )
+    parser.add_argument(
+        "--material-refiner-checkpoint",
+        default=None,
+        type=str,
+        help="Optional checkpoint path for the UV roughness/metallic material refiner.",
+    )
+    parser.add_argument(
+        "--material-refiner-atlas-size",
+        default=None,
+        type=int,
+        help="Optional atlas size override for material refinement. Defaults to texture resolution.",
+    )
     args = parser.parse_args()
 
     # Ensure args.device contains cuda
@@ -73,6 +93,8 @@ if __name__ == "__main__":
     device = args.device
     if not (torch.cuda.is_available() or torch.backends.mps.is_available()):
         device = "cpu"
+    elif device == "cuda":
+        torch.cuda.set_device(args.cuda_device_index)
 
     print("Device used: ", device)
 
@@ -83,6 +105,14 @@ if __name__ == "__main__":
     )
     model.to(device)
     model.eval()
+
+    material_refiner = None
+    if args.material_refiner_checkpoint:
+        material_refiner = MaterialRefinementPipeline.from_checkpoint(
+            args.material_refiner_checkpoint,
+            device=device,
+            cuda_device_index=args.cuda_device_index,
+        )
 
     rembg_session = rembg.new_session()
     images = []
@@ -135,7 +165,31 @@ if __name__ == "__main__":
         if len(image) == 1:
             out_mesh_path = os.path.join(output_dir, str(i), "mesh.glb")
             mesh.export(out_mesh_path, include_normals=True)
+            if material_refiner is not None:
+                refine_dir = Path(output_dir) / str(i) / "material_refine"
+                refined = material_refiner.refine_mesh(
+                    mesh,
+                    atlas_size=args.material_refiner_atlas_size
+                    or args.texture_resolution,
+                    output_dir=refine_dir,
+                )
+                refined["mesh"].export(
+                    os.path.join(output_dir, str(i), "mesh_refined.glb"),
+                    include_normals=True,
+                )
         else:
             for j in range(len(mesh)):
                 out_mesh_path = os.path.join(output_dir, str(i + j), "mesh.glb")
                 mesh[j].export(out_mesh_path, include_normals=True)
+                if material_refiner is not None:
+                    refine_dir = Path(output_dir) / str(i + j) / "material_refine"
+                    refined = material_refiner.refine_mesh(
+                        mesh[j],
+                        atlas_size=args.material_refiner_atlas_size
+                        or args.texture_resolution,
+                        output_dir=refine_dir,
+                    )
+                    refined["mesh"].export(
+                        os.path.join(output_dir, str(i + j), "mesh_refined.glb"),
+                        include_normals=True,
+                    )

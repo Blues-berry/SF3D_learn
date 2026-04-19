@@ -1,0 +1,17 @@
+# Round1 GPU0 eval preset. Supply --checkpoint when launching.
+
+manifest: output/material_refine_pipeline_20260418T091559Z/round1_splits/test_manifest.json
+output_dir: output/material_refine_pipeline_20260418T091559Z/eval_round1_gpu0_test
+split: all
+split_strategy: manifest
+batch_size: 2
+num_workers: 4
+cuda_device_index: 0
+
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine
+tracker_run_name: material-refine-round1-gpu0-test
+tracker_group: material-refine-round1
+tracker_tags: material-refine,sf3d,round1,gpu0,test
+wandb_mode: online
+wandb_log_artifacts: true

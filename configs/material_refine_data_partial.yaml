@@ -1,0 +1,20 @@
+# Dataset-side config for the current incrementally growing canonical manifest.
+
+manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_partial.json
+train_manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_partial.json
+val_manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_partial.json
+freeze_val_manifest_to: output/material_refine_pipeline_20260418T091559Z/prepared/full/frozen_val_manifest.json
+
+train_split: train
+val_split: val
+split_strategy: auto
+hash_val_ratio: 0.1
+hash_test_ratio: 0.1
+reload_manifest_every: 1
+allow_empty_val: true
+
+atlas_size: 512
+buffer_resolution: 256
+train_balance_mode: source_x_prior
+train_balance_power: 1.0
+train_samples_per_epoch: 0

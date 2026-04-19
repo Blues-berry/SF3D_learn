@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
@@ -8,7 +9,6 @@ import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-
 
 PROJECT_ROOT = Path("/home/ubuntu/ssd_work/projects/stable-fast-3d")
 DOCS_ROOT = PROJECT_ROOT / "docs" / "neural_gaffer_dataset_audit"
@@ -22,15 +22,36 @@ BLENDER_SCRIPT = PROJECT_ROOT / "scripts" / "blender_model_signal_audit.py"
 AUDITOR = "blender_obj_signal_audit_v1"
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-csv", type=Path, default=INPUT_CSV)
+    parser.add_argument("--output-csv", type=Path, default=OUTPUT_CSV)
+    parser.add_argument("--summary-md", type=Path, default=SUMMARY_MD)
+    parser.add_argument("--blender-bin", type=Path, default=BLENDER_BIN)
+    parser.add_argument(
+        "--cuda-device-index",
+        type=str,
+        default="0",
+        help="Physical CUDA device index to isolate for Blender probe work.",
+    )
+    return parser.parse_args()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def run_blender_probe(object_path: Path, scratch_dir: Path) -> dict:
+def run_blender_probe(
+    object_path: Path,
+    scratch_dir: Path,
+    *,
+    blender_bin: Path,
+    cuda_device_index: str,
+) -> dict:
     scratch_dir.mkdir(parents=True, exist_ok=True)
     output_json = scratch_dir / f"{object_path.parent.name}.json"
     cmd = [
-        str(BLENDER_BIN),
+        str(blender_bin),
         "-b",
         "-P",
         str(BLENDER_SCRIPT),
@@ -41,7 +62,8 @@ def run_blender_probe(object_path: Path, scratch_dir: Path) -> dict:
         str(output_json),
     ]
     env = dict(os.environ)
-    env.setdefault("CUDA_VISIBLE_DEVICES", "1")
+    env["CUDA_VISIBLE_DEVICES"] = cuda_device_index
+    env["BLENDER_CUDA_DEVICE_INDEX"] = "0"
     subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return json.loads(output_json.read_text())
 
@@ -63,7 +85,8 @@ def classify(probe: dict) -> tuple[str, str, str]:
 
 
 def main():
-    rows = list(csv.DictReader(INPUT_CSV.open(newline="", encoding="utf-8")))
+    args = parse_args()
+    rows = list(csv.DictReader(args.input_csv.open(newline="", encoding="utf-8")))
     if not rows:
         raise RuntimeError("empty_input_csv")
     scratch_dir = OUTPUT_ROOT / "tmp_pool_a_3dfuture_audit"
@@ -98,7 +121,12 @@ def main():
             output_rows.append(row)
             continue
 
-        probe = run_blender_probe(object_path, scratch_dir)
+        probe = run_blender_probe(
+            object_path,
+            scratch_dir,
+            blender_bin=args.blender_bin,
+            cuda_device_index=args.cuda_device_index,
+        )
         audit_status, reject_reason, note = classify(probe)
         row.update(
             {
@@ -124,7 +152,7 @@ def main():
         output_rows.append(row)
 
     fieldnames = list(output_rows[0].keys())
-    with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as handle:
+    with args.output_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(output_rows)
@@ -152,9 +180,9 @@ def main():
             "",
         ]
     )
-    SUMMARY_MD.write_text("\n".join(lines), encoding="utf-8")
-    print(f"wrote {OUTPUT_CSV}")
-    print(f"wrote {SUMMARY_MD}")
+    args.summary_md.write_text("\n".join(lines), encoding="utf-8")
+    print(f"wrote {args.output_csv}")
+    print(f"wrote {args.summary_md}")
 
 
 if __name__ == "__main__":

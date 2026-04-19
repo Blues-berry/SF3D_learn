@@ -1,0 +1,20 @@
+# Material refinement evaluation config
+
+manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_partial.json
+split: val
+split_strategy: auto
+hash_val_ratio: 0.1
+hash_test_ratio: 0.1
+batch_size: 1
+num_workers: 2
+cuda_device_index: 1
+max_samples: 64
+
+output_dir: output/material_refine_eval_ng_style
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine
+tracker_group: material-refine-eval
+tracker_tags: material-refine,eval,ng-style
+wandb_mode: offline
+wandb_max_rows: 64
+wandb_log_artifacts: true

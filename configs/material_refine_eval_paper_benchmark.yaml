@@ -1,0 +1,32 @@
+# Paper benchmark evaluation preset.
+#
+# Run once per checkpoint and optionally override `--generator-ids` to create
+# per-upstream tables: sf3d, spar3d, hunyuan3d, or other canonical generators.
+
+manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json
+split: test
+split_strategy: hash
+hash_val_ratio: 0.10
+hash_test_ratio: 0.10
+
+generator_ids: null
+source_names: null
+supervision_tiers: null
+license_buckets: null
+require_prior: any
+
+batch_size: 1
+num_workers: 4
+cuda_device_index: 0
+max_samples: null
+skip_report: false
+
+output_dir: output/material_refine_paper/eval_main_test
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine
+tracker_run_name: material-refine-paper-main-test
+tracker_group: paper-stage1
+tracker_tags: material-refine,paper,benchmark,cross-generator
+wandb_mode: online
+wandb_max_rows: 256
+wandb_log_artifacts: true

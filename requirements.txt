@@ -5,7 +5,15 @@ transformers==4.42.3
 open_clip_torch==2.24.0
 trimesh==4.4.1
 numpy==1.26.4
+matplotlib==3.10.8
 huggingface-hub==0.23.4
+wandb==0.26.0
+tensorboard==2.20.0
+nvidia-ml-py==13.595.45
+orjson==3.11.8
+tqdm==4.67.3
+psutil==7.2.2
+rich==14.3.4
 rembg[gpu]==2.0.57; sys_platform != 'darwin'
 rembg==2.0.57; sys_platform == 'darwin'
 pynanoinstantmeshes==0.0.3

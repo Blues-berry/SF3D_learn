@@ -3,17 +3,97 @@ import tempfile
 import time
 from contextlib import nullcontext
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+import huggingface_hub
+
+if not hasattr(huggingface_hub, "HfFolder"):
+    class _CompatHfFolder:
+        path_token = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "huggingface",
+            "token",
+        )
+
+        @classmethod
+        def save_token(cls, token: str) -> None:
+            Path(cls.path_token).parent.mkdir(parents=True, exist_ok=True)
+            Path(cls.path_token).write_text(token, encoding="utf-8")
+
+        @classmethod
+        def get_token(cls) -> str | None:
+            token_path = Path(cls.path_token)
+            if not token_path.exists():
+                return None
+            token = token_path.read_text(encoding="utf-8").strip()
+            return token or None
+
+        @classmethod
+        def delete_token(cls) -> None:
+            token_path = Path(cls.path_token)
+            if token_path.exists():
+                token_path.unlink()
+
+    huggingface_hub.HfFolder = _CompatHfFolder
 
 import gradio as gr
 import numpy as np
 import rembg
 import torch
+from gradio_client import utils as gradio_client_utils
 from gradio_litmodel3d import LitModel3D
 from PIL import Image
+from starlette.templating import Jinja2Templates
 
 import sf3d.utils as sf3d_utils
+from sf3d.material_refine import MaterialRefinementPipeline
 from sf3d.system import SF3D
+
+_original_gradio_json_schema_to_python_type = (
+    gradio_client_utils._json_schema_to_python_type
+)
+
+
+def _compat_gradio_json_schema_to_python_type(schema: Any, defs: Any) -> str:
+    if isinstance(schema, bool):
+        return "Any" if schema else "None"
+    return _original_gradio_json_schema_to_python_type(schema, defs)
+
+
+def _compat_gradio_json_schema_public(schema: Any) -> str:
+    if isinstance(schema, bool):
+        return "Any"
+    defs = schema.get("$defs") if isinstance(schema, dict) else None
+    type_hint = _compat_gradio_json_schema_to_python_type(schema, defs)
+    return type_hint.replace(gradio_client_utils.CURRENT_FILE_DATA_FORMAT, "filepath")
+
+
+gradio_client_utils._json_schema_to_python_type = (
+    _compat_gradio_json_schema_to_python_type
+)
+gradio_client_utils.json_schema_to_python_type = _compat_gradio_json_schema_public
+
+_original_template_response = Jinja2Templates.TemplateResponse
+
+
+def _compat_template_response(self: Jinja2Templates, *args: Any, **kwargs: Any):
+    if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], dict):
+        request = args[1].get("request")
+        if request is not None:
+            return _original_template_response(
+                self,
+                request,
+                args[0],
+                args[1],
+                *args[2:],
+                **kwargs,
+            )
+    return _original_template_response(self, *args, **kwargs)
+
+
+Jinja2Templates.TemplateResponse = _compat_template_response
 
 os.environ["GRADIO_TEMP_DIR"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), "gradio")
 
@@ -35,6 +115,8 @@ generated_files = []
 GRADIO_SERVER_NAME = os.environ.get("SF3D_GRADIO_SERVER_NAME", "127.0.0.1")
 GRADIO_SERVER_PORT = int(os.environ.get("SF3D_GRADIO_SERVER_PORT", "7860"))
 GRADIO_SHARE = os.environ.get("SF3D_GRADIO_SHARE", "0").lower() in {"1", "true", "yes"}
+CUDA_DEVICE_INDEX = int(os.environ.get("SF3D_CUDA_DEVICE_INDEX", "1"))
+MATERIAL_REFINER_CHECKPOINT = os.environ.get("SF3D_MATERIAL_REFINER_CHECKPOINT")
 MODEL_PATH = (
     "/home/ubuntu/ssd_work/models/sf3d_hf"
     if os.path.exists("/home/ubuntu/ssd_work/models/sf3d_hf")
@@ -49,6 +131,8 @@ if os.path.exists(os.environ["GRADIO_TEMP_DIR"]):
     shutil.rmtree(os.environ["GRADIO_TEMP_DIR"])
 
 device = sf3d_utils.get_device()
+if device == "cuda" and torch.cuda.is_available():
+    torch.cuda.set_device(CUDA_DEVICE_INDEX)
 
 model = SF3D.from_pretrained(
     MODEL_PATH,
@@ -57,6 +141,14 @@ model = SF3D.from_pretrained(
 )
 model.eval()
 model = model.to(device)
+
+material_refiner = None
+if MATERIAL_REFINER_CHECKPOINT and os.path.exists(MATERIAL_REFINER_CHECKPOINT):
+    material_refiner = MaterialRefinementPipeline.from_checkpoint(
+        MATERIAL_REFINER_CHECKPOINT,
+        device=device,
+        cuda_device_index=CUDA_DEVICE_INDEX,
+    )
 
 example_files = [
     os.path.join("demo_files/examples", f) for f in os.listdir("demo_files/examples")
@@ -76,15 +168,40 @@ def run_model(input_image, remesh_option, vertex_count, texture_size):
             )
             trimesh_mesh = trimesh_mesh[0]
 
-    # Create new tmp file
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
+    baseline_file = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
+    trimesh_mesh.export(baseline_file.name, file_type="glb", include_normals=True)
+    generated_files.append(baseline_file.name)
 
-    trimesh_mesh.export(tmp_file.name, file_type="glb", include_normals=True)
-    generated_files.append(tmp_file.name)
+    refined_glb = None
+    atlas_gallery = []
+    if material_refiner is not None:
+        atlas_dir = Path(tempfile.mkdtemp(prefix="sf3d_material_refine_"))
+        refined = material_refiner.refine_mesh(
+            trimesh_mesh,
+            atlas_size=texture_size,
+            output_dir=atlas_dir,
+        )
+        refined_file = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
+        refined["mesh"].export(
+            refined_file.name,
+            file_type="glb",
+            include_normals=True,
+        )
+        generated_files.append(refined_file.name)
+        refined_glb = refined_file.name
+        atlas_paths = refined.get("atlas_paths") or {}
+        atlas_gallery = [
+            (str(path), name.replace("_", " ").title())
+            for name, path in atlas_paths.items()
+        ]
 
     print("Generation took:", time.time() - start, "s")
 
-    return tmp_file.name
+    return {
+        "baseline_glb": baseline_file.name,
+        "refined_glb": refined_glb,
+        "atlas_gallery": atlas_gallery,
+    }
 
 
 def create_batch(input_image: Image) -> dict[str, Any]:
@@ -151,7 +268,7 @@ def run_button(
     if run_btn == "Run":
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        glb_file: str = run_model(
+        result = run_model(
             background_state, remesh_option.lower(), vertex_count, texture_size
         )
         if torch.cuda.is_available():
@@ -166,7 +283,15 @@ def run_button(
             gr.update(),
             gr.update(),
             gr.update(),
-            gr.update(value=glb_file, visible=True),
+            gr.update(value=result["baseline_glb"], visible=True),
+            gr.update(
+                value=result["refined_glb"],
+                visible=result["refined_glb"] is not None,
+            ),
+            gr.update(
+                value=result["atlas_gallery"],
+                visible=bool(result["atlas_gallery"]),
+            ),
             gr.update(visible=True),
         )
     elif run_btn == "Remove Background":
@@ -182,6 +307,8 @@ def run_button(
             fr_res,
             gr.update(value=show_mask_img(fr_res), visible=True),
             gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
             gr.update(visible=False),
         )
 
@@ -193,6 +320,8 @@ def requires_bg_remove(image, fr):
             None,
             None,
             gr.update(value=None, visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
         )
@@ -211,12 +340,16 @@ def requires_bg_remove(image, fr):
             gr.update(value=show_mask_img(fr_res), visible=True),
             gr.update(visible=False),
             gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
         )
     return (
         gr.update(value="Remove Background", visible=True),
         None,
         None,
         gr.update(value=None, visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
         gr.update(visible=False),
         gr.update(visible=False),
     )
@@ -247,6 +380,14 @@ with gr.Blocks() as demo:
     3. You can select the remeshing option to control the mesh topology. This can introduce artifacts in the mesh on thin surfaces and should be turned off in such cases.
     4. You can upload your own HDR environment map to light the 3D model.
     """)
+    gr.Markdown(
+        "Material refinement: "
+        + (
+            f"enabled from `{MATERIAL_REFINER_CHECKPOINT}`."
+            if material_refiner is not None
+            else "disabled. Set `SF3D_MATERIAL_REFINER_CHECKPOINT` to preview refined roughness/metallic maps."
+        )
+    )
     with gr.Row(variant="panel"):
         with gr.Column():
             with gr.Row():
@@ -302,13 +443,29 @@ with gr.Blocks() as demo:
             run_btn = gr.Button("Run", variant="primary", visible=False)
 
         with gr.Column():
-            output_3d = LitModel3D(
-                label="3D Model",
+            with gr.Row():
+                output_3d = LitModel3D(
+                    label="Baseline 3D Model",
+                    visible=False,
+                    clear_color=[0.0, 0.0, 0.0, 0.0],
+                    tonemapping="aces",
+                    contrast=1.0,
+                    scale=1.0,
+                )
+                refined_output_3d = LitModel3D(
+                    label="Refined 3D Model",
+                    visible=False,
+                    clear_color=[0.0, 0.0, 0.0, 0.0],
+                    tonemapping="aces",
+                    contrast=1.0,
+                    scale=1.0,
+                )
+            atlas_gallery = gr.Gallery(
+                label="Material Atlases",
                 visible=False,
-                clear_color=[0.0, 0.0, 0.0, 0.0],
-                tonemapping="aces",
-                contrast=1.0,
-                scale=1.0,
+                columns=4,
+                object_fit="contain",
+                height="auto",
             )
             with gr.Column(visible=False, scale=1.0) as hdr_row:
                 gr.Markdown("""## HDR Environment Map
@@ -330,9 +487,12 @@ with gr.Blocks() as demo:
                     )
 
                     hdr_illumination_file.change(
-                        lambda x: gr.update(env_map=x.name if x is not None else None),
+                        lambda x: (
+                            gr.update(env_map=x.name if x is not None else None),
+                            gr.update(env_map=x.name if x is not None else None),
+                        ),
                         inputs=hdr_illumination_file,
-                        outputs=[output_3d],
+                        outputs=[output_3d, refined_output_3d],
                     )
 
     examples = gr.Examples(
@@ -349,6 +509,8 @@ with gr.Blocks() as demo:
             background_remove_state,
             preview_removal,
             output_3d,
+            refined_output_3d,
+            atlas_gallery,
             hdr_row,
         ],
     )
@@ -370,6 +532,8 @@ with gr.Blocks() as demo:
             background_remove_state,
             preview_removal,
             output_3d,
+            refined_output_3d,
+            atlas_gallery,
             hdr_row,
         ],
     )

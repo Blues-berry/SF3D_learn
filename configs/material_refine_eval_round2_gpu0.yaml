@@ -1,0 +1,24 @@
+# Round2 evaluation preset. The checkpoint can be supplied by CLI after training:
+#   --checkpoint output/.../train_round2_gpu0_gated/best.pt
+
+manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json
+split: test
+split_strategy: hash
+hash_val_ratio: 0.10
+hash_test_ratio: 0.10
+
+batch_size: 1
+num_workers: 4
+cuda_device_index: 0
+max_samples: 128
+skip_report: false
+
+output_dir: output/material_refine_pipeline_20260418T091559Z/eval_round2_gpu0_test
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine
+tracker_run_name: material-refine-round2-gpu0-test
+tracker_group: material-refine-round2
+tracker_tags: material-refine,sf3d,round2,gpu0,eval
+wandb_mode: online
+wandb_max_rows: 128
+wandb_log_artifacts: true
