@@ -241,6 +241,75 @@ def override_material_scalar(material, scalar_name: str):
     }
 
 
+def build_vector_emission_override(node_tree, vector_socket, *, remap_to_unit: bool):
+    emission = node_tree.nodes.new("ShaderNodeEmission")
+    created_nodes = [emission]
+    if remap_to_unit:
+        scale = node_tree.nodes.new("ShaderNodeVectorMath")
+        scale.operation = "SCALE"
+        scale.inputs[3].default_value = 0.5
+        bias = node_tree.nodes.new("ShaderNodeVectorMath")
+        bias.operation = "ADD"
+        bias.inputs[1].default_value = (0.5, 0.5, 0.5)
+        node_tree.links.new(vector_socket, scale.inputs[0])
+        node_tree.links.new(scale.outputs["Vector"], bias.inputs[0])
+        node_tree.links.new(bias.outputs["Vector"], emission.inputs["Color"])
+        created_nodes.extend([scale, bias])
+    else:
+        node_tree.links.new(vector_socket, emission.inputs["Color"])
+    return emission, created_nodes
+
+
+def override_material_vector(material, vector_kind: str):
+    if not material.use_nodes:
+        raise RuntimeError(f"Material {material.name} does not use nodes")
+
+    node_tree = material.node_tree
+    output = find_output_node(node_tree)
+    principled = find_principled_node(node_tree)
+    if principled is None:
+        raise RuntimeError(f"Material {material.name} has no Principled BSDF node")
+
+    surface_input = output.inputs["Surface"]
+    original_from_socket = surface_input.links[0].from_socket if surface_input.links else None
+    geometry = node_tree.nodes.new("ShaderNodeNewGeometry")
+    geometry.location = (principled.location.x + 350, principled.location.y + 120)
+    created_nodes = [geometry]
+    if vector_kind == "normal":
+        emission, extra_nodes = build_vector_emission_override(
+            node_tree,
+            geometry.outputs["Normal"],
+            remap_to_unit=True,
+        )
+    elif vector_kind == "position":
+        emission, extra_nodes = build_vector_emission_override(
+            node_tree,
+            geometry.outputs["Position"],
+            remap_to_unit=True,
+        )
+    elif vector_kind == "uv":
+        uv_map = node_tree.nodes.new("ShaderNodeUVMap")
+        uv_map.location = (principled.location.x + 350, principled.location.y + 120)
+        created_nodes.append(uv_map)
+        emission, extra_nodes = build_vector_emission_override(
+            node_tree,
+            uv_map.outputs["UV"],
+            remap_to_unit=False,
+        )
+    else:
+        raise ValueError(f"Unsupported vector override: {vector_kind}")
+    created_nodes.extend(extra_nodes)
+    while surface_input.links:
+        node_tree.links.remove(surface_input.links[0])
+    node_tree.links.new(emission.outputs["Emission"], surface_input)
+    return {
+        "material": material,
+        "output": output,
+        "original_from_socket": original_from_socket,
+        "created_nodes": created_nodes,
+    }
+
+
 def restore_material_override(state):
     material = state["material"]
     output = state["output"]
@@ -274,6 +343,25 @@ def render_scalar_pass(output_path: str, scalar_name: str):
             restore_material_override(state)
 
 
+def render_vector_pass(output_path: str, vector_kind: str):
+    states = []
+    try:
+        seen = set()
+        for obj in scene_meshes():
+            for slot in obj.material_slots:
+                material = slot.material
+                if material is None:
+                    continue
+                if material.name in seen:
+                    continue
+                seen.add(material.name)
+                states.append(override_material_vector(material, vector_kind))
+        render_to(output_path, view_transform="Raw")
+    finally:
+        for state in states:
+            restore_material_override(state)
+
+
 def main():
     args = parse_args()
     views = json.loads(Path(args.views_json).read_text())
@@ -297,7 +385,13 @@ def main():
         render_to(str(view_dir / "rgba.png"))
         render_scalar_pass(str(view_dir / "roughness.png"), "Roughness")
         render_scalar_pass(str(view_dir / "metallic.png"), "Metallic")
-        (view_dir / "view.json").write_text(json.dumps(view, indent=2))
+        render_vector_pass(str(view_dir / "normal.png"), "normal")
+        render_vector_pass(str(view_dir / "position.png"), "position")
+        render_vector_pass(str(view_dir / "uv.png"), "uv")
+        view_payload = dict(view)
+        view_payload["camera_location"] = list(camera.location)
+        view_payload["camera_rotation_euler"] = list(camera.rotation_euler)
+        (view_dir / "view.json").write_text(json.dumps(view_payload, indent=2))
 
 
 if __name__ == "__main__":

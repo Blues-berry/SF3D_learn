@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -106,11 +107,12 @@ def maybe_init_wandb(
             "W&B logging was requested but wandb is not installed. Install it with `pip install wandb`."
         )
 
+    resolved_mode = resolve_wandb_mode(mode)
     init_kwargs: dict[str, Any] = {
         "project": project,
         "job_type": job_type,
         "config": config,
-        "mode": resolve_wandb_mode(mode),
+        "mode": resolved_mode,
         "tags": parse_tag_list(tags),
     }
     if name:
@@ -122,7 +124,34 @@ def maybe_init_wandb(
         init_kwargs["resume"] = resume or "allow"
     if dir_path:
         init_kwargs["dir"] = str(Path(dir_path))
-    return wandb.init(**init_kwargs)
+    if hasattr(wandb, "Settings"):
+        init_kwargs["settings"] = wandb.Settings(
+            start_method="thread",
+            init_timeout=20.0 if resolved_mode == "online" else 90.0,
+            x_service_wait=15.0 if resolved_mode == "online" else 30.0,
+        )
+    try:
+        return wandb.init(**init_kwargs)
+    except Exception as exc:
+        if resolved_mode == "online":
+            print(
+                json.dumps(
+                    {
+                        "wandb_init_failed": f"{type(exc).__name__}: {exc}",
+                        "wandb_fallback_mode": "offline",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            init_kwargs["mode"] = "offline"
+            if hasattr(wandb, "Settings"):
+                init_kwargs["settings"] = wandb.Settings(
+                    start_method="thread",
+                    init_timeout=30.0,
+                    x_service_wait=10.0,
+                )
+            return wandb.init(**init_kwargs)
+        raise
 
 
 def log_path_artifact(

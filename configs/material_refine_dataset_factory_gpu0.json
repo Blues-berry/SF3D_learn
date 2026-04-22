@@ -1,0 +1,234 @@
+{
+  "factory_version": "sf3d_material_refine_dataset_factory_v1",
+  "notes": [
+    "Continuous dataset expansion plan for SF3D material-refine data only; no training is launched here.",
+    "GPU policy keeps GPU1 free and schedules render/preprocess work on GPU0.",
+    "Pool-A paper promotion remains gated by license/import/target-quality audits; auxiliary and benchmark pools are explicitly marked."
+  ],
+  "gpu_policy": {
+    "render_gpu_list": "0",
+    "keep_gpu_indices_empty": ["1"],
+    "max_gpu0_used_mb_for_new_launch": 4096,
+    "poll_seconds": 300
+  },
+  "download_network": {
+    "proxy_candidates": ["env", "direct"],
+    "proxy_probe_timeout_seconds": 8,
+    "default_probe_url": "https://huggingface.co/"
+  },
+  "targets": {
+    "production_total_objects": 12000,
+    "active_longrun_records": 9700,
+    "objaverse_strict_increment_target": 6000,
+    "polyhaven_hdri_min_count": 900,
+    "polyhaven_hdri_target_count": 1200,
+    "material_prior_target_count": 1000
+  },
+  "source_roles": [
+    {
+      "name": "ABO_locked_core",
+      "pool": "Pool-A",
+      "role": "paper_main_seed",
+      "manifest": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "license_policy": "locked_core_pending_reconcile",
+      "promotion_gate": "A_ready + semantic validation + non-trivial target"
+    },
+    {
+      "name": "3D-FUTURE_highlight_local_8k",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "local high-throughput no-prior object expansion",
+      "manifest": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "license_policy": "research_noncommercial_separate_bucket",
+      "promotion_gate": "license/import/target-quality gate before paper_main"
+    },
+    {
+      "name": "Objaverse-XL_cached_strict_increment",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "second-generator strict filtered object expansion",
+      "manifest": "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json",
+      "license_policy": "mixed individual licenses; filtered before render",
+      "promotion_gate": "license + import + material-probe + target gate"
+    },
+    {
+      "name": "Objaverse-XL_strict_filtered_retry",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "network-fed Objaverse increment",
+      "manifest_glob": "output/material_refine_aux_downloads/objaverse_strict*/objaverse_xl_strict_filtered_manifest.json",
+      "license_policy": "noncommercial/ND/unknown blocked",
+      "promotion_gate": "downloaded local asset + import + target gate"
+    },
+    {
+      "name": "PolyHaven_HDRI",
+      "pool": "Pool-D",
+      "role": "natural/stress lighting bank",
+      "manifest": "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri_bank.json",
+      "license_policy": "CC0",
+      "promotion_gate": "lighting only; not object supervision"
+    },
+    {
+      "name": "PolyHaven_Materials",
+      "pool": "Pool-E",
+      "role": "PBR material prior bank",
+      "manifest": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials/polyhaven_material_bank_manifest.json",
+      "license_policy": "CC0",
+      "promotion_gate": "material prior only; not object supervision"
+    },
+    {
+      "name": "OpenIllumination",
+      "pool": "Pool-B",
+      "role": "real controlled/natural lighting benchmark and calibration",
+      "manifest": "output/material_refine_real_benchmarks/openillumination_pool_b/real_benchmark_stage_manifest.json",
+      "license_policy": "benchmark sidecar; keep out of Pool-A main train",
+      "promotion_gate": "benchmark/calibration only"
+    },
+    {
+      "name": "Stanford-ORB",
+      "pool": "Pool-F",
+      "role": "real OOD benchmark",
+      "manifest": "output/material_refine_real_benchmarks/stanford_orb_pool_f/stanford_orb_benchmark_manifest.json",
+      "license_policy": "benchmark sidecar; keep out of train",
+      "promotion_gate": "final OOD evaluation only"
+    }
+  ],
+  "material_quota": {
+    "metal_dominant": 0.30,
+    "ceramic_glazed_lacquer": 0.20,
+    "glass_metal": 0.15,
+    "mixed_thin_boundary": 0.20,
+    "glossy_non_metal": 0.15
+  },
+  "longrun": {
+    "session_prefix": "sf3d_longrun_material_refine",
+    "input_manifests": [
+      "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json"
+    ],
+    "input_manifest_globs": [
+      "output/material_refine_aux_downloads/objaverse_cached_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_strict_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_strict*/canonical/material_refine_manifest_objaverse_increment.json"
+    ],
+    "paper_main_sources": "ABO_locked_core",
+    "auxiliary_sources": "",
+    "priority_material_families": "metal_dominant,glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal",
+    "paper_frontload_records": 256,
+    "prefer_paper_main_first": false,
+    "max_records": 9700,
+    "shards": 8,
+    "workers_per_gpu": 1,
+    "view_light_protocol": "production_32",
+    "max_hdri_lights": 4,
+    "hdri_selection_offset_start": 1300,
+    "hdri_selection_offset_step": 200,
+    "min_hdri_count": 900,
+    "atlas_resolution": 1024,
+    "render_resolution": 320,
+    "cycles_samples": 8,
+    "refresh_partial_every": 3,
+    "merged_monitor_poll_seconds": 90
+  },
+  "downloads": [
+    {
+      "name": "polyhaven_hdri_1200",
+      "enabled": true,
+      "session": "sf3d_factory_polyhaven_hdri",
+      "output_root": "output/highlight_pool_a_8k/aux_sources",
+      "retry_seconds": 1800,
+      "proxy_probe_url": "https://polyhaven.com/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_highlight_aux_sources.py",
+        "--output-root",
+        "output/highlight_pool_a_8k/aux_sources",
+        "--polyhaven-count",
+        "1200",
+        "--polyhaven-workers",
+        "12",
+        "--objaverse-target",
+        "0"
+      ]
+    },
+    {
+      "name": "objaverse_strict_cached_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_cached_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory",
+      "retry_seconds": 900,
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_cached_factory",
+        "--sources",
+        "sketchfab,smithsonian",
+        "--target",
+        "6000",
+        "--processes",
+        "12",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_strict_full_retry",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_strict_full_retry",
+      "output_root": "output/material_refine_aux_downloads/objaverse_strict_factory",
+      "retry_seconds": 300,
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_highlight_aux_sources.py",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_strict_factory",
+        "--skip-polyhaven",
+        "--objaverse-target",
+        "6000",
+        "--objaverse-processes",
+        "12",
+        "--objaverse-allowed-sources",
+        "sketchfab,smithsonian",
+        "--download-objaverse"
+      ]
+    },
+    {
+      "name": "polyhaven_material_bank",
+      "enabled": true,
+      "session": "sf3d_factory_polyhaven_material_bank",
+      "output_root": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory",
+      "retry_seconds": 1800,
+      "proxy_probe_url": "https://polyhaven.com/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_polyhaven_material_bank.py",
+        "--output-root",
+        "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory",
+        "--target",
+        "1000"
+      ]
+    }
+  ],
+  "canonicalize_downloads": [
+    {
+      "name": "objaverse_cached_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_cached_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory_canonical"
+    },
+    {
+      "name": "objaverse_strict_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_strict_factory/objaverse_xl_strict_filtered_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_strict_factory_canonical"
+    }
+  ],
+  "quality": {
+    "min_paper_eligible": 128,
+    "min_manifest_records_for_audit": 8,
+    "min_view_ready_rate": 0.8,
+    "min_strict_complete_rate": 0.8,
+    "quality_output_root": "output/material_refine_dataset_factory/quality"
+  }
+}

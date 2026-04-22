@@ -1,0 +1,10 @@
+--2026-04-20 03:29:36--  (try: 2)  https://huggingface.co/datasets/OpenIllumination/OpenIllumination/resolve/main/.gitattributes?download=true
+Connecting to huggingface.co (huggingface.co)|108.160.166.148|:443... failed: Connection timed out.
+Connecting to huggingface.co (huggingface.co)|2a03:2880:f130:83:face:b00c:0:25de|:443... failed: Connection timed out.
+Retrying.
+
+--2026-04-20 03:30:38--  (try: 3)  https://huggingface.co/datasets/OpenIllumination/OpenIllumination/resolve/main/.gitattributes?download=true
+Connecting to huggingface.co (huggingface.co)|108.160.166.148|:443... failed: Connection timed out.
+Connecting to huggingface.co (huggingface.co)|2a03:2880:f130:83:face:b00c:0:25de|:443... failed: Connection timed out.
+Giving up.
+

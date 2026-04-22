@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import os
 import shutil
 import struct
 import subprocess
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 from bake_material_refine_uv_targets import bake_uv_targets
@@ -20,6 +26,7 @@ from refresh_material_refine_partial_manifest import (
     build_prepared_record,
     find_missing_paths,
 )
+from sf3d.material_refine.manifest_quality import enrich_record_with_quality_fields
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_MANIFEST = REPO_ROOT / "docs" / "neural_gaffer_dataset_audit" / "material_refine_manifest_v1.json"
@@ -29,7 +36,8 @@ DEFAULT_BLENDER_BIN = Path(
     "/4T/CXY/Neural_Gaffer_original/scripts/Objavarse_rendering/blender-3.2.2-linux-x64/blender"
 )
 BLENDER_SCRIPT = REPO_ROOT / "scripts" / "abo_material_passes_blender.py"
-VIEWS = [
+DEFAULT_HDRI_BANK_JSON = REPO_ROOT / "output" / "highlight_pool_a_8k" / "aux_sources" / "polyhaven_hdri_bank.json"
+CANONICAL_TRIPLET_VIEWS = [
     {
         "name": "front_studio",
         "azimuth": 0.0,
@@ -52,6 +60,47 @@ VIEWS = [
         "hdri": str(REPO_ROOT / "demo_files" / "hdri" / "neon_photostudio_1k.hdr"),
     },
 ]
+CAMERA_PROTOCOLS = {
+    "canonical_triplet": [
+        {"label": "front_studio", "azimuth": 0.0, "elevation": 18.0, "distance": 2.0},
+        {"label": "three_quarter_indoor", "azimuth": 45.0, "elevation": 28.0, "distance": 2.0},
+        {"label": "side_neon", "azimuth": 110.0, "elevation": 16.0, "distance": 2.05},
+    ],
+    "standard_12": [
+        {"label": "front_mid", "azimuth": 0.0, "elevation": 18.0, "distance": 2.0},
+        {"label": "front_high", "azimuth": 0.0, "elevation": 34.0, "distance": 2.05},
+        {"label": "three_quarter_mid", "azimuth": 45.0, "elevation": 24.0, "distance": 2.0},
+        {"label": "side_low", "azimuth": 95.0, "elevation": 12.0, "distance": 2.05},
+        {"label": "grazing_left", "azimuth": 150.0, "elevation": 10.0, "distance": 2.25},
+        {"label": "top_oblique", "azimuth": 315.0, "elevation": 42.0, "distance": 2.15},
+    ],
+    "stress_24": [
+        {"label": "front_mid", "azimuth": 0.0, "elevation": 18.0, "distance": 2.0},
+        {"label": "front_high", "azimuth": 0.0, "elevation": 34.0, "distance": 2.05},
+        {"label": "three_quarter_mid", "azimuth": 45.0, "elevation": 24.0, "distance": 2.0},
+        {"label": "side_low", "azimuth": 95.0, "elevation": 12.0, "distance": 2.05},
+        {"label": "grazing_left", "azimuth": 150.0, "elevation": 10.0, "distance": 2.25},
+        {"label": "grazing_right", "azimuth": 230.0, "elevation": 10.0, "distance": 2.25},
+        {"label": "top_oblique", "azimuth": 315.0, "elevation": 42.0, "distance": 2.15},
+        {"label": "thin_boundary_close", "azimuth": 35.0, "elevation": 8.0, "distance": 1.55},
+    ],
+    "production_32": [
+        {"label": "front_mid", "azimuth": 0.0, "elevation": 18.0, "distance": 2.0},
+        {"label": "front_high", "azimuth": 0.0, "elevation": 34.0, "distance": 2.05},
+        {"label": "three_quarter_mid", "azimuth": 45.0, "elevation": 24.0, "distance": 2.0},
+        {"label": "side_low", "azimuth": 95.0, "elevation": 12.0, "distance": 2.05},
+        {"label": "rear_three_quarter", "azimuth": 210.0, "elevation": 22.0, "distance": 2.05},
+        {"label": "grazing_left", "azimuth": 150.0, "elevation": 10.0, "distance": 2.25},
+        {"label": "grazing_right", "azimuth": 230.0, "elevation": 10.0, "distance": 2.25},
+        {"label": "top_oblique", "azimuth": 315.0, "elevation": 42.0, "distance": 2.15},
+    ],
+}
+PROTOCOL_LIGHT_COUNTS = {
+    "canonical_triplet": 0,
+    "standard_12": 2,
+    "stress_24": 3,
+    "production_32": 4,
+}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
@@ -66,6 +115,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atlas-resolution", type=int, default=1024)
     parser.add_argument("--render-resolution", type=int, default=512)
     parser.add_argument("--cycles-samples", type=int, default=32)
+    parser.add_argument(
+        "--view-light-protocol",
+        choices=sorted(CAMERA_PROTOCOLS),
+        default="canonical_triplet",
+        help="Object-level view/light bank. Non-canonical protocols combine multiple camera poses with HDRIs.",
+    )
+    parser.add_argument("--hdri-bank-json", type=Path, default=DEFAULT_HDRI_BANK_JSON)
+    parser.add_argument(
+        "--min-hdri-count",
+        type=int,
+        default=0,
+        help="Fail early for non-canonical protocols unless the HDRI bank has at least this many local entries.",
+    )
+    parser.add_argument(
+        "--max-hdri-lights",
+        type=int,
+        default=0,
+        help="Override HDRI count per object. 0 uses the protocol default.",
+    )
+    parser.add_argument(
+        "--hdri-selection-offset",
+        type=int,
+        default=0,
+        help="Deterministic offset for object-specific HDRI selection.",
+    )
     parser.add_argument("--blender-bin", type=Path, default=DEFAULT_BLENDER_BIN)
     parser.add_argument("--abo-render-cache", type=Path, default=DEFAULT_ABO_RENDER_CACHE)
     parser.add_argument("--cuda-device-index", type=str, default="0")
@@ -94,6 +168,107 @@ def read_manifest(path: Path) -> dict:
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def stable_int(text: str) -> int:
+    return int(hashlib.sha1(text.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def sanitize_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value.lower()).strip("_")
+
+
+def load_hdri_bank(path: Path | None) -> list[dict]:
+    if path is None or not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = payload.get("records", []) if isinstance(payload, dict) else payload
+    hdri_records = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        local_path = record.get("local_path") or record.get("path")
+        if not local_path:
+            continue
+        hdri_path = Path(str(local_path))
+        if not hdri_path.is_absolute():
+            hdri_path = REPO_ROOT / hdri_path
+        if not hdri_path.exists():
+            continue
+        hdri_records.append(
+            {
+                "asset_id": str(record.get("asset_id") or hdri_path.stem),
+                "name": str(record.get("name") or record.get("asset_id") or hdri_path.stem),
+                "stratum": str(record.get("stratum") or "unknown"),
+                "license_bucket": str(record.get("license_bucket") or "unknown"),
+                "path": str(hdri_path.resolve()),
+            }
+        )
+    return sorted(hdri_records, key=lambda item: (item["stratum"], item["asset_id"]))
+
+
+def select_hdri_records(
+    *,
+    hdri_bank: list[dict],
+    object_id: str,
+    count: int,
+    offset: int,
+) -> list[dict]:
+    if count <= 0 or not hdri_bank:
+        return []
+    grouped: dict[str, list[dict]] = {}
+    for record in hdri_bank:
+        grouped.setdefault(str(record.get("stratum") or "unknown"), []).append(record)
+    strata = sorted(grouped)
+    selected: list[dict] = []
+    seed = stable_int(f"{object_id}|{offset}")
+    for idx in range(count):
+        stratum = strata[(seed + idx) % len(strata)]
+        bucket = grouped[stratum]
+        selected.append(bucket[(seed // max(idx + 1, 1) + idx) % len(bucket)])
+    return selected
+
+
+def build_views_for_record(
+    record: dict,
+    *,
+    protocol: str,
+    hdri_bank: list[dict],
+    max_hdri_lights: int,
+    hdri_selection_offset: int,
+) -> list[dict]:
+    if protocol == "canonical_triplet":
+        return [dict(view) for view in CANONICAL_TRIPLET_VIEWS]
+    cameras = CAMERA_PROTOCOLS[protocol]
+    light_count = max_hdri_lights if max_hdri_lights > 0 else PROTOCOL_LIGHT_COUNTS[protocol]
+    selected_hdris = select_hdri_records(
+        hdri_bank=hdri_bank,
+        object_id=str(record.get("object_id") or record.get("source_uid") or "unknown"),
+        count=light_count,
+        offset=hdri_selection_offset,
+    )
+    if not selected_hdris:
+        return [dict(view) for view in CANONICAL_TRIPLET_VIEWS]
+    views: list[dict] = []
+    for light_index, hdri in enumerate(selected_hdris):
+        hdri_id = sanitize_name(str(hdri["asset_id"]))
+        for camera in cameras:
+            camera_label = sanitize_name(str(camera["label"]))
+            view = {
+                "name": f"{camera_label}__{light_index:02d}_{hdri_id}",
+                "azimuth": float(camera["azimuth"]),
+                "elevation": float(camera["elevation"]),
+                "distance": float(camera["distance"]),
+                "hdri": str(hdri["path"]),
+                "camera_label": str(camera["label"]),
+                "lighting_bank_id": f"polyhaven_{protocol}_v1",
+                "lighting_asset_id": str(hdri["asset_id"]),
+                "lighting_stratum": str(hdri.get("stratum") or "unknown"),
+                "lighting_license_bucket": str(hdri.get("license_bucket") or "unknown"),
+                "view_light_protocol": protocol,
+            }
+            views.append(view)
+    return views
 
 
 def select_records(payload: dict, split: str, max_records: int | None) -> list[dict]:
@@ -140,6 +315,22 @@ def resolve_prepared_prior_fields(
     elif not has_material_prior:
         prior_mode = "none"
     return has_material_prior, prior_mode
+
+
+def should_synthesize_nontrivial_prior(record: dict) -> bool:
+    """Treat locked/qualified strong tiers as strong, not only the literal string."""
+    supervision_tier = str(record.get("supervision_tier") or "").lower()
+    supervision_role = str(record.get("supervision_role") or "").lower()
+    target_source_type = str(record.get("target_source_type") or "").lower()
+    if supervision_role == "paper_main":
+        return True
+    if supervision_tier.startswith("strong") or "a_ready" in supervision_tier:
+        return True
+    if target_source_type in {"gt_render_baked", "pseudo_from_multiview"}:
+        return True
+    if "smoke" in supervision_tier or "copy" in supervision_tier:
+        return False
+    return True
 
 
 def write_prepared_record_file(bundle_dir: Path, prepared: dict) -> None:
@@ -246,6 +437,18 @@ def write_constant_gray(path: Path, value: float, size: int) -> None:
     Image.fromarray(array, mode="L").save(path)
 
 
+def write_rgb_array(path: Path, array: np.ndarray) -> None:
+    clipped = np.clip(array, 0.0, 1.0)
+    Image.fromarray((clipped * 255.0).round().astype(np.uint8), mode="RGB").save(path)
+
+
+def load_rgb_array(path: Path, size: int) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    image = Image.open(path).convert("RGB").resize((size, size), Image.BILINEAR)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
 def load_glb_json(path: Path) -> dict | None:
     if path.suffix.lower() != ".glb" or not path.exists():
         return None
@@ -325,14 +528,21 @@ def copy_or_placeholder(
         raise ValueError(f"unsupported_fallback_kind:{fallback_kind}")
 
 
-def render_bundle_complete(buffer_root: Path) -> bool:
+def render_bundle_complete(buffer_root: Path, views: list[dict]) -> bool:
     if not buffer_root.exists():
         return False
-    for view in VIEWS:
+    for view in views:
         view_dir = buffer_root / view["name"]
         if not view_dir.is_dir():
             return False
-        for name in ("rgba.png", "roughness.png", "metallic.png"):
+        for name in (
+            "rgba.png",
+            "normal.png",
+            "position.png",
+            "uv.png",
+            "roughness.png",
+            "metallic.png",
+        ):
             if not (view_dir / name).exists():
                 return False
     return True
@@ -351,6 +561,7 @@ def resolve_cached_render_root(
     record: dict,
     source_model_path: Path,
     abo_render_cache: Path | None,
+    views: list[dict],
 ) -> Path | None:
     if abo_render_cache is None or not abo_render_cache.exists():
         return None
@@ -359,7 +570,7 @@ def resolve_cached_render_root(
     if "abo" not in source_name and "abo" not in generator_id:
         return None
     candidate = abo_render_cache / source_model_path.stem
-    if render_bundle_complete(candidate):
+    if render_bundle_complete(candidate, views):
         return candidate.resolve()
     return None
 
@@ -374,24 +585,140 @@ def link_or_copy_render_root(src_root: Path, dst_root: Path) -> None:
         shutil.copytree(src_root, dst_root)
 
 
-def ensure_view_placeholders(buffer_root: Path, render_resolution: int) -> dict[str, dict[str, str]]:
+def derive_depth_from_position(position: np.ndarray, camera_location: list[float]) -> np.ndarray:
+    world_position = np.clip(position * 2.0 - 1.0, -1.0, 1.0)
+    camera = np.asarray(camera_location, dtype=np.float32).reshape(1, 1, 3)
+    depth = np.linalg.norm(world_position - camera, axis=-1)
+    if float(depth.max()) > float(depth.min()):
+        depth = (depth - float(depth.min())) / (float(depth.max()) - float(depth.min()))
+    else:
+        depth = np.zeros_like(depth, dtype=np.float32)
+    return depth.astype(np.float32)
+
+
+def finalize_view_buffers(buffer_root: Path, render_resolution: int, views: list[dict]) -> dict[str, object]:
     rgba_paths: dict[str, dict[str, str]] = {}
-    for view in VIEWS:
+    field_sources: dict[str, dict[str, object]] = {}
+    valid_view_count = 0
+    for view in views:
         view_dir = ensure_dir(buffer_root / view["name"])
         rgba_path = view_dir / "rgba.png"
+        view_sources: dict[str, str] = {}
         if not rgba_path.exists():
             rgba = np.zeros((render_resolution, render_resolution, 4), dtype=np.uint8)
             rgba[..., :3] = 180
             rgba[..., 3] = 255
             Image.fromarray(rgba, mode="RGBA").save(rgba_path)
+            view_sources["rgba"] = "synthetic_placeholder"
+        else:
+            view_sources["rgba"] = "rendered"
         roughness_path = view_dir / "roughness.png"
         if not roughness_path.exists():
             write_constant_gray(roughness_path, 0.5, render_resolution)
+            view_sources["roughness"] = "synthetic_placeholder"
+        else:
+            view_sources["roughness"] = "rendered"
         metallic_path = view_dir / "metallic.png"
         if not metallic_path.exists():
             write_constant_gray(metallic_path, 0.0, render_resolution)
+            view_sources["metallic"] = "synthetic_placeholder"
+        else:
+            view_sources["metallic"] = "rendered"
+        mask_path = view_dir / "mask.png"
+        if mask_path.exists():
+            view_sources["mask"] = "rendered"
+        else:
+            rgba = Image.open(rgba_path).convert("RGBA").resize((render_resolution, render_resolution), Image.BILINEAR)
+            mask = np.asarray(rgba.getchannel("A"), dtype=np.uint8)
+            Image.fromarray(mask, mode="L").save(mask_path)
+            view_sources["mask"] = "derived_from_rgba"
+
+        visibility_path = view_dir / "visibility.png"
+        if visibility_path.exists():
+            view_sources["visibility"] = "rendered"
+        else:
+            shutil.copy2(mask_path, visibility_path)
+            view_sources["visibility"] = "derived_from_mask"
+
+        normal_path = view_dir / "normal.png"
+        if normal_path.exists():
+            view_sources["normal"] = "rendered"
+        else:
+            write_flat_normal(normal_path, render_resolution)
+            view_sources["normal"] = "synthetic_placeholder"
+
+        position_path = view_dir / "position.png"
+        if position_path.exists():
+            view_sources["position"] = "rendered"
+        else:
+            write_constant_rgb(position_path, (128, 128, 128), render_resolution)
+            view_sources["position"] = "synthetic_placeholder"
+
+        uv_path = view_dir / "uv.png"
+        if uv_path.exists():
+            view_sources["uv"] = "rendered"
+        else:
+            write_constant_rgb(uv_path, (0, 0, 0), render_resolution)
+            view_sources["uv"] = "synthetic_placeholder"
+
+        depth_path = view_dir / "depth.png"
+        if depth_path.exists():
+            view_sources["depth"] = "rendered"
+        else:
+            position = load_rgb_array(position_path, render_resolution)
+            view_json_path = view_dir / "view.json"
+            if position is not None and view_json_path.exists():
+                view_json = json.loads(view_json_path.read_text())
+                camera_location = view_json.get("camera_location")
+                if (
+                    isinstance(camera_location, list)
+                    and len(camera_location) == 3
+                    and view_sources.get("position") != "synthetic_placeholder"
+                ):
+                    depth = derive_depth_from_position(position, camera_location)
+                    Image.fromarray((depth * 255.0).round().astype(np.uint8), mode="L").save(depth_path)
+                    view_sources["depth"] = "derived_from_position"
+                else:
+                    write_constant_gray(depth_path, 0.0, render_resolution)
+                    view_sources["depth"] = "synthetic_placeholder"
+            else:
+                write_constant_gray(depth_path, 0.0, render_resolution)
+                view_sources["depth"] = "synthetic_placeholder"
+
+        effective_ready = all(
+            view_sources.get(field, "missing") not in {"synthetic_placeholder", "missing"}
+            for field in ("rgba", "uv", "roughness", "metallic")
+        )
+        strict_ready = all(
+            view_sources.get(field, "missing") not in {"synthetic_placeholder", "missing"}
+            for field in ("rgba", "mask", "depth", "normal", "position", "uv", "visibility", "roughness", "metallic")
+        )
+        valid_view_count += int(effective_ready)
+        field_sources[view["name"]] = {
+            "fields": view_sources,
+            "view_supervision_ready": effective_ready,
+            "strict_complete_ready": strict_ready,
+        }
         rgba_paths[view["name"]] = {"rgba": str(rgba_path.resolve())}
-    return rgba_paths
+    metadata_path = buffer_root / "_field_sources.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "view_quality_version": "v1",
+                "view_count": len(views),
+                "views": field_sources,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "view_rgba_paths": rgba_paths,
+        "view_buffer_field_sources_path": str(metadata_path.resolve()),
+        "view_supervision_ready": bool(valid_view_count > 0),
+        "valid_view_count": int(valid_view_count),
+    }
 
 
 def render_views(
@@ -399,12 +726,13 @@ def render_views(
     source_model_path: Path,
     buffer_root: Path,
     views_json: Path,
+    views: list[dict],
     blender_bin: Path,
     render_resolution: int,
     cycles_samples: int,
     cuda_device_index: str,
 ) -> None:
-    views_json.write_text(json.dumps(VIEWS, indent=2))
+    views_json.write_text(json.dumps(views, indent=2, ensure_ascii=False), encoding="utf-8")
     cmd = [
         str(blender_bin),
         "-b",
@@ -440,6 +768,8 @@ def prepare_record(
     abo_render_cache: Path | None,
     cuda_device_index: str,
     skip_render: bool,
+    views: list[dict],
+    view_light_protocol: str,
 ) -> dict:
     source_model_path = Path(record["source_model_path"]).resolve()
     texture_root = first_existing_path(record.get("source_texture_root", ""))
@@ -448,7 +778,7 @@ def prepare_record(
     uv_dir = ensure_dir(bundle_dir / "uv")
     buffer_root = bundle_dir / "buffers"
     views_json = bundle_dir / "views.json"
-    views_json.write_text(json.dumps(VIEWS, indent=2))
+    views_json.write_text(json.dumps(views, indent=2, ensure_ascii=False), encoding="utf-8")
 
     roughness_seed, metallic_seed = infer_scalar_priors(source_model_path, record)
     albedo_src = discover_texture(texture_root, ("albedo", "basecolor", "base_color", "diffuse"))
@@ -467,19 +797,7 @@ def prepare_record(
     metallic_dst = uv_dir / "uv_prior_metallic.png"
 
     if not find_missing_paths(bundle_dir):
-        prepared = build_prepared_record(record, bundle_root, bundle_dir, split)
-        prepared.update(
-            {
-                "scalar_prior_roughness": roughness_seed,
-                "scalar_prior_metallic": metallic_seed,
-                "has_material_prior": has_material_prior,
-                "prior_mode": prior_mode,
-                "render_mode": str(prepared.get("render_mode") or "existing_bundle"),
-            }
-        )
-        write_prepared_record_file(bundle_dir, prepared)
-        print(f"[prepare reuse] complete bundle for {record['object_id']}")
-        return prepared
+        print(f"[prepare reuse] upgrading existing bundle for {record['object_id']}")
 
     copy_or_placeholder(albedo_src, albedo_dst, fallback_kind="albedo", size=atlas_resolution)
     copy_or_placeholder(normal_src, normal_dst, fallback_kind="normal", size=atlas_resolution)
@@ -498,8 +816,8 @@ def prepare_record(
         size=atlas_resolution,
     )
 
-    cached_render_root = resolve_cached_render_root(record, source_model_path, abo_render_cache)
-    if render_bundle_complete(buffer_root):
+    cached_render_root = resolve_cached_render_root(record, source_model_path, abo_render_cache, views)
+    if render_bundle_complete(buffer_root, views):
         render_mode = "existing_bundle"
         print(f"[prepare reuse] existing bundle buffers for {record['object_id']}")
     elif cached_render_root is not None:
@@ -514,6 +832,7 @@ def prepare_record(
             source_model_path=source_model_path,
             buffer_root=buffer_root,
             views_json=views_json,
+            views=views,
             blender_bin=blender_bin,
             render_resolution=render_resolution,
             cycles_samples=cycles_samples,
@@ -523,15 +842,21 @@ def prepare_record(
     else:
         ensure_dir(buffer_root)
         render_mode = "placeholder"
-    ensure_view_placeholders(buffer_root, render_resolution)
+    view_buffer_payload = finalize_view_buffers(buffer_root, render_resolution, views)
 
     uv_target_payload = bake_uv_targets(
         bundle_dir=bundle_dir,
+        uv_albedo_path=albedo_dst,
         uv_prior_roughness_path=roughness_dst,
         uv_prior_metallic_path=metallic_dst,
+        uv_target_roughness_source_path=roughness_src,
+        uv_target_metallic_source_path=metallic_src,
+        canonical_buffer_root=buffer_root,
         atlas_resolution=atlas_resolution,
         default_roughness=roughness_seed,
         default_metallic=metallic_seed,
+        synthesize_nontrivial_prior=should_synthesize_nontrivial_prior(record),
+        allow_prior_copy_fallback=True,
     )
 
     missing = find_missing_paths(bundle_dir)
@@ -549,8 +874,36 @@ def prepare_record(
             "has_material_prior": has_material_prior,
             "prior_mode": prior_mode,
             "render_mode": render_mode,
+            "target_source_type": uv_target_payload["target_source_type"],
+            "target_is_prior_copy": uv_target_payload["target_is_prior_copy"],
+            "target_prior_identity": uv_target_payload["target_prior_identity"],
+            "target_confidence_summary": uv_target_payload["target_confidence_summary"],
+            "target_confidence_mean": uv_target_payload["target_confidence_mean"],
+            "target_confidence_nonzero_rate": uv_target_payload["target_confidence_nonzero_rate"],
+            "target_coverage": uv_target_payload["target_coverage"],
+            "target_quality_tier": "",
+            "view_rgba_paths": view_buffer_payload["view_rgba_paths"],
+            "view_buffer_field_sources_path": view_buffer_payload["view_buffer_field_sources_path"],
+            "view_supervision_ready": view_buffer_payload["view_supervision_ready"],
+            "valid_view_count": view_buffer_payload["valid_view_count"],
+            "view_light_protocol": view_light_protocol,
+            "view_count": len(views),
+            "lighting_bank_id": (
+                f"polyhaven_{view_light_protocol}_v1"
+                if view_light_protocol != "canonical_triplet"
+                else str(record.get("lighting_bank_id") or "canonical_triplet_v1")
+            ),
+            "hdri_asset_ids": sorted(
+                {
+                    str(view.get("lighting_asset_id"))
+                    for view in views
+                    if view.get("lighting_asset_id")
+                }
+            ),
+            "paper_split": str(record.get("paper_split") or record.get("default_split", "train")),
         }
     )
+    prepared = enrich_record_with_quality_fields(prepared)
     write_prepared_record_file(bundle_dir, prepared)
     return prepared
 
@@ -558,6 +911,12 @@ def prepare_record(
 def main() -> None:
     args = parse_args()
     payload = read_manifest(args.input_manifest)
+    hdri_bank = load_hdri_bank(args.hdri_bank_json)
+    if args.view_light_protocol != "canonical_triplet" and int(args.min_hdri_count) > 0:
+        if len(hdri_bank) < int(args.min_hdri_count):
+            raise RuntimeError(
+                f"insufficient_hdri_bank:{len(hdri_bank)}<{int(args.min_hdri_count)}:{args.hdri_bank_json}"
+            )
     output_root = ensure_dir(args.output_root / args.split)
     bundle_root = ensure_dir(output_root / "canonical_bundle")
     output_manifest = (
@@ -607,6 +966,13 @@ def main() -> None:
         )
 
     def run_prepare(index: int, record: dict) -> tuple[int, dict]:
+        views = build_views_for_record(
+            record,
+            protocol=args.view_light_protocol,
+            hdri_bank=hdri_bank,
+            max_hdri_lights=args.max_hdri_lights,
+            hdri_selection_offset=args.hdri_selection_offset,
+        )
         prepared = prepare_record(
             record,
             output_root=output_root,
@@ -618,6 +984,8 @@ def main() -> None:
             abo_render_cache=args.abo_render_cache,
             cuda_device_index=args.cuda_device_index,
             skip_render=args.skip_render,
+            views=views,
+            view_light_protocol=args.view_light_protocol,
         )
         return index, prepared
 

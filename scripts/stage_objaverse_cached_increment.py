@@ -91,11 +91,27 @@ def material_class_from_row(row: pd.Series) -> tuple[str, str]:
         for column in ("fileIdentifier", "metadata")
     ).lower()
     checks = {
-        "metal_dominant": ("metal", "chrome", "steel", "aluminum", "brass", "copper", "hardware"),
-        "ceramic_glazed_lacquer": ("ceramic", "porcelain", "vase", "tile", "glazed", "lacquer", "marble"),
-        "glass_metal": ("glass", "lamp", "lantern", "mirror", "transparent", "chandelier"),
-        "mixed_thin_boundary": ("frame", "handle", "wire", "rack", "shelf", "chair", "table", "furniture"),
-        "glossy_non_metal": ("glossy", "plastic", "leather", "polished", "painted", "acrylic", "resin"),
+        "metal_dominant": (
+            "metal", "metallic", "chrome", "steel", "aluminum", "aluminium", "brass", "copper",
+            "hardware", "silver", "gold", "iron", "tool", "gear", "bolt", "screw", "hinge",
+        ),
+        "ceramic_glazed_lacquer": (
+            "ceramic", "porcelain", "pottery", "vase", "tile", "glazed", "glaze", "lacquer",
+            "marble", "stoneware", "bowl", "plate", "dish", "cup", "mug", "sink", "toilet",
+            "statue", "figurine",
+        ),
+        "glass_metal": (
+            "glass", "lamp", "lantern", "mirror", "transparent", "translucent", "chandelier",
+            "bottle", "jar", "goblet", "window", "vitrine", "bulb", "crystal",
+        ),
+        "mixed_thin_boundary": (
+            "frame", "handle", "wire", "rack", "shelf", "chair", "table", "furniture",
+            "fence", "rail", "basket", "cage", "stand",
+        ),
+        "glossy_non_metal": (
+            "glossy", "plastic", "leather", "polished", "painted", "acrylic", "resin",
+            "varnish", "paint", "synthetic",
+        ),
     }
     scores = {
         material_class: sum(1 for token in tokens if token in text)

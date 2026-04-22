@@ -6,6 +6,8 @@ open_clip_torch==2.24.0
 trimesh==4.4.1
 numpy==1.26.4
 matplotlib==3.10.8
+lpips==0.1.4
+scikit-image==0.25.2
 huggingface-hub==0.23.4
 wandb==0.26.0
 tensorboard==2.20.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,55 @@ from sf3d.material_refine.io import (
 from sf3d.material_refine.types import CanonicalAssetRecordV1
 
 DEFAULT_VIEWS = ["front_studio", "three_quarter_indoor", "side_neon"]
+HARD_VIEW_TOKENS = (
+    "grazing",
+    "thin",
+    "boundary",
+    "close",
+    "edge",
+    "rim",
+    "highlight",
+    "metal",
+    "glass",
+)
+
+
+def _view_importance(view_name: str) -> float:
+    lowered = view_name.lower()
+    if any(token in lowered for token in HARD_VIEW_TOKENS):
+        return 2.0
+    if any(token in lowered for token in ("side", "low", "oblique", "stress")):
+        return 1.35
+    return 1.0
+
+
+def _select_view_names(
+    view_names: list[str],
+    *,
+    max_views: int,
+    min_hard_views: int,
+    randomize: bool,
+) -> list[str]:
+    if max_views <= 0 or len(view_names) <= max_views:
+        return view_names
+    hard_views = [name for name in view_names if _view_importance(name) > 1.0]
+    regular_views = [name for name in view_names if name not in hard_views]
+    rng = random if randomize else None
+    if rng is not None:
+        hard_views = hard_views[:]
+        regular_views = regular_views[:]
+        rng.shuffle(hard_views)
+        rng.shuffle(regular_views)
+    take_hard = min(max(int(min_hard_views), 0), max_views, len(hard_views))
+    selected = hard_views[:take_hard]
+    remaining = [name for name in view_names if name not in set(selected)]
+    if rng is not None:
+        rng.shuffle(remaining)
+    selected.extend(remaining[: max_views - len(selected)])
+    if not randomize:
+        selected_set = set(selected)
+        selected = [name for name in view_names if name in selected_set]
+    return selected
 
 
 def _resolve_record_path(
@@ -92,15 +142,27 @@ def _load_view_bundle(
     record: CanonicalAssetRecordV1,
     manifest_dir: Path,
     buffer_resolution: int,
+    *,
+    max_views: int = 0,
+    min_hard_views: int = 0,
+    randomize_views: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, dict[str, Any]]:
     buffer_root = _resolve_record_path(record, record.canonical_buffer_root, manifest_dir)
-    view_names = _load_view_names(record, manifest_dir)
+    all_view_names = _load_view_names(record, manifest_dir)
+    view_names = _select_view_names(
+        all_view_names,
+        max_views=max_views,
+        min_hard_views=min_hard_views,
+        randomize=randomize_views,
+    )
     if buffer_root is None or not buffer_root.exists():
         zero_features = torch.zeros(1, 11, buffer_resolution, buffer_resolution)
         zero_mask = torch.zeros(1, 1, buffer_resolution, buffer_resolution)
         return zero_features, None, zero_mask, {
             "view_names": view_names,
             "view_targets": None,
+            "view_importance": torch.ones(1, dtype=torch.float32),
+            "available_view_count": len(all_view_names),
         }
 
     features = []
@@ -154,6 +216,8 @@ def _load_view_bundle(
         uv = _load_array_like(view_dir / "uv.npy")
         if uv is None:
             uv = _load_array_like(view_dir / "uv.npz")
+        if uv is None:
+            uv = _load_array_like(view_dir / "uv.png")
         if uv is not None:
             uv = resize_tensor_image(uv[:2], buffer_resolution).permute(1, 2, 0).contiguous()
         view_uvs.append(uv)
@@ -196,6 +260,8 @@ def _load_view_bundle(
     return stacked_features, stacked_uvs, stacked_masks, {
         "view_names": view_names,
         "view_targets": stacked_targets,
+        "view_importance": torch.tensor([_view_importance(name) for name in view_names], dtype=torch.float32),
+        "available_view_count": len(all_view_names),
     }
 
 
@@ -211,23 +277,39 @@ class CanonicalMaterialDataset(Dataset):
         source_names: list[str] | None = None,
         generator_ids: list[str] | None = None,
         supervision_tiers: list[str] | None = None,
+        supervision_roles: list[str] | None = None,
         license_buckets: list[str] | None = None,
+        target_quality_tiers: list[str] | None = None,
+        paper_splits: list[str] | None = None,
+        material_families: list[str] | None = None,
+        lighting_bank_ids: list[str] | None = None,
         require_prior: bool | None = None,
         max_records: int | None = None,
         atlas_size: int = 512,
         buffer_resolution: int = 256,
+        max_views_per_sample: int = 0,
+        min_hard_views_per_sample: int = 0,
+        randomize_view_subset: bool = False,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest_dir = self.manifest_path.parent
         manifest = load_canonical_manifest(self.manifest_path)
         self.atlas_size = atlas_size
         self.buffer_resolution = buffer_resolution
+        self.max_views_per_sample = max(int(max_views_per_sample), 0)
+        self.min_hard_views_per_sample = max(int(min_hard_views_per_sample), 0)
+        self.randomize_view_subset = bool(randomize_view_subset)
         records = filter_records(
             manifest.records,
             generator_ids=generator_ids,
             source_names=source_names,
             supervision_tiers=supervision_tiers,
+            supervision_roles=supervision_roles,
             license_buckets=license_buckets,
+            target_quality_tiers=target_quality_tiers,
+            paper_splits=paper_splits,
+            material_families=material_families,
+            lighting_bank_ids=lighting_bank_ids,
             require_prior=require_prior,
         )
         self.records = select_split_records(
@@ -325,17 +407,37 @@ class CanonicalMaterialDataset(Dataset):
             record,
             self.manifest_dir,
             self.buffer_resolution,
+            max_views=self.max_views_per_sample,
+            min_hard_views=self.min_hard_views_per_sample,
+            randomize_views=self.randomize_view_subset,
+        )
+        has_effective_view_supervision = bool(record.view_supervision_ready) and (
+            view_uvs is not None and view_meta["view_targets"] is not None
         )
 
         return {
             "object_id": record.object_id,
             "split": record.default_split,
+            "paper_split": str(record.paper_split or "unknown"),
             "generator_id": record.generator_id,
             "source_name": str(record.metadata.get("source_name", record.generator_id)),
+            "category_bucket": str(record.metadata.get("category_bucket", "unknown")),
             "supervision_tier": record.supervision_tier,
+            "supervision_role": record.supervision_role,
             "license_bucket": record.license_bucket,
             "has_material_prior": bool(record.has_material_prior),
             "prior_mode": record.prior_mode,
+            "target_source_type": record.target_source_type,
+            "target_quality_tier": record.target_quality_tier,
+            "target_prior_identity": (
+                0.0 if record.target_prior_identity is None else float(record.target_prior_identity)
+            ),
+            "target_coverage": 0.0 if record.target_coverage is None else float(record.target_coverage),
+            "material_family": str(record.material_family or "unknown"),
+            "thin_boundary_flag": bool(record.thin_boundary_flag),
+            "lighting_bank_id": str(record.lighting_bank_id or "unknown"),
+            "view_supervision_ready": bool(record.view_supervision_ready),
+            "valid_view_count": int(record.valid_view_count),
             "uv_albedo": uv_albedo,
             "uv_normal": uv_normal,
             "uv_prior_roughness": prior_roughness,
@@ -349,6 +451,9 @@ class CanonicalMaterialDataset(Dataset):
             "view_masks": view_masks,
             "view_targets": view_meta["view_targets"],
             "view_names": view_meta["view_names"],
+            "view_importance": view_meta["view_importance"],
+            "available_view_count": int(view_meta["available_view_count"]),
+            "has_effective_view_supervision": has_effective_view_supervision,
             "metadata": record.metadata,
         }
 
@@ -357,13 +462,48 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     batch: dict[str, Any] = {
         "object_id": [sample["object_id"] for sample in samples],
         "split": [sample["split"] for sample in samples],
+        "paper_split": [sample["paper_split"] for sample in samples],
         "generator_id": [sample["generator_id"] for sample in samples],
         "source_name": [sample["source_name"] for sample in samples],
+        "category_bucket": [sample["category_bucket"] for sample in samples],
         "supervision_tier": [sample["supervision_tier"] for sample in samples],
+        "supervision_role": [sample["supervision_role"] for sample in samples],
         "license_bucket": [sample["license_bucket"] for sample in samples],
         "has_material_prior": [sample["has_material_prior"] for sample in samples],
         "prior_mode": [sample["prior_mode"] for sample in samples],
+        "target_source_type": [sample["target_source_type"] for sample in samples],
+        "target_quality_tier": [sample["target_quality_tier"] for sample in samples],
+        "target_prior_identity": torch.tensor(
+            [float(sample["target_prior_identity"]) for sample in samples],
+            dtype=torch.float32,
+        ),
+        "target_coverage": torch.tensor(
+            [float(sample["target_coverage"]) for sample in samples],
+            dtype=torch.float32,
+        ),
+        "material_family": [sample["material_family"] for sample in samples],
+        "thin_boundary_flag": torch.tensor(
+            [bool(sample["thin_boundary_flag"]) for sample in samples],
+            dtype=torch.bool,
+        ),
+        "lighting_bank_id": [sample["lighting_bank_id"] for sample in samples],
+        "view_supervision_ready": torch.tensor(
+            [bool(sample["view_supervision_ready"]) for sample in samples],
+            dtype=torch.bool,
+        ),
+        "valid_view_count": torch.tensor(
+            [int(sample["valid_view_count"]) for sample in samples],
+            dtype=torch.int32,
+        ),
         "view_names": [sample["view_names"] for sample in samples],
+        "available_view_count": torch.tensor(
+            [int(sample["available_view_count"]) for sample in samples],
+            dtype=torch.int32,
+        ),
+        "has_effective_view_supervision": torch.tensor(
+            [bool(sample["has_effective_view_supervision"]) for sample in samples],
+            dtype=torch.bool,
+        ),
         "metadata": [sample["metadata"] for sample in samples],
     }
     tensor_keys = [
@@ -383,6 +523,7 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     feature_shape = samples[0]["view_features"].shape[1:]
     padded_features = []
     padded_masks = []
+    padded_importance = []
     padded_uvs = []
     padded_targets = []
     has_uvs = any(sample["view_uvs"] is not None for sample in samples)
@@ -409,6 +550,13 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
             )
         padded_features.append(views)
         padded_masks.append(masks)
+        importance = sample["view_importance"]
+        if pad_count > 0:
+            importance = torch.cat(
+                [importance, torch.zeros(pad_count, dtype=importance.dtype)],
+                dim=0,
+            )
+        padded_importance.append(importance)
 
         if has_uvs:
             uvs = sample["view_uvs"]
@@ -458,6 +606,7 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
     batch["view_features"] = torch.stack(padded_features, dim=0)
     batch["view_masks"] = torch.stack(padded_masks, dim=0)
+    batch["view_importance"] = torch.stack(padded_importance, dim=0)
     batch["view_uvs"] = torch.stack(padded_uvs, dim=0) if has_uvs else None
     batch["view_targets"] = (
         torch.stack(padded_targets, dim=0) if has_targets else None

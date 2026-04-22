@@ -21,6 +21,44 @@ It does not copy the diffusion-specific parts of NG:
 
 The material-refine task is lighter and consumes `CanonicalAssetRecordV1` manifests, so the training loop stays PyTorch-native and uses an explicit `--cuda-device-index` instead of hard-coding a GPU.
 
+## P0 Readiness Contract
+
+Paper-stage full training is intentionally blocked until these conditions are all true:
+
+- `target_prior_identity_rate <= 0.30`
+- `paper_stage_eligible_records >= 128`
+- the fixed stage1 subset is non-empty
+
+The historical full manifest does not satisfy that contract. Its blocked state was:
+
+- `target_prior_identity_rate = 1.0000`
+- `paper_stage_eligible_records = 0`
+- `effective_view_supervision_record_rate = 0.0`
+- `stage1_subset_records = 0`
+
+That older result remains engineering smoke only. It validates the pipeline, but it does not support a paper-stage effectiveness claim.
+
+The latest longrun merged manifest does satisfy the contract:
+
+- manifest: `output/material_refine_longrun_stress24_hdri900_20260419T134158Z/canonical_manifest_monitor_merged.json`
+- `records = 490`
+- `target_prior_identity_rate = 0.2939`
+- `paper_stage_eligible_records = 346`
+- `effective_view_supervision_record_rate = 1.0`
+- `stage1_subset_records = 346`
+- fixed split counts: `paper_train = 240`, `paper_val_iid = 40`, `paper_test_iid = 31`, `paper_test_material_holdout = 35`
+
+The current Stage-1 subset is valid for a with-prior paper-stage run, but its scope is intentionally narrow:
+
+- source/generator: `ABO_locked_core`
+- prior mode: `with_prior`
+- target type: `pseudo_from_multiview`
+- material family: `glossy_non_metal`
+
+Do not use this subset alone to claim no-prior generalization, cross-generator robustness, or broad material-family coverage.
+
+One training-side compatibility bug was also fixed at this stage: `run_preflight_checks()` no longer treats the legacy optional `--manifest` alias as a separate required file once explicit `--train-manifest` and `--val-manifest` are provided. This matters for paper-stage launches because the config keeps a historical default `manifest` path while the pipeline injects the newly generated stage1 subset manifests at runtime.
+
 ## Module Principles
 
 The v1 refiner follows a conservative residual-refinement principle:
@@ -29,6 +67,7 @@ The v1 refiner follows a conservative residual-refinement principle:
 - Preserve `baseColorTexture` and `normalTexture`; only refine roughness/metallic UV maps in v1.
 - Use roughness/metallic priors when they exist, but train with `prior_dropout_prob` so the same model also learns the no-prior path.
 - Predict a coarse RM estimate first, then predict a bounded residual delta around the prior/coarse initialization.
+- Optionally predict a residual confidence gate for each texel. This is disabled in round3 for compatibility and enabled in the round4 residual-gate ablation to test conservative correction of upstream priors.
 - Keep dataset preparation outside the training process; training consumes only canonical manifests and never audits raw assets.
 - Log by generator, source, prior mode, supervision tier, and license bucket so quality changes are traceable to data provenance and upstream-generator generalization.
 
@@ -85,6 +124,24 @@ tail -f output/material_refine_pipeline_20260418T091559Z/train_round2_gpu0_gated
 cat output/material_refine_pipeline_20260418T091559Z/train_round2_gpu0_gated/logs/sf3d_material_refine_round2_gpu0.status.json
 ```
 
+Paper-stage background launch is now available as a gated watcher. It keeps polling the manifest until the readiness gate passes, then runs train/eval/report/W&B automatically:
+
+```bash
+cd /home/ubuntu/ssd_work/projects/stable-fast-3d
+
+SESSION=sf3d_material_refine_paper_stage1 \
+WAIT_FOR_READY=true \
+POLL_SECONDS=300 \
+WAIT_FOR_GPU=true \
+GPU_INDEX=0 \
+MAX_GPU_USED_MB=4096 \
+scripts/launch_material_refine_paper_stage1_tmux.sh
+```
+
+By default the paper-stage watcher now scans multiple existing manifest lines, including the original paper pipeline bundle, the `highlight_pool_a_8k` outputs, and the newer HDRI900 longrun manifests, then selects the best current candidate with `scripts/select_material_refine_best_manifest.py`.
+
+The launcher now also supports GPU-idle waiting before it hands control to the paper-stage pipeline, which is important when Blender dataset jobs are still consuming the same card.
+
 Evaluation launch:
 
 ```bash
@@ -103,6 +160,24 @@ Paper-stage launch after non-trivial RM targets are available:
 /home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/eval_material_refiner.py \
   --config configs/material_refine_eval_paper_benchmark.yaml \
   --checkpoint output/material_refine_paper/stage1_main/best.pt
+```
+
+The current round3 live preset uses the 346-record subset and full 24-view validation:
+
+```bash
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/train_material_refiner.py \
+  --config configs/material_refine_train_paper_stage1_round3.yaml \
+  --cuda-device-index 1 \
+  --output-dir output/material_refine_paper/paper_stage1_round3_gpu1_20260421/train_stage1_round3
+```
+
+The next controlled architecture ablation keeps the same split and enables residual gating:
+
+```bash
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/train_material_refiner.py \
+  --config configs/material_refine_train_paper_stage1_round4_residual_gate.yaml \
+  --cuda-device-index 1 \
+  --output-dir output/material_refine_paper/stage1_round4_residual_gate
 ```
 
 Per-generator paper eval can be produced by overriding only the filter and output name:
@@ -167,13 +242,25 @@ Recommended v1 defaults:
 - `coarse_weight: 0.35`
 - `prior_consistency_weight: 0.10`
 - `smoothness_weight: 0.02`
-- `view_consistency_weight: 0.15`
+- `view_consistency_weight: 0.0`
+- `view_consistency_mode: disabled`
 - `matmul_precision: high`
 - `allow_tf32: true`
+
+Paper ablation switches are now first-class config knobs:
+
+- `disable_prior_inputs: true` for `no_prior_refiner`
+- `disable_view_fusion: true` for `no_view_refiner`
+- `disable_residual_head: true` for `no_residual_refiner`
 
 The training script supports `--optimizer adamw` and `--optimizer adam`. AdamW remains the default because it gives stable weight decay for the compact UNet heads, while plain Adam is useful for ablation or very small smoke runs.
 
 Full training should set `fail_on_target_prior_identity: true`. The current round1 manifest is a useful pipeline smoke test, but its target roughness/metallic maps are identical to SF3D priors for the audited records, so the gate intentionally prevents treating it as a real quality-improvement training set.
+
+The paper-stage thresholds are config-backed and should remain stable across runs:
+
+- `max_target_prior_identity_rate_for_paper: 0.30`
+- `min_nontrivial_target_count_for_paper: 128`
 
 Debug logs include:
 
@@ -183,14 +270,31 @@ Debug logs include:
 - memory: allocated, reserved, and max allocated GPU memory
 - data mix: source, prior/no-prior, supervision tier, and license bucket counts
 - generator mix: `generator_id` counts and validation metrics, needed for cross-generator tables
+- supervision realism: paper-eligible non-trivial target counts and effective view-supervision rate
+- failure emphasis: sampler-side difficulty/tag reweighting and eval-side failure-tag reduction
 
 Terminal output intentionally includes both machine-readable JSON and readable progress lines:
 
 - `[preflight]`: manifest/device/W&B/auth checks before training starts
-- `[train]`: epoch, optimizer step, lr, train loss, grad norm, throughput, and GPU memory
+- `[epoch:start]`: epoch, train/val record counts, planned samples, batch count, and optimizer-step count
+- `[train]`: epoch fraction, `step/total`, `batch/total`, elapsed time, epoch ETA, total ETA, lr, train loss, grad norm, throughput, and GPU memory
 - `[val]`: validation label, UV MAE by channel, best metric, and whether the model improved
 - `[epoch]`: compact end-of-epoch summary with checkpoint path
 - `[final]`: final output directory, `latest.pt`, `best.pt`, and `history.json`
+
+Validation preview logging now uses three layers instead of a single image list:
+
+- `val/previews`: the full preview list for the step
+- `val/preview_grid`: one contact-sheet image containing the whole step's preview set
+- `val/preview_00`, `val/preview_01`, ...: fixed per-slot preview keys so W&B can show multiple sample trajectories side by side across epochs
+
+Each preview panel now includes:
+
+- representative SF3D input RGB views
+- baseline / target / refined roughness
+- baseline / target / refined metallic
+- baseline-target and refined-target error heatmaps
+- per-object baseline/refined MAE and improvement text in the header
 
 Training visualizations are exported to the output directory when `export_training_curves: true`:
 
@@ -210,6 +314,23 @@ Manifest quality can be audited before trusting metrics:
 /home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/audit_material_refine_manifest.py \
   --manifest output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json \
   --output-dir output/material_refine_pipeline_20260418T091559Z/manifest_audit_full
+
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/validate_material_refine_buffers.py \
+  --manifest output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json \
+  --output-dir output/material_refine_pipeline_20260418T091559Z/buffer_validation_full
+
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/build_material_refine_paper_stage1_subset.py \
+  --manifest output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json \
+  --output-root output/material_refine_pipeline_20260418T091559Z/paper_stage1_subset
+```
+
+Paper ablation suite entry point:
+
+```bash
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/run_material_refine_ablation_suite.py \
+  --stage1-manifest output/material_refine_paper/paper_stage1_pipeline/readiness/stage1_subset/paper_stage1_subset_manifest.json \
+  --reference-checkpoint output/material_refine_paper/paper_stage1_pipeline/train_stage1_main/best.pt \
+  --output-root output/material_refine_paper/ablation_suite
 ```
 
 Round-level analysis combines training curves, eval metrics, material attribute deltas, and manifest audit warnings:

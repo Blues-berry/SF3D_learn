@@ -3,16 +3,19 @@
 # Run once per checkpoint and optionally override `--generator-ids` to create
 # per-upstream tables: sf3d, spar3d, hunyuan3d, or other canonical generators.
 
-manifest: output/material_refine_pipeline_20260418T091559Z/prepared/full/canonical_manifest_full.json
+manifest: output/material_refine_paper/paper_stage1_pipeline/readiness/stage1_subset/paper_stage1_subset_manifest.json
 split: test
-split_strategy: hash
+split_strategy: manifest
 hash_val_ratio: 0.10
 hash_test_ratio: 0.10
 
 generator_ids: null
 source_names: null
 supervision_tiers: null
+supervision_roles: paper_main
 license_buckets: null
+target_quality_tiers: paper_strong,paper_pseudo
+paper_splits: paper_test_iid,paper_test_material_holdout,paper_test_real_lighting
 require_prior: any
 
 batch_size: 1

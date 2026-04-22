@@ -3,15 +3,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sf3d.material_refine.manifest_quality import enrich_record_with_quality_fields
+
 DEFAULT_INPUT_MANIFEST = REPO_ROOT / "docs" / "neural_gaffer_dataset_audit" / "material_refine_manifest_v1.json"
 DEFAULT_CANONICAL_BUNDLE_ROOT = REPO_ROOT / "output" / "material_refine" / "prepared" / "full" / "canonical_bundle"
 DEFAULT_OUTPUT_MANIFEST = REPO_ROOT / "output" / "material_refine" / "prepared" / "full" / "canonical_manifest_partial.json"
 DEFAULT_VIEW_NAMES = ("front_studio", "three_quarter_indoor", "side_neon")
 PREPARED_RECORD_FILENAME = "prepared_record.json"
+REQUIRED_VIEW_BUFFER_FILES = (
+    "rgba.png",
+    "mask.png",
+    "depth.png",
+    "normal.png",
+    "position.png",
+    "uv.png",
+    "visibility.png",
+    "roughness.png",
+    "metallic.png",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +66,27 @@ def select_records(payload: dict, split: str) -> list[dict]:
     return selected
 
 
+def load_bundle_views(bundle_dir: Path) -> list[dict]:
+    views_json = bundle_dir / "views.json"
+    if not views_json.exists():
+        return [{"name": view_name} for view_name in DEFAULT_VIEW_NAMES]
+    try:
+        payload = json.loads(views_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return [{"name": view_name} for view_name in DEFAULT_VIEW_NAMES]
+    views = payload.get("views") if isinstance(payload, dict) else payload
+    if not isinstance(views, list):
+        return [{"name": view_name} for view_name in DEFAULT_VIEW_NAMES]
+    normalized = []
+    for view in views:
+        if not isinstance(view, dict):
+            continue
+        name = str(view.get("name") or "")
+        if name:
+            normalized.append({"name": name, **view})
+    return normalized or [{"name": view_name} for view_name in DEFAULT_VIEW_NAMES]
+
+
 def expected_bundle_paths(bundle_dir: Path) -> dict[str, Path]:
     uv_dir = bundle_dir / "uv"
     buffer_root = bundle_dir / "buffers"
@@ -64,11 +102,11 @@ def expected_bundle_paths(bundle_dir: Path) -> dict[str, Path]:
         "uv_target_metallic_path": uv_dir / "uv_target_metallic.png",
         "uv_target_confidence_path": uv_dir / "uv_target_confidence.png",
     }
-    for view_name in DEFAULT_VIEW_NAMES:
+    for view in load_bundle_views(bundle_dir):
+        view_name = str(view["name"])
         view_dir = buffer_root / view_name
-        paths[f"view:{view_name}:rgba"] = view_dir / "rgba.png"
-        paths[f"view:{view_name}:roughness"] = view_dir / "roughness.png"
-        paths[f"view:{view_name}:metallic"] = view_dir / "metallic.png"
+        for file_name in REQUIRED_VIEW_BUFFER_FILES:
+            paths[f"view:{view_name}:{file_name.removesuffix('.png')}"] = view_dir / file_name
     return paths
 
 
@@ -88,10 +126,11 @@ def load_prepared_record(bundle_dir: Path) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def build_view_rgba_paths(buffer_root: Path) -> dict[str, dict[str, str]]:
+def build_view_rgba_paths(bundle_dir: Path) -> dict[str, dict[str, str]]:
+    buffer_root = bundle_dir / "buffers"
     return {
         view_name: {"rgba": str((buffer_root / view_name / "rgba.png").resolve())}
-        for view_name in DEFAULT_VIEW_NAMES
+        for view_name in [str(view["name"]) for view in load_bundle_views(bundle_dir)]
     }
 
 
@@ -116,7 +155,7 @@ def build_fallback_prepared_record(record: dict, bundle_root: Path, bundle_dir: 
             "processing_status": "prepared",
             "execution_split": execution_split,
             "is_smoke": bool(record.get("include_in_smoke")),
-            "view_rgba_paths": build_view_rgba_paths(buffer_root),
+            "view_rgba_paths": build_view_rgba_paths(bundle_dir),
         }
     )
     if not prepared.get("canonical_mesh_path") and prepared.get("source_model_path"):
@@ -128,7 +167,7 @@ def build_fallback_prepared_record(record: dict, bundle_root: Path, bundle_dir: 
             if source_model_path.suffix.lower() in {".glb", ".gltf"} and source_model_path.exists()
             else ""
         )
-    return prepared
+    return enrich_record_with_quality_fields(prepared)
 
 
 def build_prepared_record(record: dict, bundle_root: Path, bundle_dir: Path, split: str) -> dict:
@@ -136,6 +175,23 @@ def build_prepared_record(record: dict, bundle_root: Path, bundle_dir: Path, spl
     cached_payload = load_prepared_record(bundle_dir)
     if cached_payload is not None:
         prepared.update(cached_payload)
+        # Preserve source-level distribution labels from the active input
+        # manifest. Older cached prepared records may contain fallback
+        # material_family values such as glossy_non_metal, which would hide
+        # the intended metal/thin-boundary quotas on resume.
+        for key in (
+            "material_family",
+            "highlight_material_class",
+            "thin_boundary_flag",
+            "failure_tags",
+            "sampling_bucket",
+            "supervision_role",
+            "license_bucket",
+            "default_split",
+        ):
+            value = record.get(key)
+            if key in record and value is not None and value != "":
+                prepared[key] = value
     has_material_prior = bool(record.get("has_material_prior"))
     prior_mode = str(record.get("prior_mode") or "none")
     prepared.update(
@@ -156,7 +212,7 @@ def build_prepared_record(record: dict, bundle_root: Path, bundle_dir: Path, spl
             "is_smoke": bool(record.get("include_in_smoke")),
             "has_material_prior": has_material_prior,
             "prior_mode": prior_mode,
-            "view_rgba_paths": build_view_rgba_paths(bundle_dir / "buffers"),
+            "view_rgba_paths": build_view_rgba_paths(bundle_dir),
         }
     )
     if not prepared.get("canonical_mesh_path") and prepared.get("source_model_path"):
@@ -168,7 +224,7 @@ def build_prepared_record(record: dict, bundle_root: Path, bundle_dir: Path, spl
             if source_model_path.suffix.lower() in {".glb", ".gltf"} and source_model_path.exists()
             else ""
         )
-    return prepared
+    return enrich_record_with_quality_fields(prepared)
 
 
 def build_partial_manifest(manifest: dict, bundle_root: Path, split: str) -> dict:

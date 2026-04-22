@@ -97,6 +97,7 @@ class UVFeatureFusion(nn.Module):
         view_features: torch.Tensor,
         view_uvs: torch.Tensor,
         view_masks: torch.Tensor,
+        view_importance: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, views, channels, height, width = view_features.shape
         atlas = torch.zeros(
@@ -118,6 +119,13 @@ class UVFeatureFusion(nn.Module):
             for view_idx in range(views):
                 uv = view_uvs[batch_idx, view_idx]
                 mask = view_masks[batch_idx, view_idx, 0] > 0.5
+                view_weight = (
+                    float(view_importance[batch_idx, view_idx].detach().item())
+                    if view_importance is not None
+                    else 1.0
+                )
+                if view_weight <= 0.0:
+                    continue
                 if not mask.any():
                     continue
                 feature = view_features[batch_idx, view_idx].permute(1, 2, 0).reshape(-1, channels)
@@ -128,6 +136,7 @@ class UVFeatureFusion(nn.Module):
                     continue
                 uv_flat = uv_flat[valid]
                 feature = feature[valid]
+                feature = feature * view_weight
                 x = (uv_flat[:, 0].clamp(0, 1) * (atlas_size - 1)).round().long()
                 y = ((1.0 - uv_flat[:, 1].clamp(0, 1)) * (atlas_size - 1)).round().long()
                 index = y * atlas_size + x
@@ -139,9 +148,9 @@ class UVFeatureFusion(nn.Module):
                 counts[batch_idx].scatter_add_(
                     1,
                     index.unsqueeze(0),
-                    torch.ones(
-                        1,
-                        index.shape[0],
+                    torch.full(
+                        (1, index.shape[0]),
+                        view_weight,
                         device=view_features.device,
                         dtype=view_features.dtype,
                     ),
@@ -159,6 +168,7 @@ class UVFeatureFusion(nn.Module):
         atlas_size: int,
         view_uvs: torch.Tensor | None,
         view_masks: torch.Tensor,
+        view_importance: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if view_uvs is not None:
             return self._scatter_view_features(
@@ -166,9 +176,15 @@ class UVFeatureFusion(nn.Module):
                 encoded_views,
                 view_uvs,
                 view_masks,
+                view_importance=view_importance,
             )
 
-        pooled = encoded_views.mean(dim=1)
+        if view_importance is not None:
+            weights = view_importance.to(device=encoded_views.device, dtype=encoded_views.dtype)
+            weights = weights.clamp_min(0.0).view(encoded_views.shape[0], encoded_views.shape[1], 1, 1, 1)
+            pooled = (encoded_views * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        else:
+            pooled = encoded_views.mean(dim=1)
         pooled = F.interpolate(
             pooled,
             size=(atlas_size, atlas_size),
@@ -194,6 +210,13 @@ class MaterialRefiner(BaseModule):
         view_feature_channels: int = 32
         base_channels: int = 32
         delta_scale: float = 0.35
+        disable_view_fusion: bool = False
+        disable_prior_inputs: bool = False
+        disable_residual_head: bool = False
+        enable_residual_gate: bool = False
+        residual_gate_bias: float = -0.5
+        min_residual_gate: float = 0.05
+        prior_confidence_gate_strength: float = 0.0
 
     cfg: Config
 
@@ -212,20 +235,28 @@ class MaterialRefiner(BaseModule):
             out_channels=2,
             base_channels=self.cfg.base_channels,
         )
+        refine_out_channels = 3 if self.cfg.enable_residual_gate else 2
         self.refine_head = SmallUNet(
             refine_channels,
-            out_channels=2,
+            out_channels=refine_out_channels,
             base_channels=self.cfg.base_channels,
         )
 
     def build_uv_inputs(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        prior_roughness = batch["uv_prior_roughness"]
+        prior_metallic = batch["uv_prior_metallic"]
+        prior_confidence = batch["uv_prior_confidence"]
+        if self.cfg.disable_prior_inputs:
+            prior_roughness = torch.full_like(prior_roughness, 0.5)
+            prior_metallic = torch.zeros_like(prior_metallic)
+            prior_confidence = torch.zeros_like(prior_confidence)
         return torch.cat(
             [
                 batch["uv_albedo"],
                 batch["uv_normal"],
-                batch["uv_prior_roughness"],
-                batch["uv_prior_metallic"],
-                batch["uv_prior_confidence"],
+                prior_roughness,
+                prior_metallic,
+                prior_confidence,
             ],
             dim=1,
         )
@@ -233,35 +264,77 @@ class MaterialRefiner(BaseModule):
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         atlas_size = batch["uv_albedo"].shape[-1]
         uv_inputs = self.build_uv_inputs(batch)
-        encoded_views = self.view_encoder(batch["view_features"])
-        fused_views, fused_valid = self.view_fuser(
-            encoded_views,
-            atlas_size=atlas_size,
-            view_uvs=batch.get("view_uvs"),
-            view_masks=batch["view_masks"],
-        )
+        if self.cfg.disable_view_fusion:
+            encoded_views = self.view_encoder(batch["view_features"])
+            fused_views = torch.zeros(
+                batch["uv_albedo"].shape[0],
+                self.cfg.view_feature_channels,
+                atlas_size,
+                atlas_size,
+                device=batch["uv_albedo"].device,
+                dtype=batch["uv_albedo"].dtype,
+            )
+            fused_valid = torch.zeros(
+                batch["uv_albedo"].shape[0],
+                1,
+                atlas_size,
+                atlas_size,
+                device=batch["uv_albedo"].device,
+                dtype=batch["uv_albedo"].dtype,
+            )
+        else:
+            encoded_views = self.view_encoder(batch["view_features"])
+            fused_views, fused_valid = self.view_fuser(
+                encoded_views,
+                atlas_size=atlas_size,
+                view_uvs=batch.get("view_uvs"),
+                view_masks=batch["view_masks"],
+                view_importance=batch.get("view_importance"),
+            )
 
         init_features = torch.cat([uv_inputs, fused_views, fused_valid], dim=1)
         coarse = torch.sigmoid(self.init_head(init_features))
-        prior = torch.cat(
-            [batch["uv_prior_roughness"], batch["uv_prior_metallic"]],
-            dim=1,
-        )
+        prior = torch.cat([batch["uv_prior_roughness"], batch["uv_prior_metallic"]], dim=1)
         prior_confidence = batch["uv_prior_confidence"]
+        if self.cfg.disable_prior_inputs:
+            prior = torch.cat(
+                [
+                    torch.full_like(batch["uv_prior_roughness"], 0.5),
+                    torch.zeros_like(batch["uv_prior_metallic"]),
+                ],
+                dim=1,
+            )
+            prior_confidence = torch.zeros_like(prior_confidence)
         initial = coarse * (1.0 - prior_confidence) + prior * prior_confidence
 
         refine_features = torch.cat(
             [uv_inputs, fused_views, fused_valid, initial, prior_confidence],
             dim=1,
         )
-        delta = torch.tanh(self.refine_head(refine_features)) * self.cfg.delta_scale
-        refined = (initial + delta).clamp(0.0, 1.0)
+        if self.cfg.disable_residual_head:
+            delta = torch.zeros_like(initial)
+            residual_gate = torch.zeros_like(prior_confidence)
+        else:
+            refine_raw = self.refine_head(refine_features)
+            delta = torch.tanh(refine_raw[:, :2]) * self.cfg.delta_scale
+            residual_gate = torch.ones_like(prior_confidence)
+            if self.cfg.enable_residual_gate:
+                residual_gate = torch.sigmoid(refine_raw[:, 2:3] + self.cfg.residual_gate_bias)
+                min_gate = float(max(0.0, min(1.0, self.cfg.min_residual_gate)))
+                residual_gate = min_gate + (1.0 - min_gate) * residual_gate
+            if self.cfg.prior_confidence_gate_strength > 0.0:
+                strength = float(max(0.0, min(1.0, self.cfg.prior_confidence_gate_strength)))
+                confidence_gate = 1.0 - prior_confidence.clamp(0.0, 1.0) * strength
+                residual_gate = residual_gate * confidence_gate.clamp_min(float(self.cfg.min_residual_gate))
+        refined = (initial + delta * residual_gate).clamp(0.0, 1.0)
 
         return {
             "coarse": coarse,
             "baseline": prior,
             "initial": initial,
             "refined": refined,
+            "residual_delta": delta,
+            "residual_gate": residual_gate,
             "fused_views": fused_views,
             "fused_validity": fused_valid,
         }

@@ -112,6 +112,41 @@ def source_rank(record: dict) -> tuple[int, str]:
     return availability_rank, stable_hash_key(record["object_id"])
 
 
+def infer_material_family_from_row(row: dict) -> str:
+    text = " ".join(
+        str(row.get(key, ""))
+        for key in (
+            "label",
+            "highlight_priority_class",
+            "semantic_stratum",
+            "selection_reason",
+            "category",
+            "super_category",
+            "material",
+            "notes",
+        )
+    ).lower()
+    if "mixed_thin_boundary" in text or "thin-boundary" in text or "thin boundary" in text:
+        return "mixed_thin_boundary"
+    if "glass_metal" in text or ("glass" in text and "metal" in text):
+        return "glass_metal"
+    if "ceramic" in text or "glazed" in text or "lacquer" in text:
+        return "ceramic_glazed_lacquer"
+    if "metal_dominant" in text or float(row.get("avg_gt_metallic_mean", 0.0) or 0.0) >= 0.45:
+        return "metal_dominant"
+    return "glossy_non_metal"
+
+
+def infer_thin_boundary_flag_from_row(row: dict, *, material_family: str) -> bool:
+    if material_family == "mixed_thin_boundary":
+        return True
+    text = " ".join(
+        str(row.get(key, ""))
+        for key in ("label", "category", "name", "notes")
+    ).lower()
+    return any(token in text for token in ("thin", "frame", "wire", "handle", "boundary"))
+
+
 def csv_record(record: dict) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in record.items():
@@ -139,6 +174,7 @@ def build_abo_records(path: Path) -> list[dict]:
         source_model_path = str(row.get("source_model_path", ""))
         texture_root = str(row.get("texture_root", ""))
         notes = str(row.get("notes", ""))
+        material_family = infer_material_family_from_row(row)
         prior_mode = infer_prior_mode(
             notes=notes,
             has_roughness=True,
@@ -152,6 +188,7 @@ def build_abo_records(path: Path) -> list[dict]:
             "source_dataset": "mini_v1_abo_ecommerce",
             "generator_id": "abo_locked_core",
             "license_bucket": "cc_by_nc_4_0",
+            "supervision_role": "paper_main",
             "source_model_path": source_model_path,
             "source_texture_root": texture_root,
             "source_format": str(row.get("format", "glb")),
@@ -175,6 +212,12 @@ def build_abo_records(path: Path) -> list[dict]:
             "uv_target_confidence_path": "",
             "canonical_views_json": "",
             "canonical_buffer_root": "",
+            "paper_split": str(row.get("default_split", "train")),
+            "material_family": material_family,
+            "thin_boundary_flag": infer_thin_boundary_flag_from_row(row, material_family=material_family),
+            "lighting_bank_id": "canonical_triplet_v1",
+            "view_supervision_ready": False,
+            "valid_view_count": 0,
             "include_in_smoke": False,
             "include_in_full": True,
             "processing_status": "unprepared",
@@ -202,6 +245,7 @@ def build_three_future_records(path: Path) -> list[dict]:
         audit_status = str(row.get("audit_status", "unknown"))
         has_roughness = str(row.get("has_roughness", "")).lower() == "true"
         has_metallic = str(row.get("has_metallic", "")).lower() == "true"
+        material_family = infer_material_family_from_row(row)
         prior_mode = infer_prior_mode(
             notes=str(row.get("notes", "")),
             has_roughness=has_roughness,
@@ -216,6 +260,7 @@ def build_three_future_records(path: Path) -> list[dict]:
             "source_dataset": "pool_a_pilot_3dfuture",
             "generator_id": "3d_future_candidate",
             "license_bucket": str(row.get("license_bucket", "custom_tianchi_terms")),
+            "supervision_role": "auxiliary_upgrade_queue",
             "source_model_path": source_model_path or str(row.get("source_model_path", "")),
             "source_texture_root": texture_root or str(row.get("texture_root", "")),
             "source_format": str(row.get("format", "obj")),
@@ -239,6 +284,12 @@ def build_three_future_records(path: Path) -> list[dict]:
             "uv_target_confidence_path": "",
             "canonical_views_json": "",
             "canonical_buffer_root": "",
+            "paper_split": deterministic_split(str(row["object_id"])),
+            "material_family": material_family,
+            "thin_boundary_flag": infer_thin_boundary_flag_from_row(row, material_family=material_family),
+            "lighting_bank_id": "canonical_triplet_v1",
+            "view_supervision_ready": False,
+            "valid_view_count": 0,
             "include_in_smoke": False,
             "include_in_full": True,
             "processing_status": "unprepared",
@@ -257,6 +308,7 @@ def build_objaverse_records(path: Path) -> list[dict]:
             str(row.get("local_path", "")),
             str(row.get("source_model_path", "")),
         )
+        material_family = infer_material_family_from_row(row)
         record = {
             "record_version": MANIFEST_VERSION,
             "object_id": str(row["object_id"]),
@@ -265,6 +317,7 @@ def build_objaverse_records(path: Path) -> list[dict]:
             "source_dataset": "pool_a_pilot_objaverse",
             "generator_id": "objaverse_xl_filtered_candidate",
             "license_bucket": str(row.get("license_bucket", "mixed_per_object_license")),
+            "supervision_role": "auxiliary_upgrade_queue",
             "source_model_path": source_model_path or str(row.get("source_model_path", "")),
             "source_texture_root": str(row.get("texture_root", "")),
             "source_format": str(row.get("format", "glb")),
@@ -288,6 +341,12 @@ def build_objaverse_records(path: Path) -> list[dict]:
             "uv_target_confidence_path": "",
             "canonical_views_json": "",
             "canonical_buffer_root": "",
+            "paper_split": deterministic_split(str(row["object_id"])),
+            "material_family": material_family,
+            "thin_boundary_flag": infer_thin_boundary_flag_from_row(row, material_family=material_family),
+            "lighting_bank_id": "canonical_triplet_v1",
+            "view_supervision_ready": False,
+            "valid_view_count": 0,
             "include_in_smoke": False,
             "include_in_full": True,
             "processing_status": "unprepared",

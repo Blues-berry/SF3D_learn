@@ -1,0 +1,118 @@
+# Paper Stage-1 round4 preset: residual-gated refinement with true view-space guard.
+#
+# Round3 improved UV pseudo-target MAE but regressed view/proxy/object metrics.
+# This config keeps the same data protocol and adds two constraints:
+#   1. a conservative residual gate to avoid unnecessary prior perturbation;
+#   2. required view consistency because the current stage1 subset has UV/view
+#      supervision available.
+
+manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
+train_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
+val_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
+
+train_split: train
+val_split: val
+split_strategy: manifest
+hash_val_ratio: 0.10
+hash_test_ratio: 0.10
+freeze_val_manifest_to: paper_stage1_round4_view_guard_frozen_val_manifest.json
+reload_manifest_every: 1
+allow_empty_val: false
+
+train_supervision_roles: paper_main
+val_supervision_roles: paper_main
+train_target_quality_tiers: paper_strong,paper_pseudo
+val_target_quality_tiers: paper_strong,paper_pseudo
+train_paper_splits: paper_train
+val_paper_splits: paper_val_iid
+
+epochs: 48
+max_train_steps: 0
+batch_size: 4
+val_batch_size: 4
+num_workers: 4
+grad_accumulation_steps: 4
+drop_last: false
+
+optimizer: adamw
+learning_rate: 1.5e-4
+min_learning_rate: 1.0e-5
+weight_decay: 1.0e-2
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+adam_amsgrad: false
+lr_scheduler: plateau
+warmup_steps: 500
+plateau_factor: 0.5
+plateau_patience: 5
+plateau_threshold: 5.0e-4
+grad_clip_norm: 1.0
+
+atlas_size: 512
+buffer_resolution: 256
+train_view_sample_count: 8
+train_min_hard_views: 3
+train_randomize_view_subset: true
+val_view_sample_count: 24
+val_min_hard_views: 4
+amp_dtype: bfloat16
+cuda_device_index: 1
+matmul_precision: high
+allow_tf32: true
+
+disable_view_fusion: false
+disable_prior_inputs: false
+disable_residual_head: false
+enable_residual_gate: true
+residual_gate_bias: -1.10
+min_residual_gate: 0.05
+prior_confidence_gate_strength: 0.35
+
+train_balance_mode: generator_x_prior
+train_balance_power: 1.0
+train_samples_per_epoch: 0
+train_target_quality_weights: paper_strong=1.8,paper_pseudo=1.0,research_only=0.4,smoke_only=0.0
+train_failure_tag_metadata_key: failure_tags
+train_failure_tag_weights: metal_nonmetal_confusion=3.0,boundary_bleed=2.5,local_highlight_misread=2.5
+prior_dropout_prob: 0.05
+prior_dropout_start_prob: 0.05
+prior_dropout_end_prob: 0.35
+prior_dropout_warmup_epochs: 12
+
+refine_weight: 0.85
+coarse_weight: 0.35
+prior_consistency_weight: 0.12
+smoothness_weight: 0.008
+view_consistency_weight: 0.20
+view_consistency_mode: required
+
+eval_every: 1
+validation_steps: 0
+max_validation_batches: 0
+save_every: 1
+checkpointing_steps: 0
+save_only_best_checkpoint: false
+keep_last_checkpoints: 10
+log_every: 1
+val_preview_samples: 24
+early_stopping_patience: 10
+early_stopping_min_delta: 1.0e-5
+
+output_dir: output/material_refine_paper/stage1_round4_view_guard
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine
+tracker_run_name: material-refine-paper-stage1-round4-view-guard
+tracker_group: paper-stage1
+tracker_tags: material-refine,paper,stage1,round4,view-guard,residual-gate
+wandb_mode: online
+wandb_log_artifacts: true
+wandb_artifact_policy: best_and_final
+wandb_watch: false
+export_training_curves: true
+preflight_audit_records: -1
+target_prior_identity_warning_threshold: 0.20
+max_target_prior_identity_rate_for_paper: 0.30
+min_nontrivial_target_count_for_paper: 128
+fail_on_target_prior_identity: true
+seed: 20260423

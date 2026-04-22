@@ -52,7 +52,8 @@ refine_weight: 1.0
 coarse_weight: 0.35
 prior_consistency_weight: 0.10
 smoothness_weight: 0.02
-view_consistency_weight: 0.15
+view_consistency_weight: 0.0
+view_consistency_mode: disabled
 
 eval_every: 1
 validation_steps: 0
@@ -76,4 +77,6 @@ wandb_watch: false
 export_training_curves: true
 preflight_audit_records: 256
 target_prior_identity_warning_threshold: 0.95
+max_target_prior_identity_rate_for_paper: 0.30
+min_nontrivial_target_count_for_paper: 128
 seed: 42

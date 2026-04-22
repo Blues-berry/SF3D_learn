@@ -1,0 +1,4 @@
+disable_residual_head: true
+tracker_run_name: material-refine-paper-ablation-no-residual
+tracker_group: paper-ablation
+tracker_tags: material-refine,paper,ablation,no-residual

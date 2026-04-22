@@ -1,0 +1,3 @@
+eval_variant: prior_smoothing
+tracker_group: paper-ablation
+tracker_tags: material-refine,paper,ablation,prior-smoothing

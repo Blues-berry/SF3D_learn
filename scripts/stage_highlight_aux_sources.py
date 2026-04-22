@@ -6,6 +6,7 @@ import csv
 import json
 import re
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -28,11 +29,27 @@ HDRI_STRATA = {
 }
 
 OBJAVERSE_CLASS_KEYWORDS = {
-    "metal_dominant": ("metal", "chrome", "steel", "aluminum", "brass", "copper", "hardware"),
-    "ceramic_glazed_lacquer": ("ceramic", "porcelain", "vase", "tile", "glazed", "lacquer", "marble"),
-    "glass_metal": ("glass", "lamp", "lantern", "mirror", "transparent", "chandelier"),
-    "mixed_thin_boundary": ("frame", "handle", "wire", "rack", "shelf", "chair", "table", "furniture"),
-    "glossy_non_metal": ("glossy", "plastic", "leather", "polished", "painted", "acrylic", "resin"),
+    "metal_dominant": (
+        "metal", "metallic", "chrome", "steel", "aluminum", "aluminium", "brass", "copper",
+        "hardware", "silver", "gold", "iron", "tool", "gear", "bolt", "screw", "hinge",
+    ),
+    "ceramic_glazed_lacquer": (
+        "ceramic", "porcelain", "pottery", "vase", "tile", "glazed", "glaze", "lacquer",
+        "marble", "stoneware", "bowl", "plate", "dish", "cup", "mug", "sink", "toilet",
+        "statue", "figurine",
+    ),
+    "glass_metal": (
+        "glass", "lamp", "lantern", "mirror", "transparent", "translucent", "chandelier",
+        "bottle", "jar", "goblet", "window", "vitrine", "bulb", "crystal",
+    ),
+    "mixed_thin_boundary": (
+        "frame", "handle", "wire", "rack", "shelf", "chair", "table", "furniture",
+        "fence", "rail", "basket", "cage", "stand",
+    ),
+    "glossy_non_metal": (
+        "glossy", "plastic", "leather", "polished", "painted", "acrylic", "resin",
+        "varnish", "paint", "synthetic",
+    ),
 }
 
 
@@ -41,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         description="Stage auxiliary highlight sources while Pool-A rendering is already running."
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--polyhaven-count", type=int, default=60)
+    parser.add_argument("--polyhaven-count", type=int, default=900)
     parser.add_argument("--polyhaven-workers", type=int, default=8)
     parser.add_argument("--objaverse-target", type=int, default=1500)
     parser.add_argument("--objaverse-processes", type=int, default=8)
@@ -56,13 +73,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def fetch_json(url: str) -> Any:
+def fetch_json(url: str, *, attempts: int = 3, timeout: int = 60, backoff_seconds: float = 2.0) -> Any:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "stable-fast-3d-dataset-builder/1.0"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            time.sleep(backoff_seconds * attempt)
+    raise RuntimeError(f"fetch_json_failed_after_{attempts}_attempts: {url}") from last_error
 
 
 def slugify(text: str) -> str:
@@ -138,51 +164,119 @@ def select_hdri_file(files_payload: dict[str, Any]) -> tuple[str, int, str]:
     raise RuntimeError("no_hdr_file_in_polyhaven_payload")
 
 
-def download_file(url: str, output_path: Path) -> None:
+def download_file(url: str, output_path: Path, *, attempts: int = 3) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     if output_path.exists() and output_path.stat().st_size > 0:
         return
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "stable-fast-3d-dataset-builder/1.0"},
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "stable-fast-3d-dataset-builder/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=240) as response, tmp_path.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+            tmp_path.replace(output_path)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            tmp_path.unlink(missing_ok=True)
+            if attempt < attempts:
+                time.sleep(3.0 * attempt)
+    raise RuntimeError(f"download_failed_after_{attempts}_attempts: {url}") from last_error
+
+
+def build_polyhaven_row(asset: dict[str, Any], index: int, hdri_root: Path) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
+    asset_id = str(asset["asset_id"])
+    try:
+        files = fetch_json(
+            POLYHAVEN_FILES_URL.format(asset_id=asset_id),
+            attempts=2,
+            timeout=25,
+            backoff_seconds=2.0,
+        )
+        url, size, resolution = select_hdri_file(files)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            index,
+            {},
+            {
+                "source_name": "PolyHaven_HDRI",
+                "asset_id": asset_id,
+                "name": asset.get("name", asset_id),
+                "stratum": asset.get("stratum", ""),
+                "license_bucket": "cc0",
+                "download_status": "metadata_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+    local_path = hdri_root / f"{slugify(asset_id)}_{resolution}.hdr"
+    return (
+        index,
+        {
+            "source_name": "PolyHaven_HDRI",
+            "asset_id": asset_id,
+            "name": asset.get("name", asset_id),
+            "stratum": asset.get("stratum", ""),
+            "license_bucket": "cc0",
+            "resolution": resolution,
+            "download_url": url,
+            "expected_size_bytes": size,
+            "local_path": str(local_path),
+            "download_status": "queued",
+        },
+        None,
     )
-    with urllib.request.urlopen(request, timeout=180) as response, tmp_path.open("wb") as handle:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-    tmp_path.replace(output_path)
+
+
+def build_polyhaven_direct_row(asset: dict[str, Any], index: int, hdri_root: Path) -> tuple[int, dict[str, Any]]:
+    asset_id = str(asset["asset_id"])
+    resolution = "1k"
+    url = f"https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/{resolution}/{asset_id}_{resolution}.hdr"
+    local_path = hdri_root / f"{slugify(asset_id)}_{resolution}.hdr"
+    return (
+        index,
+        {
+            "source_name": "PolyHaven_HDRI",
+            "asset_id": asset_id,
+            "name": asset.get("name", asset_id),
+            "stratum": asset.get("stratum", ""),
+            "license_bucket": "cc0",
+            "resolution": resolution,
+            "download_url": url,
+            "expected_size_bytes": 0,
+            "local_path": str(local_path),
+            "download_status": "queued",
+            "url_source": "polyhaven_stable_1k_pattern",
+        },
+    )
 
 
 def stage_polyhaven(output_root: Path, count: int, workers: int) -> dict[str, Any]:
     hdri_root = output_root / "polyhaven_hdri"
-    assets = fetch_json(POLYHAVEN_ASSETS_URL)
-    selected = choose_polyhaven_assets(assets, count)
+    assets = fetch_json(POLYHAVEN_ASSETS_URL, attempts=5, timeout=90)
+    overselect_count = min(len(assets), max(count, count + 96))
+    selected = choose_polyhaven_assets(assets, overselect_count)
     jobs = []
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = [
+        row
+        for _index, row in sorted(
+            (build_polyhaven_direct_row(asset, index, hdri_root) for index, asset in enumerate(selected)),
+            key=lambda item: item[0],
+        )
+    ]
+    metadata_failures: list[dict[str, Any]] = []
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for asset in selected:
-            asset_id = str(asset["asset_id"])
-            files = fetch_json(POLYHAVEN_FILES_URL.format(asset_id=asset_id))
-            url, size, resolution = select_hdri_file(files)
-            local_path = hdri_root / f"{slugify(asset_id)}_{resolution}.hdr"
-            rows.append(
-                {
-                    "source_name": "PolyHaven_HDRI",
-                    "asset_id": asset_id,
-                    "name": asset.get("name", asset_id),
-                    "stratum": asset.get("stratum", ""),
-                    "license_bucket": "cc0",
-                    "resolution": resolution,
-                    "download_url": url,
-                    "expected_size_bytes": size,
-                    "local_path": str(local_path),
-                    "download_status": "queued",
-                }
-            )
-            jobs.append((asset_id, executor.submit(download_file, url, local_path)))
+        for row in rows:
+            local_path = Path(row["local_path"])
+            jobs.append((row["asset_id"], executor.submit(download_file, row["download_url"], local_path)))
         for asset_id, future in jobs:
             status = "downloaded"
             error = ""
@@ -196,16 +290,34 @@ def stage_polyhaven(output_root: Path, count: int, workers: int) -> dict[str, An
                     row["download_status"] = status
                     row["error"] = error
                     break
-    manifest_csv = output_root / "polyhaven_hdri_bank_60.csv"
-    manifest_json = output_root / "polyhaven_hdri_bank_60.json"
+    manifest_csv = output_root / f"polyhaven_hdri_bank_{count}.csv"
+    manifest_json = output_root / f"polyhaven_hdri_bank_{count}.json"
+    latest_csv = output_root / "polyhaven_hdri_bank.csv"
+    latest_json = output_root / "polyhaven_hdri_bank.json"
     write_csv(manifest_csv, rows)
-    write_json(manifest_json, {"source": "PolyHaven_HDRI", "count": len(rows), "records": rows})
+    write_csv(latest_csv, rows)
+    payload = {
+        "source": "PolyHaven_HDRI",
+        "requested_count": int(count),
+        "candidate_count": len(selected),
+        "count": len(rows),
+        "metadata_failed_count": len(metadata_failures),
+        "metadata_failures": metadata_failures,
+        "records": rows,
+    }
+    write_json(manifest_json, payload)
+    write_json(latest_json, payload)
     return {
         "source": "PolyHaven_HDRI",
+        "requested": int(count),
+        "candidates": len(selected),
         "records": len(rows),
         "downloaded": sum(row["download_status"] == "downloaded" for row in rows),
+        "metadata_failed": len(metadata_failures),
         "manifest_csv": str(manifest_csv),
         "manifest_json": str(manifest_json),
+        "latest_manifest_csv": str(latest_csv),
+        "latest_manifest_json": str(latest_json),
     }
 
 
@@ -379,15 +491,16 @@ def main() -> None:
         summary["outputs"].append(
             stage_polyhaven(args.output_root, args.polyhaven_count, args.polyhaven_workers)
         )
-    summary["outputs"].append(
-        stage_objaverse(
-            args.output_root,
-            target=args.objaverse_target,
-            processes=args.objaverse_processes,
-            download=args.download_objaverse,
-            allowed_sources=args.objaverse_allowed_sources,
+    if args.objaverse_target > 0:
+        summary["outputs"].append(
+            stage_objaverse(
+                args.output_root,
+                target=args.objaverse_target,
+                processes=args.objaverse_processes,
+                download=args.download_objaverse,
+                allowed_sources=args.objaverse_allowed_sources,
+            )
         )
-    )
     summary["elapsed_seconds"] = round(time.time() - started, 3)
     write_json(args.output_root / "aux_source_stage_summary.json", summary)
     print(json.dumps(summary, indent=2))

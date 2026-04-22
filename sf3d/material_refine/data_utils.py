@@ -95,13 +95,23 @@ def filter_records(
     generator_ids: Sequence[str] | str | None = None,
     source_names: Sequence[str] | str | None = None,
     supervision_tiers: Sequence[str] | str | None = None,
+    supervision_roles: Sequence[str] | str | None = None,
     license_buckets: Sequence[str] | str | None = None,
+    target_quality_tiers: Sequence[str] | str | None = None,
+    paper_splits: Sequence[str] | str | None = None,
+    material_families: Sequence[str] | str | None = None,
+    lighting_bank_ids: Sequence[str] | str | None = None,
     require_prior: bool | None = None,
 ) -> list[CanonicalAssetRecordV1]:
     allowed_generators = normalize_optional_values(generator_ids)
     allowed_sources = normalize_optional_values(source_names)
     allowed_tiers = normalize_optional_values(supervision_tiers)
+    allowed_roles = normalize_optional_values(supervision_roles)
     allowed_licenses = normalize_optional_values(license_buckets)
+    allowed_target_quality_tiers = normalize_optional_values(target_quality_tiers)
+    allowed_paper_splits = normalize_optional_values(paper_splits)
+    allowed_material_families = normalize_optional_values(material_families)
+    allowed_lighting_bank_ids = normalize_optional_values(lighting_bank_ids)
 
     filtered = []
     for record in records:
@@ -112,7 +122,26 @@ def filter_records(
             continue
         if allowed_tiers is not None and record.supervision_tier not in allowed_tiers:
             continue
+        if allowed_roles is not None and record.supervision_role not in allowed_roles:
+            continue
         if allowed_licenses is not None and record.license_bucket not in allowed_licenses:
+            continue
+        if (
+            allowed_target_quality_tiers is not None
+            and record.target_quality_tier not in allowed_target_quality_tiers
+        ):
+            continue
+        if allowed_paper_splits is not None and str(record.paper_split or "unknown") not in allowed_paper_splits:
+            continue
+        if (
+            allowed_material_families is not None
+            and str(record.material_family or "unknown") not in allowed_material_families
+        ):
+            continue
+        if (
+            allowed_lighting_bank_ids is not None
+            and str(record.lighting_bank_id or "unknown") not in allowed_lighting_bank_ids
+        ):
             continue
         if require_prior is not None and bool(record.has_material_prior) != require_prior:
             continue
@@ -126,14 +155,23 @@ def summarize_records(records: Iterable[CanonicalAssetRecordV1]) -> dict[str, An
     summary = {
         "records": len(records),
         "default_split": dict(Counter(record.default_split for record in records)),
+        "paper_split": dict(Counter(str(record.paper_split or "unknown") for record in records)),
         "generator_id": dict(Counter(record.generator_id for record in records)),
         "source_name": dict(source_counts),
         "supervision_tier": dict(Counter(record.supervision_tier for record in records)),
+        "supervision_role": dict(Counter(record.supervision_role for record in records)),
         "license_bucket": dict(Counter(record.license_bucket for record in records)),
         "prior_mode": dict(Counter(record.prior_mode for record in records)),
+        "target_quality_tier": dict(Counter(record.target_quality_tier for record in records)),
+        "material_family": dict(Counter(str(record.material_family or "unknown") for record in records)),
+        "lighting_bank_id": dict(Counter(str(record.lighting_bank_id or "unknown") for record in records)),
         "has_material_prior": {
             "true": sum(1 for record in records if record.has_material_prior),
             "false": sum(1 for record in records if not record.has_material_prior),
+        },
+        "view_supervision_ready": {
+            "true": sum(1 for record in records if record.view_supervision_ready),
+            "false": sum(1 for record in records if not record.view_supervision_ready),
         },
     }
     return summary

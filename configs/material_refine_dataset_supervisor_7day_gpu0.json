@@ -1,0 +1,108 @@
+{
+  "supervisor_version": "sf3d_material_refine_dataset_supervisor_7day_v1",
+  "notes": [
+    "Data-only supervisor: keeps download, render/preprocess, merge, audit, and validation loops alive for seven days.",
+    "GPU1 is intentionally kept free; all supervised render/preprocess sessions must target GPU0.",
+    "No training command is launched from this supervisor."
+  ],
+  "duration_days": 7,
+  "poll_seconds": 300,
+  "session_name": "sf3d_material_refine_dataset_7day_supervisor",
+  "output_root": "output/material_refine_dataset_factory/supervisor_7day",
+  "python_bin": "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+  "factory": {
+    "enabled": true,
+    "session": "sf3d_material_refine_dataset_factory_gpu0",
+    "config": "configs/material_refine_dataset_factory_gpu0.json",
+    "state_json": "output/material_refine_dataset_factory/factory_state.json",
+    "log": "output/material_refine_dataset_factory/factory_gpu0_loop.log",
+    "run_script": "output/material_refine_dataset_factory/factory_gpu0_loop.run.sh",
+    "loop_flags": [
+      "--loop",
+      "--start-downloads",
+      "--start-render",
+      "--audit"
+    ]
+  },
+  "gpu_policy": {
+    "render_gpu": 0,
+    "keep_gpu_indices_empty": [
+      1
+    ],
+    "warn_if_data_process_on_gpu1": true
+  },
+  "downloads": {
+    "required_sessions": [
+      "sf3d_factory_polyhaven_hdri",
+      "sf3d_factory_objaverse_cached_increment",
+      "sf3d_factory_objaverse_strict_full_retry",
+      "sf3d_factory_polyhaven_material_bank"
+    ]
+  },
+  "production_roots": {
+    "patterns": [
+      "output/material_refine_dataset_factory/longrun_gpu0_*"
+    ],
+    "latest_only": true,
+    "required_prefixes": [
+      "sf3d_longrun_material_refine_shard",
+      "sf3d_longrun_material_refine_merged_monitor"
+    ],
+    "merge_output_name": "canonical_manifest_supervisor_merged.json"
+  },
+  "paper_unlock": {
+    "enabled": true,
+    "root_pattern": "output/material_refine_dataset_factory/paper_unlock_gpu0_*",
+    "latest_only": true,
+    "target_eligible_records": 128,
+    "target_total_records": 256,
+    "required_prefixes": [
+      "sf3d_paper_unlock_material_refine_shard",
+      "sf3d_paper_unlock_material_refine_merged_monitor"
+    ],
+    "merge_output_name": "canonical_manifest_supervisor_merged.json",
+    "launch_env": {
+      "SESSION_PREFIX": "sf3d_paper_unlock_material_refine",
+      "MAX_RECORDS": "256",
+      "SHARDS": "4",
+      "GPU_LIST": "0",
+      "WORKERS_PER_GPU": "1",
+      "VIEW_LIGHT_PROTOCOL": "standard_12",
+      "MAX_HDRI_LIGHTS": "2",
+      "MIN_HDRI_COUNT": "900",
+      "ATLAS_RESOLUTION": "768",
+      "RENDER_RESOLUTION": "256",
+      "CYCLES_SAMPLES": "8",
+      "REFRESH_PARTIAL_EVERY": "1",
+      "MERGED_MONITOR_POLL_SECONDS": "30",
+      "LONGRUN_INPUT_MANIFESTS": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "PAPER_MAIN_SOURCES": "ABO_locked_core",
+      "AUXILIARY_SOURCES": "",
+      "PRIORITY_MATERIAL_FAMILIES": "metal_dominant,glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal",
+      "PAPER_FRONTLOAD_RECORDS": "256",
+      "PREFER_PAPER_MAIN_FIRST": "1",
+      "START_MERGED_MONITOR": "1"
+    }
+  },
+  "quality": {
+    "enabled": true,
+    "audit_every_seconds": 900,
+    "buffer_validation_every_seconds": 1800,
+    "min_manifest_records_for_audit": 8,
+    "min_paper_eligible": 128,
+    "min_view_ready_rate": 0.8,
+    "min_strict_complete_rate": 0.8
+  },
+  "log_scan": {
+    "enabled": true,
+    "patterns": [
+      "unhashable type",
+      "Out of memory",
+      "CUDA error",
+      "RuntimeError: Error",
+      "Traceback",
+      "Error:"
+    ],
+    "max_lines": 120
+  }
+}
