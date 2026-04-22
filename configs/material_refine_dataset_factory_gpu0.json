@@ -12,7 +12,7 @@
     "poll_seconds": 300
   },
   "download_network": {
-    "proxy_candidates": ["env", "direct"],
+    "proxy_candidates": ["env", "http://127.0.0.1:51081", "direct"],
     "proxy_probe_timeout_seconds": 8,
     "default_probe_url": "https://huggingface.co/"
   },
@@ -50,6 +50,14 @@
       "promotion_gate": "license + import + material-probe + target gate"
     },
     {
+      "name": "Objaverse-XL_github_lfs_increment",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "GitHub/LFS permissive object expansion now that git-lfs is installed",
+      "manifest": "output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json",
+      "license_policy": "mixed individual licenses; filtered before render",
+      "promotion_gate": "license + import + material-probe + target gate"
+    },
+    {
       "name": "Objaverse-XL_strict_filtered_retry",
       "pool": "Pool-A auxiliary upgrade queue",
       "role": "network-fed Objaverse increment",
@@ -69,7 +77,7 @@
       "name": "PolyHaven_Materials",
       "pool": "Pool-E",
       "role": "PBR material prior bank",
-      "manifest": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials/polyhaven_material_bank_manifest.json",
+      "manifest": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory/polyhaven_material_bank_manifest.json",
       "license_policy": "CC0",
       "promotion_gate": "material prior only; not object supervision"
     },
@@ -101,7 +109,8 @@
     "session_prefix": "sf3d_longrun_material_refine",
     "input_manifests": [
       "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
-      "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json"
+      "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json",
+      "output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json"
     ],
     "input_manifest_globs": [
       "output/material_refine_aux_downloads/objaverse_cached_factory_canonical/material_refine_manifest_objaverse_increment.json",
@@ -113,6 +122,7 @@
     "priority_material_families": "metal_dominant,glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal",
     "paper_frontload_records": 256,
     "prefer_paper_main_first": false,
+    "interleave_selection_keys": "material_family,source_name,has_material_prior",
     "max_records": 9700,
     "shards": 8,
     "workers_per_gpu": 1,
@@ -154,6 +164,7 @@
       "session": "sf3d_factory_objaverse_cached_increment",
       "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory",
       "retry_seconds": 900,
+      "timeout_seconds": 5400,
       "proxy_probe_url": "https://huggingface.co/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -168,6 +179,32 @@
         "6000",
         "--processes",
         "12",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_github_lfs_cached_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_github_lfs_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_github_lfs_factory",
+      "retry_seconds": 1200,
+      "timeout_seconds": 7200,
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_github_lfs_factory",
+        "--sources",
+        "github",
+        "--target",
+        "600",
+        "--processes",
+        "4",
+        "--github-save-repo-format",
+        "files",
         "--download"
       ]
     },
@@ -206,7 +243,13 @@
         "--output-root",
         "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory",
         "--target",
-        "1000"
+        "1000",
+        "--request-retries",
+        "7",
+        "--download-retries",
+        "5",
+        "--retry-delay",
+        "2.0"
       ]
     }
   ],
@@ -216,6 +259,12 @@
       "enabled": true,
       "input_json": "output/material_refine_aux_downloads/objaverse_cached_factory/objaverse_cached_increment_manifest.json",
       "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory_canonical"
+    },
+    {
+      "name": "objaverse_github_lfs_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_github_lfs_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_github_lfs_factory_canonical"
     },
     {
       "name": "objaverse_strict_factory_to_canonical",

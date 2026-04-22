@@ -176,6 +176,48 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def reconcile_cached_downloads(download_root: Path, selected: pd.DataFrame) -> dict[str, str]:
+    if selected.empty or "sha256" not in selected.columns:
+        return {}
+    wanted = {
+        str(row["sha256"]).lower(): str(row["fileIdentifier"])
+        for _index, row in selected.iterrows()
+        if str(row.get("sha256") or "").strip()
+    }
+    if not wanted:
+        return {}
+    search_roots = [
+        download_root / "hf-objaverse-v1" / "glbs",
+        download_root / "smithsonian",
+    ]
+    recovered: dict[str, str] = {}
+    extensions = {".glb", ".gltf", ".obj", ".fbx"}
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if len(recovered) >= len(wanted):
+                return recovered
+            if not path.is_file() or path.suffix.lower() not in extensions:
+                continue
+            try:
+                digest = file_sha256(path)
+            except OSError:
+                continue
+            identifier = wanted.get(digest)
+            if identifier and identifier not in recovered:
+                recovered[identifier] = str(path)
+    return recovered
+
+
 def main() -> None:
     args = parse_args()
     sources = [source.strip().lower() for source in args.sources.split(",") if source.strip()]
@@ -217,6 +259,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             download_error = f"{type(exc).__name__}: {exc}"
 
+    recovered_results = reconcile_cached_downloads(args.objaverse_root.parent, selected)
+    if recovered_results:
+        download_results = {**recovered_results, **download_results}
+
     rows: list[dict[str, Any]] = []
     for _index, row in selected.iterrows():
         identifier = str(row["fileIdentifier"])
@@ -254,7 +300,13 @@ def main() -> None:
     }
     write_csv(manifest_csv, rows)
     write_json(manifest_json, payload)
-    print(json.dumps(payload, indent=2))
+    print(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "records"},
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

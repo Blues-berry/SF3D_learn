@@ -5,6 +5,8 @@ import argparse
 import csv
 import hashlib
 import json
+import os
+import random
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -92,6 +94,9 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated canonical maps to try per material.",
     )
     parser.add_argument("--request-delay", type=float, default=0.08)
+    parser.add_argument("--request-retries", type=int, default=5)
+    parser.add_argument("--download-retries", type=int, default=4)
+    parser.add_argument("--retry-delay", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -103,10 +108,34 @@ def stable_id(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:20]
 
 
-def request_json(url: str) -> dict[str, Any]:
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
-    response.raise_for_status()
-    return response.json()
+def sleep_before_retry(base_delay: float, attempt: int) -> None:
+    delay = max(0.0, base_delay) * (2 ** max(0, attempt - 1))
+    time.sleep(delay + random.uniform(0.0, min(1.0, max(0.0, base_delay))))
+
+
+def request_json(
+    session: requests.Session,
+    url: str,
+    *,
+    attempts: int,
+    retry_delay: float,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            response = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError(f"Expected JSON object from {url}, got {type(payload).__name__}")
+            return payload
+        except (requests.RequestException, json.JSONDecodeError, TypeError) as exc:
+            last_error = exc
+            if attempt >= max(1, attempts):
+                break
+            print(f"request retry {attempt}/{attempts} for {url}: {exc}", flush=True)
+            sleep_before_retry(retry_delay, attempt)
+    raise RuntimeError(f"request failed after {attempts} attempts for {url}: {last_error}")
 
 
 def material_bucket(asset_id: str, metadata: dict[str, Any]) -> tuple[str, int]:
@@ -189,17 +218,48 @@ def choose_file(
     return None
 
 
-def download_file(url: str, path: Path, expected_size: int | None) -> str:
+def download_file(
+    session: requests.Session,
+    url: str,
+    path: Path,
+    expected_size: int | None,
+    *,
+    attempts: int,
+    retry_delay: float,
+) -> str:
     if path.exists() and (not expected_size or path.stat().st_size == expected_size):
         return "cached"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120) as response:
-        response.raise_for_status()
-        with path.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
-    return "downloaded"
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            with session.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120) as response:
+                response.raise_for_status()
+                with tmp_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+            if expected_size and tmp_path.stat().st_size != expected_size:
+                raise OSError(
+                    f"size mismatch for {url}: expected {expected_size}, got {tmp_path.stat().st_size}"
+                )
+            os.replace(tmp_path, path)
+            return "downloaded"
+        except (requests.RequestException, OSError) as exc:
+            last_error = exc
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            if attempt >= max(1, attempts):
+                break
+            print(f"download retry {attempt}/{attempts} for {url}: {exc}", flush=True)
+            sleep_before_retry(retry_delay, attempt)
+    raise RuntimeError(f"download failed after {attempts} attempts for {url}: {last_error}")
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -221,13 +281,39 @@ def main() -> None:
     args = parse_args()
     requested_maps = [name.strip().lower() for name in args.maps.split(",") if name.strip()]
     args.output_root.mkdir(parents=True, exist_ok=True)
-    assets = request_json(ASSETS_URL)
+    session = requests.Session()
+    assets = request_json(
+        session,
+        ASSETS_URL,
+        attempts=args.request_retries,
+        retry_delay=args.retry_delay,
+    )
     selected = select_assets(assets, args.target)
 
     records: list[dict[str, Any]] = []
     map_records: list[dict[str, Any]] = []
+    failed_assets: list[dict[str, Any]] = []
+    failed_maps: list[dict[str, Any]] = []
     for index, (asset_id, metadata, bucket) in enumerate(selected, start=1):
-        file_tree = request_json(FILES_URL.format(asset_id=asset_id))
+        try:
+            file_tree = request_json(
+                session,
+                FILES_URL.format(asset_id=asset_id),
+                attempts=args.request_retries,
+                retry_delay=args.retry_delay,
+            )
+        except Exception as exc:
+            failed_assets.append(
+                {
+                    "asset_id": asset_id,
+                    "name": metadata.get("name") or asset_id,
+                    "highlight_material_class": bucket,
+                    "error": str(exc),
+                }
+            )
+            print(f"[{index}/{len(selected)}] {asset_id}: metadata failed, skipped: {exc}", flush=True)
+            time.sleep(args.request_delay)
+            continue
         time.sleep(args.request_delay)
         material_id = f"polyhaven_mat_{stable_id(asset_id)}"
         material_dir = args.output_root / "materials" / material_id
@@ -240,7 +326,40 @@ def main() -> None:
             url = str(file_info["url"])
             suffix = Path(url.split("?")[0]).suffix or f".{args.file_format}"
             local_path = material_dir / f"{canonical_map}{suffix}"
-            status = download_file(url, local_path, int(file_info.get("size") or 0) or None)
+            try:
+                status = download_file(
+                    session,
+                    url,
+                    local_path,
+                    int(file_info.get("size") or 0) or None,
+                    attempts=args.download_retries,
+                    retry_delay=args.retry_delay,
+                )
+            except Exception as exc:
+                failed_maps.append(
+                    {
+                        "material_id": material_id,
+                        "asset_id": asset_id,
+                        "canonical_map": canonical_map,
+                        "source_map_name": source_map_name,
+                        "url": url,
+                        "error": str(exc),
+                    }
+                )
+                map_records.append(
+                    {
+                        "material_id": material_id,
+                        "asset_id": asset_id,
+                        "canonical_map": canonical_map,
+                        "source_map_name": source_map_name,
+                        "status": "failed",
+                        "local_path": str(local_path),
+                        "url": url,
+                        "bytes": file_info.get("size") or "",
+                    }
+                )
+                print(f"[{index}/{len(selected)}] {asset_id}: {canonical_map} failed: {exc}", flush=True)
+                continue
             downloaded_maps[canonical_map] = str(local_path)
             map_records.append(
                 {
@@ -278,9 +397,14 @@ def main() -> None:
         "resolution": args.resolution,
         "preferred_format": args.file_format,
         "requested_maps": requested_maps,
-        "downloaded_map_count": len(map_records),
+        "downloaded_map_count": sum(1 for row in map_records if row.get("status") != "failed"),
+        "map_attempt_count": len(map_records),
+        "failed_asset_count": len(failed_assets),
+        "failed_map_count": len(failed_maps),
         "license_policy": "Poly Haven asset pages state assets are CC0; API used with a User-Agent for research staging.",
         "material_counts": dict(Counter(row["highlight_material_class"] for row in records)),
+        "failed_assets": failed_assets,
+        "failed_maps": failed_maps,
         "records": records,
         "maps": map_records,
     }

@@ -167,6 +167,7 @@ def start_retry_session(
     command: list[str],
     output_root: Path,
     retry_seconds: int,
+    timeout_seconds: int,
     proxy_probe_url: str | None,
     proxy_candidates: list[str],
     proxy_probe_timeout_seconds: int,
@@ -176,6 +177,11 @@ def start_retry_session(
     log_dir.mkdir(parents=True, exist_ok=True)
     run_script = log_dir / f"{session}.run.sh"
     log_path = log_dir / f"{session}.log"
+    command_line = shell_join(command)
+    if timeout_seconds > 0:
+        # Do not use --foreground here: Objaverse downloaders spawn worker
+        # children, and foreground timeout can leave those workers orphaned.
+        command_line = f"timeout -k 60s {int(timeout_seconds)} {command_line}"
     script = f"""#!/usr/bin/env bash
 set -uo pipefail
 cd {shlex.quote(str(REPO_ROOT))}
@@ -184,7 +190,7 @@ while true; do
   attempt=$((attempt + 1))
   echo "==== ${{attempt}} $(date -Iseconds) ===="
 {proxy_probe_shell(proxy_probe_url, proxy_candidates, proxy_probe_timeout_seconds)}
-  {shell_join(command)}
+  {command_line}
   rc=$?
   echo "==== exit ${{rc}} $(date -Iseconds) ===="
   if [ $rc -eq 0 ]; then
@@ -223,6 +229,7 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
                     command=[str(item) for item in source["command"]],
                     output_root=REPO_ROOT / str(source["output_root"]),
                     retry_seconds=int(source.get("retry_seconds", 900)),
+                    timeout_seconds=int(source.get("timeout_seconds", 0)),
                     proxy_probe_url=source.get("proxy_probe_url") or config.get("download_network", {}).get("default_probe_url"),
                     proxy_candidates=[
                         str(item)
@@ -266,6 +273,7 @@ def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             ),
             "PAPER_FRONTLOAD_RECORDS": str(longrun.get("paper_frontload_records", 0)),
             "PREFER_PAPER_MAIN_FIRST": "1" if bool(longrun.get("prefer_paper_main_first", True)) else "0",
+            "INTERLEAVE_SELECTION_KEYS": str(longrun.get("interleave_selection_keys", "")),
             "MAX_RECORDS": str(longrun["max_records"]),
             "SHARDS": str(longrun["shards"]),
             "GPU_LIST": str(config["gpu_policy"].get("render_gpu_list", "0")),
@@ -482,10 +490,10 @@ def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]
 
 def main() -> None:
     args = parse_args()
-    config = read_json(args.config)
     if not args.once and not args.loop:
         args.once = True
     while True:
+        config = read_json(args.config)
         state = run_once(args, config)
         write_json(args.state_json, state)
         print(json.dumps(state, indent=2, ensure_ascii=False))

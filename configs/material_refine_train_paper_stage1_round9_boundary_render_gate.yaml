@@ -1,15 +1,12 @@
-# Paper-stage Round6: boundary/safety training with cleaned validation and W&B policy.
-# This keeps the Round5 objective, but fixes experiment hygiene:
-# - validation runs at 40 total-progress milestones instead of every epoch
-# - validation manifest is material-family balanced when the data supports it
-# - W&B logs only compact metrics and small per-object comparison panels
+# Paper-stage Round9 draft: boundary + render-proxy validation gate.
+# Round8 promotion failed, so Round9 starts from the steadier Round7 model weights only.
 
 train_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 val_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 train_split: train
 val_split: val
 split_strategy: manifest
-freeze_val_manifest_to: paper_stage1_round6_wandb_clean_frozen_val_manifest.json
+freeze_val_manifest_to: paper_stage1_round9_boundary_render_gate_frozen_val_manifest.json
 reload_manifest_every: 1
 allow_empty_val: false
 
@@ -20,7 +17,7 @@ val_target_quality_tiers: paper_strong,paper_pseudo
 train_paper_splits: paper_train
 val_paper_splits: paper_val_iid
 
-epochs: 40
+epochs: 46
 batch_size: 4
 val_batch_size: 4
 num_workers: 4
@@ -34,7 +31,7 @@ adam_beta2: 0.999
 adam_epsilon: 1.0e-8
 adam_amsgrad: false
 lr_scheduler: plateau
-warmup_steps: 400
+warmup_steps: 450
 plateau_factor: 0.5
 plateau_patience: 4
 plateau_threshold: 5.0e-4
@@ -59,41 +56,47 @@ disable_view_fusion: false
 disable_prior_inputs: false
 disable_residual_head: false
 enable_residual_gate: true
-residual_gate_bias: -1.55
-min_residual_gate: 0.02
+residual_gate_bias: -1.50
+min_residual_gate: 0.025
 prior_confidence_gate_strength: 0.55
 
-train_balance_mode: generator_x_prior
+train_balance_mode: material_x_source_x_prior
 train_balance_power: 1.0
 train_samples_per_epoch: 0
 train_target_quality_weights: paper_strong=1.8,paper_pseudo=1.0,research_only=0.4,smoke_only=0.0
 train_failure_tag_metadata_key: failure_tags
-train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=4.0,local_highlight_misread=2.5,over_smoothing=1.5
+train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=5.0,local_highlight_misread=2.5,over_smoothing=1.8
 prior_dropout_prob: 0.05
-prior_dropout_start_prob: 0.03
-prior_dropout_end_prob: 0.20
-prior_dropout_warmup_epochs: 10
+prior_dropout_start_prob: 0.04
+prior_dropout_end_prob: 0.22
+prior_dropout_warmup_epochs: 12
 
-refine_weight: 0.72
+refine_weight: 0.74
 coarse_weight: 0.30
-prior_consistency_weight: 0.20
-smoothness_weight: 0.004
-view_consistency_weight: 0.35
-edge_aware_weight: 0.18
+prior_consistency_weight: 0.18
+smoothness_weight: 0.001
+view_consistency_weight: 0.36
+edge_aware_weight: 0.10
 edge_aware_epsilon: 1.0e-3
-metallic_classification_weight: 0.06
-residual_safety_weight: 0.16
+boundary_bleed_weight: 0.10
+boundary_band_kernel: 7
+gradient_preservation_weight: 0.10
+metallic_classification_weight: 0.08
+residual_safety_weight: 0.20
 residual_safety_margin: 0.035
 view_consistency_mode: required
 
 eval_every: 1
 validation_steps: 0
 validation_progress_milestones: 40
+render_proxy_validation_milestone_interval: 10
+render_proxy_validation_max_batches: 4
 max_validation_batches: 0
 save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: true
 keep_last_checkpoints: 4
+init_from_checkpoint: output/material_refine_paper/stage1_round7_gradient_guard/best.pt
 log_every: 1
 progress_bar: true
 progress_bar_leave: false
@@ -106,12 +109,12 @@ save_preview_contact_sheet: false
 early_stopping_patience: 8
 early_stopping_min_delta: 1.0e-5
 
-output_dir: output/material_refine_paper/stage1_round6_wandb_clean
+output_dir: output/material_refine_paper/stage1_round9_boundary_render_gate
 report_to: wandb
 tracker_project_name: stable-fast-3d-material-refine
-tracker_run_name: material-refine-paper-stage1-round6-wandb-clean
+tracker_run_name: material-refine-paper-stage1-round9-boundary-render-gate
 tracker_group: paper-stage1
-tracker_tags: material-refine,paper,stage1,round6,wandb-clean,boundary-safety,edge-aware,residual-safety
+tracker_tags: material-refine,paper,stage1,round9,boundary-band,render-proxy-gate,residual-safety
 wandb_mode: online
 wandb_log_artifacts: true
 wandb_artifact_policy: best_and_final
@@ -126,4 +129,4 @@ target_prior_identity_warning_threshold: 0.20
 max_target_prior_identity_rate_for_paper: 0.30
 min_nontrivial_target_count_for_paper: 128
 fail_on_target_prior_identity: true
-seed: 20260425
+seed: 20260428

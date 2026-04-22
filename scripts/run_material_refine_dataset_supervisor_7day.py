@@ -203,6 +203,29 @@ def discover_latest_root(pattern: str) -> Path | None:
     return roots[-1] if roots else None
 
 
+def production_root_groups(config: dict[str, Any]) -> list[dict[str, Any]]:
+    production = dict(config.get("production_roots") or {})
+    nested_groups = production.pop("groups", []) or []
+    groups: list[dict[str, Any]] = []
+    if production.get("patterns"):
+        production.setdefault("name", "production_longrun")
+        groups.append(production)
+
+    defaults = {
+        "latest_only": bool(production.get("latest_only", True)),
+        "merge_output_name": str(production.get("merge_output_name", "canonical_manifest_supervisor_merged.json")),
+        "required_prefixes": [str(item) for item in production.get("required_prefixes", [])],
+    }
+    for index, item in enumerate(nested_groups):
+        if not isinstance(item, dict) or not item.get("patterns"):
+            continue
+        group = dict(defaults)
+        group.update(item)
+        group.setdefault("name", f"production_group_{index}")
+        groups.append(group)
+    return groups
+
+
 def run_script_session_name(run_script: Path) -> str:
     name = run_script.name
     if name.endswith(".run.sh"):
@@ -614,20 +637,104 @@ def scan_recent_errors(config: dict[str, Any], output_root: Path) -> dict[str, A
     patterns = [str(item) for item in scan.get("patterns", [])]
     if not patterns:
         return {"action": "no_patterns"}
-    logs = [
-        "output/material_refine_dataset_factory/**/*.log",
-        "output/material_refine_aux_downloads/**/*.log",
-        "output/highlight_pool_a_8k/aux_sources/**/*.log",
-    ]
-    regex = "|".join(re.escape(pattern) for pattern in patterns)
-    command = [
-        "bash",
-        "-lc",
-        f"rg -n --glob '*.log' {shlex.quote(regex)} {' '.join(shlex.quote(item) for item in logs)} 2>/dev/null | tail -{int(scan.get('max_lines', 120))} || true",
-    ]
-    result = run_capture(command, timeout=60)
-    lines = result.stdout.splitlines()
+    regex = re.compile("|".join(re.escape(pattern) for pattern in patterns))
+    tail_bytes = int(scan.get("tail_bytes_per_log", 2 * 1024 * 1024))
+    max_lines = int(scan.get("max_lines", 120))
+    scan_from_end_on_first_seen = bool(scan.get("scan_from_end_on_first_seen", True))
+    offsets_path = output_root / "log_scan_offsets.json"
+    try:
+        offsets = json.loads(offsets_path.read_text(encoding="utf-8")) if offsets_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        offsets = {}
+    if not isinstance(offsets, dict):
+        offsets = {}
+    ignore_names = {
+        "sf3d_material_refine_dataset_7day_supervisor.log",
+        *[str(item) for item in scan.get("ignore_names", [])],
+    }
+    ignore_path_contains = [str(item) for item in scan.get("ignore_path_contains", [])]
+    log_roots: list[Path] = []
+    for production in production_root_groups(config):
+        log_roots.extend(
+            root / "logs"
+            for root in discover_latest_roots(
+                [str(item) for item in production.get("patterns", [])],
+                latest_only=bool(production.get("latest_only", True)),
+            )
+        )
+    paper = config.get("paper_unlock", {})
+    paper_root = discover_latest_root(str(paper.get("root_pattern", ""))) if paper else None
+    if paper_root is not None:
+        log_roots.append(paper_root / "logs")
+    log_roots.append(output_root)
+    factory = config.get("factory", {})
+    if factory.get("log"):
+        log_roots.append(REPO_ROOT / str(factory["log"]))
+    if factory.get("config"):
+        factory_config_path = REPO_ROOT / str(factory["config"])
+        if factory_config_path.exists():
+            try:
+                factory_config = json.loads(factory_config_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                factory_config = {}
+            for item in factory_config.get("downloads", []):
+                output_dir = REPO_ROOT / str(item.get("output_root", ""))
+                session = str(item.get("session") or "")
+                if session:
+                    log_roots.append(output_dir / "logs" / f"{session}.log")
+
+    log_paths: list[Path] = []
+    seen: set[str] = set()
+    for root in log_roots:
+        if not root.exists():
+            continue
+        if root.is_file() and root.suffix == ".log":
+            candidates = [root]
+        else:
+            candidates = sorted(root.rglob("*.log"))
+        for path in candidates:
+            if path.name in ignore_names:
+                continue
+            if any(token and token in str(path) for token in ignore_path_contains):
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            log_paths.append(path)
+
+    matches: list[str] = []
+    new_offsets: dict[str, int] = {}
+    for path in log_paths:
+        key = str(path.resolve())
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            continue
+        previous_offset = offsets.get(key)
+        if previous_offset is None and scan_from_end_on_first_seen:
+            new_offsets[key] = file_size
+            continue
+        if isinstance(previous_offset, int):
+            start_offset = max(0, min(previous_offset, file_size))
+        elif tail_bytes > 0:
+            start_offset = max(0, file_size - tail_bytes)
+        else:
+            start_offset = 0
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start_offset, os.SEEK_SET)
+                raw = handle.read()
+        except OSError:
+            continue
+        new_offsets[key] = file_size
+        text = raw.decode("utf-8", errors="replace")
+        for offset, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                matches.append(f"{path}:{start_offset}+{offset}:{line}")
+    lines = matches[-max_lines:]
     payload = {"action": "scanned", "count": len(lines), "lines": lines}
+    write_json(offsets_path, new_offsets)
     write_json(output_root / "recent_errors.json", payload)
     return payload
 
@@ -690,33 +797,34 @@ def supervise_once(
     sessions = set(tmux_sessions())
 
     roots: list[dict[str, Any]] = []
-    production = config.get("production_roots", {})
-    for root in discover_latest_roots(
-        [str(item) for item in production.get("patterns", [])],
-        latest_only=bool(production.get("latest_only", True)),
-    ):
-        root_actions = restart_missing_root_sessions(
-            root,
-            prefixes=[str(item) for item in production.get("required_prefixes", [])],
-            sessions=sessions,
-            dry_run=dry_run,
-        )
-        merge = merge_root_manifest(
-            root,
-            output_name=str(production.get("merge_output_name", "canonical_manifest_supervisor_merged.json")),
-            python_bin=python_bin,
-            dry_run=dry_run,
-        )
-        manifest = root / str(production.get("merge_output_name", "canonical_manifest_supervisor_merged.json"))
-        roots.append(
-            {
-                "root": str(root),
-                "type": "production_longrun",
-                "actions": root_actions,
-                "merge": merge,
-                "manifest_summary": summarize_manifest(manifest),
-            }
-        )
+    for production in production_root_groups(config):
+        group_name = str(production.get("name", "production_longrun"))
+        for root in discover_latest_roots(
+            [str(item) for item in production.get("patterns", [])],
+            latest_only=bool(production.get("latest_only", True)),
+        ):
+            root_actions = restart_missing_root_sessions(
+                root,
+                prefixes=[str(item) for item in production.get("required_prefixes", [])],
+                sessions=sessions,
+                dry_run=dry_run,
+            )
+            merge = merge_root_manifest(
+                root,
+                output_name=str(production.get("merge_output_name", "canonical_manifest_supervisor_merged.json")),
+                python_bin=python_bin,
+                dry_run=dry_run,
+            )
+            manifest = root / str(production.get("merge_output_name", "canonical_manifest_supervisor_merged.json"))
+            roots.append(
+                {
+                    "root": str(root),
+                    "type": group_name,
+                    "actions": root_actions,
+                    "merge": merge,
+                    "manifest_summary": summarize_manifest(manifest),
+                }
+            )
 
     actions["paper_unlock"] = ensure_paper_unlock(config, sessions=set(tmux_sessions()), python_bin=python_bin, dry_run=dry_run)
     paper = config.get("paper_unlock", {})
@@ -793,11 +901,11 @@ def supervise_once(
 
 def main() -> None:
     args = parse_args()
-    config = read_json(args.config)
     start_time = utc_now_dt()
-    deadline = start_time + timedelta(days=float(config.get("duration_days", 7)))
-    poll_seconds = int(config.get("poll_seconds", 300))
     while True:
+        config = read_json(args.config)
+        deadline = start_time + timedelta(days=float(config.get("duration_days", 7)))
+        poll_seconds = int(config.get("poll_seconds", 300))
         status = supervise_once(config=config, start_time=start_time, deadline=deadline, dry_run=args.dry_run)
         print(json.dumps(status, indent=2, ensure_ascii=False), flush=True)
         if args.once or utc_now_dt() >= deadline:

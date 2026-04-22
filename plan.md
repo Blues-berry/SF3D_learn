@@ -858,3 +858,77 @@
   * paper unlock supervisor merge: `61` records，`54` paper-pseudo eligible，仍在继续渲染。
   * 当前 blocker 只是数量尚未到 `128`，不是 prior-copy；recent error scan 为 `0`。
   * GPU 状态：GPU0 约 `17-24GB / 32GB`，GPU1 约 `15-18MB / 32GB`。
+
+### 2026-04-22 GPU0 数据扩充与下载链路加固
+
+* 已修复 PolyHaven 材料库下载的单点失败问题：
+  * `scripts/stage_polyhaven_material_bank.py` 增加 metadata/API retry、贴图下载 retry、`.tmp` 原子写入、单资产/单贴图失败记录与跳过。
+  * 单个 SSL EOF / 资产 API 失败不再导致整条材料库任务退出。
+  * factory 配置显式传入 `--request-retries 7 --download-retries 5 --retry-delay 2.0`。
+* 已优化下载代理候选：
+  * `configs/material_refine_dataset_factory_gpu0.json` 的 proxy candidates 固化为 `env`、`http://127.0.0.1:51081`、`direct`。
+  * 当前观测：PolyHaven 走 direct 更快；Objaverse cached 走 `http://127.0.0.1:51081`。
+  * 下载 retry wrapper 已增加 `timeout --foreground`，避免 Objaverse/Sketchfab 卡在 `download_objects` 内部无限挂死。
+  * `sf3d_factory_objaverse_cached_increment` 当前超时上限为 `5400s`，超时后自动重试。
+  * 新增 `sf3d_factory_objaverse_github_lfs_increment`，走 GitHub/LFS permissive rows，目标 `600`，`4` processes，超时上限 `7200s`。
+  * factory longrun 输入已重新纳入既有 GitHub/LFS 成功增量：`output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json`。
+  * supervisor recent-error 扫描改成 offset 增量扫描，首次见到日志从末尾建基线，之后只报新增 OOM/CUDA/Traceback；避免历史 OOM 和 Objaverse per-repo clone warning 反复污染状态。
+* 已让 factory / supervisor 支持长跑期间热更新配置：
+  * `scripts/run_material_refine_dataset_factory.py` 每轮 loop 重新读取 config。
+  * `scripts/run_material_refine_dataset_supervisor_7day.py` 每轮 loop 重新读取 config。
+  * supervisor 现在支持多个 production root group，可以同时监督主长跑和稀缺材质补齐队列。
+* 已重启数据侧长期进程，吃到新配置：
+  * supervisor: `sf3d_material_refine_dataset_7day_supervisor`
+  * factory: `sf3d_material_refine_dataset_factory_gpu0`
+  * Objaverse cached download: `sf3d_factory_objaverse_cached_increment`
+  * Objaverse GitHub/LFS download: `sf3d_factory_objaverse_github_lfs_increment`
+* Pool-D / Pool-E 当前状态：
+  * PolyHaven HDRI 已完成 `965` 个，可满足 `MIN_HDRI_COUNT=900`。
+  * PolyHaven material bank 已完成 `754` 个 CC0 PBR materials，`failed_asset_count=0`，`failed_map_count=0`。
+  * PolyHaven material manifest 路径已修正为 `output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory/polyhaven_material_bank_manifest.json`。
+* 已新增 GPU0 稀缺材质补齐队列：
+  * root: `output/material_refine_dataset_factory/scarce_material_gpu0_20260422T073856Z`
+  * sessions: `sf3d_scarce_material_refine_shard0_gpu0` 到 `sf3d_scarce_material_refine_shard2_gpu0`
+  * monitor: `sf3d_scarce_material_refine_merged_monitor`
+  * protocol: `production_32`，`MAX_HDRI_LIGHTS=6`，每对象最多 `8 cameras x 6 HDRI = 48` 条 view/light 条件。
+  * input records: `2400`，其中 `ceramic_glazed_lacquer=350`，`glass_metal=1090`，`mixed_thin_boundary=576`，`metal_dominant=240`，`glossy_non_metal=144`。
+  * `has_material_prior=false` 为 `2394`，主要用于补 no-prior / auxiliary upgrade 分布。
+  * 因每个对象要产出 48 组 view/light full buffers，初期 partial manifest 可能先显示 `records=0`；日志已确认 Blender 正在连续写入 buffers，完成首个对象后 monitor/supervisor 会合并出记录。
+* 曾短暂试探高质量 HQ top-up：
+  * root: `output/material_refine_dataset_factory/scarce_material_hq_gpu0_20260422T074007Z`
+  * 配置为 `render=384 / cycles=12 / 2 shards`。
+  * 与已有 8 个主分片 + 3 个稀缺分片叠加后触发 GPU0 OOM，因此已停止并从 supervisor 监控组移除。
+  * 当前长期配置保留更稳的 3 分片稀缺补齐队列，避免反复 OOM。
+* 当前安全运行窗口：
+  * GPU0 数据进程保持在约 `19-23GB / 32GB`，全部数据渲染队列绑定 GPU0。
+  * GPU1 占用来自现有 Round8 训练/评估链路，不是数据工厂新进程。
+  * supervisor 会继续合并、审计、验证，并在主分片或稀缺补齐分片掉线时按 `.run.sh` 自动恢复。
+
+### 2026-04-22 follow-up: 分布轮询与 Objaverse cache 恢复
+
+* 已修正下载 timeout 策略：
+  * `scripts/run_material_refine_dataset_factory.py` 从 `timeout --foreground` 改为 `timeout -k 60s`。
+  * 原因：Objaverse downloader 会创建 worker 子进程，`--foreground` 超时后可能留下 orphan worker，导致网络/内存被幽灵进程占用。
+  * 已清理旧 GitHub/LFS orphan downloader，并重启 cached/GitHub 下载会话。
+* 已增加 longrun manifest 的材质轮询能力：
+  * `scripts/build_material_refine_longrun_manifest.py` 新增 `--interleave-selection-keys`。
+  * `scripts/launch_material_refine_longrun_dataset_tmux.sh` 新增 `INTERLEAVE_SELECTION_KEYS` 透传。
+  * factory 默认配置为 `material_family,source_name,has_material_prior`，后续新 longrun 不再按单一材质块连续喂入 shard。
+* 已重排并重启稀缺材质补齐队列：
+  * root 保持 `output/material_refine_dataset_factory/scarce_material_gpu0_20260422T073856Z`。
+  * 已完成 bundle 会复用；新 shard 输入顺序改为 `glass_metal / mixed_thin_boundary / ceramic_glazed_lacquer / metal_dominant / glossy_non_metal` 交错。
+  * 目标仍是 `2400` records，`production_32`，`MAX_HDRI_LIGHTS=6`，GPU0-only。
+* 已修复 Objaverse cached “下载了但 canonical=0”的恢复问题：
+  * `scripts/stage_objaverse_cached_increment.py` 增加本地 cache sha256 反查，网络异常后也能把已落盘 GLB 重新挂回 `local_path`。
+  * staging stdout 改为只打印摘要，避免 6000 条 records 刷爆日志。
+  * 当前 `output/material_refine_aux_downloads/objaverse_cached_factory/objaverse_cached_increment_manifest.json` 已恢复 `downloaded_count=1672`。
+  * 当前 `output/material_refine_aux_downloads/objaverse_cached_factory_canonical/material_refine_manifest_objaverse_increment.json` 已恢复 `records=1672`，会进入后续 factory longrun 输入。
+* 已避免 Objaverse unknown 被误归为 glossy：
+  * `scripts/build_material_refine_longrun_manifest.py` 将 `unknown_pending_second_pass / pending_material_probe` 保留为 `unknown_pending_second_pass`。
+  * 这样后续统计不会把 Objaverse 未分类对象算成 `glossy_non_metal`，避免重现“单一 glossy”假分布。
+* 已新增第二上游 Objaverse cached GPU0 top-up：
+  * root: `output/material_refine_dataset_factory/objaverse_cached_gpu0_20260422T124111Z`
+  * sessions: `sf3d_objaverse_cached_refine_shard0_gpu0`、`sf3d_objaverse_cached_refine_merged_monitor`
+  * input: `512` local Objaverse records from recovered cached canonical manifest。
+  * material labels: `unknown_pending_second_pass=496`，`ceramic_glazed_lacquer=8`，`mixed_thin_boundary=6`，`metal_dominant=2`。
+  * 该队列已加入 supervisor group `objaverse_cached_topup`，后续会被 7-day supervisor 合并/审计/重启。

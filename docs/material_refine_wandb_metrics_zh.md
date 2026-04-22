@@ -4,6 +4,34 @@
 
 本文说明当前 `stable-fast-3d-material-refine` 项目在 W&B 中保留的指标含义。当前策略是：终端保留详细训练进度，W&B 只保留主指标、专项指标和少量诊断信息；大量中间进度、重复大图和 top-case 明细默认不上传。
 
+## 终端训练日志
+
+这些内容主要写入 `train.log`，默认不再全部上传 W&B，目的是让远程终端和 tmux/tunx 后台日志也能像 NG 一样快速定位问题。
+
+| 终端前缀 | 含义 | 读数建议 |
+| --- | --- | --- |
+| `[preflight]` | 训练前硬门禁结果，包含设备、W&B 登录、manifest target/prior identity 和 view supervision 审计。 | `status=ok` 才能继续；paper-stage 不允许绕过 identity / non-trivial target 门禁。 |
+| `[run]` | run 名称、seed、输出目录和当前工作目录。 | 用于确认没有写错 output dir 或复用了错误 seed。 |
+| `[system]` | Python、PyTorch、CUDA/cuDNN、CPU、系统 load、磁盘剩余空间。 | load 很高或磁盘不足时，训练慢/中断通常不是模型问题。 |
+| `[device]` / `[device:gpu]` | 当前选择设备、AMP、TF32、所有 GPU 的显存占用和空闲量。 | `*cuda:N` 是本次训练设备；若 selected GPU 已被占满，应先换卡或降低 batch。 |
+| `[data:train]` / `[data:val]` | train/val 样本数、split 分布。 | 确认 train/val/test 没隐式重切。 |
+| `[data:*:dist]` | source、generator、material_family、with/without prior 分布。 | 用于检查是否真的多材质、多上游、多 prior 状态。 |
+| `[data:*:quality]` | supervision tier/role、target_quality、license、view supervision 分布。 | 判断数据是否可进入 paper-stage。 |
+| `[data:*:paths]` | 关键贴图和 buffer 路径存在性检查。 | `miss>0` 要优先排查 canonical bundle。 |
+| `[data:*:probe]` | 首批 batch 读取速度、H2D 传输速度、prior/view supervision 比例、target-prior 差异、confidence 均值。 | `read_samples_s` 很低说明 dataloader/PNG 解码是瓶颈；`target_prior_delta` 接近 0 说明 target 可能过于接近 prior。 |
+| `[data:*:tensor]` | 首批 batch 的 tensor shape、dtype、范围、均值和 finite rate。 | 主要排查 NaN、全 0、维度不匹配、UV/view target 缺失。 |
+| `[model]` | 参数量和核心结构开关。 | 复现实验时确认 residual/view/prior 开关是否正确。 |
+| `[optimizer]` | Adam/AdamW、LR、warmup、scheduler、grad clip。 | 用于确认优化器没有被 config 覆盖错。 |
+| `[schedule]` | epoch、batch、optimizer step、validation 计划。 | 当前 paper-stage 推荐 `validation_progress_milestones=40`。 |
+| `[loader]` | batch size、num_workers、pin memory、sampler。 | sampler 应匹配 generator/prior 或 source/prior balance 设计。 |
+| `[epoch:start]` | 每个 epoch 开始时的数据规模和计划 step。 | manifest 动态增加时可看到 reload 后规模变化。 |
+| `epoch N/M: ... loss=... lr=...` | tqdm 训练进度条。 | 默认只显示关键训练状态：`loss`、`lr`、`ref`、`edge`、`grad`、`v`、`sps`、`mem`。 |
+| `[train]` | epoch/step/batch/global step、总进度、elapsed、ETA、LR、loss 分项、速度、显存。 | 这是主要训练仪表盘；重点看 `eta_total`、`samples_s`、`grad`、`max_mem_gb`。 |
+| `[val]` | 验证触发点、baseline/refined UV MAE、improvement、roughness/metallic 分项、best。 | 只在进度里程碑或配置指定周期触发，不再每个 step/epoch 无脑验证。 |
+| `[epoch]` | epoch 汇总、是否保存 checkpoint。 | 用于快速定位 best epoch 和 checkpoint。 |
+
+如果需要恢复旧的机器 JSON 控制台输出，可在 config 或命令行设置 `terminal_json_logs: true`。如果需要恢复每个 log interval 的长 `[train]` 文本行，可设置 `train_line_logs: true`。当前 paper 配置默认 `progress_bar: true`、`train_line_logs: false`，避免终端和 W&B console 被大段 JSON/长行淹没。
+
 ## 训练基础轴
 
 | W&B key | 含义 | 读数建议 |
@@ -24,6 +52,7 @@
 | `train/smoothness` | UV RM 平滑正则。 | 防止噪声，但过高会导致 `over_smoothing`。 |
 | `train/view_consistency` | view-to-UV 监督下的多视角一致性损失。 | 只有 `view_sup_rate` 有效时才是有效监督。 |
 | `train/edge_aware` | 材质边界/梯度敏感损失。 | 用于压低 `boundary_bleed_score`，避免边界被抹开。 |
+| `train/boundary_bleed` | 边界膨胀带 RM 误差和边界-内部误差差值约束。 | Round8 新增，用于更直接压低 `eval/special/boundary_bleed_score`。 |
 | `train/gradient_preservation` | RM 梯度保持损失。 | Round7 新增，直接约束 Pred 与 GT 的 roughness/metallic 梯度一致，目标是减少过平滑并保留薄边界。 |
 | `train/metallic_classification` | metallic 二值分类辅助损失。 | 用于改善 metal/non-metal 判别。 |
 | `train/residual_safety` | residual 安全约束。 | 惩罚在 target/prior 差异小或高置信区域的不必要改动。 |

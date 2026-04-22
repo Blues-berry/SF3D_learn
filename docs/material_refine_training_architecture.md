@@ -273,11 +273,12 @@ Debug logs include:
 - supervision realism: paper-eligible non-trivial target counts and effective view-supervision rate
 - failure emphasis: sampler-side difficulty/tag reweighting and eval-side failure-tag reduction
 
-Terminal output intentionally includes both machine-readable JSON and readable progress lines:
+Terminal output is compact by default and mirrors the Neural Gaffer tqdm pattern. Full machine-readable JSON is kept in files/W&B; it is printed to the terminal only when `terminal_json_logs: true`.
 
 - `[preflight]`: manifest/device/W&B/auth checks before training starts
 - `[epoch:start]`: epoch, train/val record counts, planned samples, batch count, and optimizer-step count
-- `[train]`: epoch fraction, `step/total`, `batch/total`, elapsed time, epoch ETA, total ETA, lr, train loss, grad norm, throughput, and GPU memory
+- `epoch N/M`: tqdm step progress with key postfix values such as `loss`, `lr`, `ref`, `edge`, `grad`, `v`, `sps`, and `mem`
+- `[train]`: optional verbose interval line, enabled with `train_line_logs: true` or used as the fallback when the progress bar is disabled
 - `[val]`: validation label, UV MAE by channel, best metric, and whether the model improved
 - `[epoch]`: compact end-of-epoch summary with checkpoint path
 - `[final]`: final output directory, `latest.pt`, `best.pt`, and `history.json`

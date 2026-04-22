@@ -158,3 +158,22 @@
 - Implemented: `configs/material_refine_train_paper_stage1_round7_gradient_guard.yaml` starts from Round6 but increases view recovery pressure, adds gradient preservation, and relaxes the residual gate slightly.
 - Implemented: eval no longer prints the full `summary.json` to stdout by default. It prints a compact summary and keeps the full JSON locally, preventing W&B console from being flooded by tens of thousands of lines.
 - Risk: Round7 is still limited by the same Stage-1 single-family data (`glossy_non_metal`) until the data pipeline contributes additional material families.
+
+## 2026-04-22 NG-style Terminal Diagnostics
+
+- Implemented: `scripts/train_material_refiner.py` now prints NG-style startup diagnostics: `[run]`, `[system]`, `[device]`, `[device:gpu]`, `[data:*]`, `[data:*:dist]`, `[data:*:quality]`, `[data:*:paths]`, `[data:*:probe]`, `[data:*:tensor]`, `[model]`, `[optimizer]`, `[schedule]`, and `[loader]`.
+- Implemented: startup probing reads configurable initial dataloader batches and reports batch read time, samples/sec, optional host-to-device transfer time, prior rate, effective view supervision rate, target/prior weighted delta, confidence mean, material-family counts, and tensor shape/range/finite checks.
+- Implemented: training progress now supports a compact NG-style `tqdm` progress bar. Paper configs force `progress_bar: true` so it still appears when the process is piped through `tee`, and keep `train_line_logs: false` so the terminal only shows the bar plus validation/epoch summaries.
+- Implemented: full interval/epoch JSON terminal spam is now gated by `terminal_json_logs`; defaults and paper configs keep it disabled, while structured JSON files are still saved locally for reproducibility.
+- Implemented: paper-stage configs now explicitly set `startup_probe_batches`, `startup_probe_device_transfer`, `dataset_distribution_topk`, and validation milestone settings so new runs expose environment/data/load health before the first training step.
+- Verified: a CPU one-step smoke run completed with the new diagnostics and wrote `output/material_refine_paper/debug_terminal_logging_smoke/startup_checks.json`.
+- Remaining improvement: split train step timing into dataloader wait, H2D, forward, backward, optimizer, validation, and preview-export sub-times; this will make GPU utilization bottlenecks easier to isolate when the dataset grows.
+
+## 2026-04-22 Round7 Eval 与 Round8 Boundary-Band 迭代
+
+- Round7 full-test summary: UV RM MAE improved from `0.11596` to `0.05459`, view RM MAE improved from `1.03209` to `0.98106`, LPIPS improved from `0.10988` to `0.10784`, and residual safety improved over Round6.
+- Round7 remaining problems: proxy PSNR regressed from `9.41600` to `9.29687`, proxy SSIM regressed from `0.92240` to `0.91723`, and boundary bleed score rose from `0.00598` to `0.02281`. It is a UV/view improvement, not a complete visual-quality win.
+- Implemented: `boundary_bleed_loss` in `scripts/train_material_refiner.py`. It builds a target-gradient boundary band, optimizes boundary-band RM error, and penalizes boundary error when it exceeds interior error.
+- Implemented: compact progress bar now reports `bnd=` so Round8 can be monitored from terminal without reopening W&B.
+- Implemented: `configs/material_refine_train_paper_stage1_round8_boundary_band.yaml` enables `boundary_bleed_weight=0.10`, lowers smoothing, and slightly raises view consistency to target Round7's boundary/render proxy regressions.
+- Data sync note: the data supervisor is still active, but the best paper-stage training manifest remains the 346-record locked Stage-1 subset. New longrun data has more `metal_dominant` / `3D-FUTURE` records, but most are still `smoke_only` or `auxiliary_upgrade_queue`, so they should not be mixed into paper-stage training yet.

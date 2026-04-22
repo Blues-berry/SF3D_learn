@@ -35,6 +35,7 @@
     "required_sessions": [
       "sf3d_factory_polyhaven_hdri",
       "sf3d_factory_objaverse_cached_increment",
+      "sf3d_factory_objaverse_github_lfs_increment",
       "sf3d_factory_objaverse_strict_full_retry",
       "sf3d_factory_polyhaven_material_bank"
     ]
@@ -48,7 +49,33 @@
       "sf3d_longrun_material_refine_shard",
       "sf3d_longrun_material_refine_merged_monitor"
     ],
-    "merge_output_name": "canonical_manifest_supervisor_merged.json"
+    "merge_output_name": "canonical_manifest_supervisor_merged.json",
+    "groups": [
+      {
+        "name": "scarce_material_topup",
+        "patterns": [
+          "output/material_refine_dataset_factory/scarce_material_gpu0_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_material_refine_shard",
+          "sf3d_scarce_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "objaverse_cached_topup",
+        "patterns": [
+          "output/material_refine_dataset_factory/objaverse_cached_gpu0_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_objaverse_cached_refine_shard",
+          "sf3d_objaverse_cached_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      }
+    ]
   },
   "paper_unlock": {
     "enabled": true,
@@ -95,13 +122,17 @@
   },
   "log_scan": {
     "enabled": true,
+    "tail_bytes_per_log": 2097152,
+    "scan_from_end_on_first_seen": true,
+    "ignore_names": [
+      "sf3d_material_refine_dataset_7day_supervisor.log"
+    ],
     "patterns": [
       "unhashable type",
       "Out of memory",
       "CUDA error",
       "RuntimeError: Error",
-      "Traceback",
-      "Error:"
+      "Traceback"
     ],
     "max_lines": 120
   }

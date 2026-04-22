@@ -33,6 +33,7 @@ val_paper_splits: paper_val_iid
 epochs: 60
 max_train_steps: 0
 batch_size: 4
+val_batch_size: 4
 num_workers: 4
 grad_accumulation_steps: 4
 drop_last: false
@@ -59,6 +60,9 @@ train_min_hard_views: 3
 train_randomize_view_subset: true
 val_view_sample_count: 12
 val_min_hard_views: 3
+val_balance_key: material_family
+val_records_per_balance_group: 64
+val_expected_balance_groups: metal_dominant,ceramic_glossy,glass_metal,mixed_thin_boundary,glossy_non_metal
 amp_dtype: bfloat16
 cuda_device_index: 0
 matmul_precision: high
@@ -84,12 +88,21 @@ view_consistency_mode: disabled
 
 eval_every: 1
 validation_steps: 0
+validation_progress_milestones: 40
+max_validation_batches: 0
 save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: false
 keep_last_checkpoints: 10
 log_every: 1
+progress_bar: true
+progress_bar_leave: false
+progress_bar_mininterval: 0.5
+train_line_logs: false
 val_preview_samples: 12
+wandb_val_preview_max: 8
+wandb_log_preview_grid: false
+save_preview_contact_sheet: false
 early_stopping_patience: 10
 early_stopping_min_delta: 1.0e-5
 
@@ -103,6 +116,10 @@ wandb_mode: offline
 wandb_log_artifacts: true
 wandb_watch: false
 export_training_curves: true
+terminal_json_logs: false
+startup_probe_batches: 2
+startup_probe_device_transfer: true
+dataset_distribution_topk: 8
 preflight_audit_records: -1
 target_prior_identity_warning_threshold: 0.20
 max_target_prior_identity_rate_for_paper: 0.30

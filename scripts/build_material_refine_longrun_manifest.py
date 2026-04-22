@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.06)
     parser.add_argument("--test-ratio", type=float, default=0.06)
     parser.add_argument("--prefer-paper-main-first", action="store_true")
+    parser.add_argument(
+        "--interleave-selection-keys",
+        type=str,
+        default="",
+        help="Comma-separated keys used to round-robin selected records before sharding, e.g. material_family,source_name.",
+    )
     return parser.parse_args()
 
 
@@ -162,6 +168,8 @@ def infer_distribution_tags(record: dict[str, Any]) -> tuple[str, bool, list[str
     thin_boundary = False
     if explicit_family:
         family = explicit_family
+    elif "unknown_pending_second_pass" in text or "pending_material_probe" in text:
+        family = "unknown_pending_second_pass"
     elif "glass" in text:
         family = "glass_metal"
     elif any(token in text for token in ("ceramic", "marble", "granite", "lacquer", "glazed", "porcelain")):
@@ -175,6 +183,8 @@ def infer_distribution_tags(record: dict[str, Any]) -> tuple[str, bool, list[str
         thin_boundary = True
     elif any(token in text for token in ("leather", "plastic", "wood", "cloth", "sofa")):
         family = "glossy_non_metal"
+    elif "objaverse" in str(record.get("source_name") or record.get("generator_id") or "").lower():
+        family = "unknown_pending_second_pass"
     else:
         family = "glossy_non_metal"
     if any(token in text for token in ("thin", "frame", "wire", "handle", "lamp", "pendant", "rack")):
@@ -316,6 +326,36 @@ def select_quota_balanced_records(
     return selected[:max_records]
 
 
+def interleave_records(records: list[dict[str, Any]], key_fields: list[str]) -> list[dict[str, Any]]:
+    if not records or not key_fields:
+        return records
+    buckets: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for item in records:
+        key = tuple(str(item.get(field) or "unknown") for field in key_fields)
+        buckets.setdefault(key, []).append(item)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda item: stable_hash(str(item["object_id"])))
+
+    ordered_keys = sorted(
+        buckets,
+        key=lambda key: (
+            -len(buckets[key]),
+            stable_hash("|".join(key)),
+        ),
+    )
+    interleaved: list[dict[str, Any]] = []
+    while ordered_keys:
+        next_keys: list[tuple[str, ...]] = []
+        for key in ordered_keys:
+            bucket = buckets[key]
+            if bucket:
+                interleaved.append(bucket.pop(0))
+            if bucket:
+                next_keys.append(key)
+        ordered_keys = next_keys
+    return interleaved
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -358,6 +398,8 @@ def main() -> None:
         )
     if args.max_records > 0:
         records = records[: int(args.max_records)]
+    interleave_keys = [item.strip() for item in str(args.interleave_selection_keys).split(",") if item.strip()]
+    records = interleave_records(records, interleave_keys)
 
     payload = {
         "manifest_version": "canonical_asset_record_v1_longrun_input",
@@ -372,6 +414,7 @@ def main() -> None:
             "prefer_paper_main_first": bool(args.prefer_paper_main_first),
             "paper_frontload_records": max(0, int(args.paper_frontload_records)),
             "target_material_family_ratios": target_material_ratios,
+            "interleave_selection_keys": interleave_keys,
         },
         "counts": {
             "records": len(records),

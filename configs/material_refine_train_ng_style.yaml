@@ -62,6 +62,10 @@ checkpointing_steps: 0
 save_only_best_checkpoint: false
 keep_last_checkpoints: 3
 log_every: 20
+progress_bar: true
+progress_bar_leave: false
+progress_bar_mininterval: 0.5
+train_line_logs: false
 val_preview_samples: 4
 early_stopping_patience: 8
 early_stopping_min_delta: 1.0e-4
@@ -75,6 +79,10 @@ wandb_mode: offline
 wandb_log_artifacts: true
 wandb_watch: false
 export_training_curves: true
+terminal_json_logs: false
+startup_probe_batches: 2
+startup_probe_device_transfer: true
+dataset_distribution_topk: 8
 preflight_audit_records: 256
 target_prior_identity_warning_threshold: 0.95
 max_target_prior_identity_rate_for_paper: 0.30
