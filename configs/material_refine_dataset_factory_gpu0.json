@@ -12,8 +12,17 @@
     "poll_seconds": 300
   },
   "download_network": {
-    "proxy_candidates": ["env", "http://127.0.0.1:51081", "direct"],
+    "proxy_candidates": [
+      "env",
+      "http://127.0.0.1:51081",
+      "http://127.0.0.1:7890",
+      "http://127.0.0.1:7891",
+      "http://127.0.0.1:10809",
+      "direct"
+    ],
     "proxy_probe_timeout_seconds": 8,
+    "hf_endpoint_candidates": ["env", "https://huggingface.co", "https://hf-mirror.com"],
+    "hf_endpoint_probe_timeout_seconds": 8,
     "default_probe_url": "https://huggingface.co/"
   },
   "targets": {
@@ -144,6 +153,11 @@
       "session": "sf3d_factory_polyhaven_hdri",
       "output_root": "output/highlight_pool_a_8k/aux_sources",
       "retry_seconds": 1800,
+      "stall_seconds": 3600,
+      "progress_paths": [
+        "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri_bank.json",
+        "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri"
+      ],
       "proxy_probe_url": "https://polyhaven.com/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -165,6 +179,12 @@
       "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory",
       "retry_seconds": 900,
       "timeout_seconds": 5400,
+      "stall_seconds": 7200,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_cached_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_cached_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/hf-objaverse-v1"
+      ],
       "proxy_probe_url": "https://huggingface.co/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -189,6 +209,11 @@
       "output_root": "output/material_refine_aux_downloads/objaverse_github_lfs_factory",
       "retry_seconds": 1200,
       "timeout_seconds": 7200,
+      "stall_seconds": 9000,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_github_lfs_factory/objaverse_cached_increment_manifest.json",
+        "output/highlight_pool_a_8k/aux_sources/github/repos"
+      ],
       "proxy_probe_url": "https://huggingface.co/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -214,6 +239,11 @@
       "session": "sf3d_factory_objaverse_strict_full_retry",
       "output_root": "output/material_refine_aux_downloads/objaverse_strict_factory",
       "retry_seconds": 300,
+      "stall_seconds": 5400,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_strict_factory/objaverse_xl_strict_filtered_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_strict_factory/objaverse_xl"
+      ],
       "proxy_probe_url": "https://huggingface.co/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -236,6 +266,11 @@
       "session": "sf3d_factory_polyhaven_material_bank",
       "output_root": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory",
       "retry_seconds": 1800,
+      "stall_seconds": 3600,
+      "progress_paths": [
+        "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory/polyhaven_material_bank_manifest.json",
+        "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory/materials"
+      ],
       "proxy_probe_url": "https://polyhaven.com/",
       "command": [
         "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
@@ -273,6 +308,35 @@
       "output_root": "output/material_refine_aux_downloads/objaverse_strict_factory_canonical"
     }
   ],
+  "promotion": {
+    "enabled": true,
+    "prefer_for_audit": true,
+    "min_input_records": 8,
+    "input_manifest_globs": [
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
+      "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_monitor_merged.json",
+      "output/material_refine_dataset_factory/paper_unlock_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/paper_unlock_gpu0_*/canonical_manifest_monitor_merged.json",
+      "output/material_refine_dataset_factory/objaverse_cached_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/objaverse_cached_gpu0_*/canonical_manifest_monitor_merged.json"
+    ],
+    "output_manifest": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+    "report_json": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.json",
+    "report_md": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.md",
+    "report_html": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.html",
+    "allowed_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
+    "promotable_source_names": "ABO_locked_core,3D-FUTURE_highlight_local_8k,Objaverse-XL_strict_filtered_increment",
+    "promote_auxiliary_to_paper_main": true,
+    "keep_unpromoted_audit_fields": true,
+    "min_confidence_mean": 0.70,
+    "min_confidence_nonzero_rate": 0.50,
+    "min_target_coverage": 0.50,
+    "max_target_prior_identity": 0.95,
+    "min_valid_view_count": 1,
+    "min_strict_complete_view_rate": 0.80
+  },
   "quality": {
     "min_paper_eligible": 128,
     "min_manifest_records_for_audit": 8,

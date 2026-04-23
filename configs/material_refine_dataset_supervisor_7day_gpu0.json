@@ -65,6 +65,7 @@
       },
       {
         "name": "objaverse_cached_topup",
+        "enabled": false,
         "patterns": [
           "output/material_refine_dataset_factory/objaverse_cached_gpu0_*"
         ],

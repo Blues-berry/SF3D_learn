@@ -1,12 +1,17 @@
-# Paper-stage Round9 draft: boundary + render-proxy validation gate.
-# Round8 promotion failed, so Round9 starts from the steadier Round7 model weights only.
+# Round10 / R-8-module full architecture preset.
+#
+# Purpose:
+#   Upgrade the light UV refiner into a boundary-aware, material-aware, and
+#   render-consistency-aware R module while keeping the same CanonicalAssetRecordV1
+#   data contract. This config is intentionally separate from Round9 conservative
+#   training so existing checkpoint/eval jobs remain reproducible.
 
 train_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 val_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 train_split: train
 val_split: val
 split_strategy: manifest
-freeze_val_manifest_to: paper_stage1_round9_boundary_render_gate_frozen_val_manifest.json
+freeze_val_manifest_to: paper_stage1_round10_r8_full_frozen_val_manifest.json
 reload_manifest_every: 1
 allow_empty_val: false
 
@@ -17,13 +22,13 @@ val_target_quality_tiers: paper_strong,paper_pseudo
 train_paper_splits: paper_train
 val_paper_splits: paper_val_iid
 
-epochs: 46
-batch_size: 4
-val_batch_size: 4
+epochs: 52
+batch_size: 3
+val_batch_size: 3
 num_workers: 4
 grad_accumulation_steps: 4
-learning_rate: 1.0e-4
-min_learning_rate: 1.0e-5
+learning_rate: 8.0e-5
+min_learning_rate: 8.0e-6
 weight_decay: 1.0e-2
 optimizer: adamw
 adam_beta1: 0.9
@@ -31,7 +36,7 @@ adam_beta2: 0.999
 adam_epsilon: 1.0e-8
 adam_amsgrad: false
 lr_scheduler: plateau
-warmup_steps: 450
+warmup_steps: 550
 plateau_factor: 0.5
 plateau_patience: 4
 plateau_threshold: 5.0e-4
@@ -52,45 +57,68 @@ cuda_device_index: 1
 matmul_precision: high
 allow_tf32: true
 
+# Legacy safety gates retained for compatibility and stronger priors.
 disable_view_fusion: false
 disable_prior_inputs: false
 disable_residual_head: false
 enable_residual_gate: true
-residual_gate_bias: -1.50
+residual_gate_bias: -1.35
 min_residual_gate: 0.025
-prior_confidence_gate_strength: 0.55
-enable_boundary_context: true
-boundary_context_strength: 0.30
-enable_material_context: true
+prior_confidence_gate_strength: 0.50
+enable_boundary_context: false
+boundary_context_strength: 0.0
+enable_material_context: false
 material_context_classes: 3
-material_delta_scale: 0.06
-enable_render_consistency_gate: true
-render_gate_strength: 0.30
+material_delta_scale: 0.0
+enable_render_consistency_gate: false
+render_gate_strength: 0.0
+
+# Full R module A-H.
+enable_dual_path_prior_init: true
+enable_domain_prior_calibration: true
+domain_feature_channels: 8
+prior_feature_channels: 16
+max_generator_embeddings: 64
+max_source_embeddings: 128
+enable_material_sensitive_view_encoder: true
+enable_hard_view_routing: true
+enable_tri_branch_fusion: true
+enable_boundary_safety_module: true
+boundary_safety_strength: 0.35
+enable_material_topology_reasoning: true
+topology_feature_channels: 16
+topology_patch_size: 16
+topology_layers: 2
+topology_heads: 2
+enable_confidence_gated_trunk: true
+uncertainty_gate_strength: 0.25
+enable_inverse_material_check: true
+inverse_check_strength: 0.25
 
 train_balance_mode: material_x_source_x_prior
 train_balance_power: 1.0
 train_samples_per_epoch: 0
 train_target_quality_weights: paper_strong=1.8,paper_pseudo=1.0,research_only=0.4,smoke_only=0.0
 train_failure_tag_metadata_key: failure_tags
-train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=5.0,local_highlight_misread=2.5,over_smoothing=1.8
-prior_dropout_prob: 0.05
+train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=4.5,local_highlight_misread=3.0,over_smoothing=2.0
+prior_dropout_prob: 0.06
 prior_dropout_start_prob: 0.04
-prior_dropout_end_prob: 0.22
-prior_dropout_warmup_epochs: 12
+prior_dropout_end_prob: 0.25
+prior_dropout_warmup_epochs: 14
 
-refine_weight: 0.74
-coarse_weight: 0.30
-prior_consistency_weight: 0.18
-smoothness_weight: 0.001
-view_consistency_weight: 0.36
-edge_aware_weight: 0.10
+refine_weight: 0.76
+coarse_weight: 0.32
+prior_consistency_weight: 0.16
+smoothness_weight: 0.0015
+view_consistency_weight: 0.34
+edge_aware_weight: 0.12
 edge_aware_epsilon: 1.0e-3
-boundary_bleed_weight: 0.10
-boundary_band_kernel: 7
-gradient_preservation_weight: 0.10
+boundary_bleed_weight: 0.08
+boundary_band_kernel: 9
+gradient_preservation_weight: 0.12
 metallic_classification_weight: 0.08
 material_context_weight: 0.04
-residual_safety_weight: 0.20
+residual_safety_weight: 0.22
 residual_safety_margin: 0.035
 view_consistency_mode: required
 
@@ -104,7 +132,7 @@ save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: true
 keep_last_checkpoints: 4
-init_from_checkpoint: output/material_refine_paper/stage1_round7_gradient_guard/best.pt
+init_from_checkpoint: output/material_refine_paper/stage1_round9_conservative_boundary/best.pt
 log_every: 1
 progress_bar: true
 progress_bar_leave: false
@@ -114,15 +142,15 @@ val_preview_samples: 8
 wandb_val_preview_max: 8
 wandb_log_preview_grid: false
 save_preview_contact_sheet: false
-early_stopping_patience: 8
+early_stopping_patience: 9
 early_stopping_min_delta: 1.0e-5
 
-output_dir: output/material_refine_paper/stage1_round9_boundary_render_gate
+output_dir: output/material_refine_paper/stage1_round10_r8_full
 report_to: wandb
 tracker_project_name: stable-fast-3d-material-refine
-tracker_run_name: material-refine-paper-stage1-round9-boundary-render-gate
+tracker_run_name: material-refine-paper-stage1-round10-r8-full
 tracker_group: paper-stage1
-tracker_tags: material-refine,paper,stage1,round9,r-module-v2,boundary-aware,material-aware,render-consistency,residual-safety
+tracker_tags: material-refine,paper,stage1,round10,r8-full,boundary-aware,material-aware,render-aware
 wandb_mode: online
 wandb_log_artifacts: true
 wandb_artifact_policy: best_and_final
@@ -137,4 +165,4 @@ target_prior_identity_warning_threshold: 0.20
 max_target_prior_identity_rate_for_paper: 0.30
 min_nontrivial_target_count_for_paper: 128
 fail_on_target_prior_identity: true
-seed: 20260428
+seed: 20260424

@@ -161,6 +161,43 @@ def proxy_probe_shell(probe_url: str | None, candidates: list[str], timeout_seco
 """
 
 
+def hf_endpoint_probe_shell(candidates: list[str], timeout_seconds: int) -> str:
+    if not candidates:
+        return ""
+    candidate_text = "|".join(candidates)
+    return f"""
+  HF_ENDPOINT_CANDIDATES={shlex.quote(candidate_text)}
+  HF_ENDPOINT_PROBE_TIMEOUT={int(timeout_seconds)}
+  best_hf_endpoint=""
+  best_hf_ms=999999999
+  IFS='|' read -r -a hf_endpoint_candidates <<< "${{HF_ENDPOINT_CANDIDATES}}"
+  for endpoint in "${{hf_endpoint_candidates[@]}}"; do
+    if [ "${{endpoint}}" = "env" ]; then
+      endpoint="${{HF_ENDPOINT:-}}"
+    fi
+    if [ -z "${{endpoint}}" ]; then
+      continue
+    fi
+    endpoint="${{endpoint%/}}"
+    start_ms=$(date +%s%3N)
+    curl -fsSIL --max-time "${{HF_ENDPOINT_PROBE_TIMEOUT}}" "${{endpoint}}/api/models?limit=1" >/dev/null 2>&1
+    rc=$?
+    end_ms=$(date +%s%3N)
+    elapsed=$((end_ms - start_ms))
+    if [ $rc -eq 0 ] && [ $elapsed -lt $best_hf_ms ]; then
+      best_hf_ms=$elapsed
+      best_hf_endpoint="${{endpoint}}"
+    fi
+  done
+  if [ -n "${{best_hf_endpoint}}" ]; then
+    export HF_ENDPOINT="${{best_hf_endpoint}}"
+    echo "==== selected_hf_endpoint ${{best_hf_endpoint}} ${{best_hf_ms}}ms ===="
+  else
+    echo "==== selected_hf_endpoint keep_existing none_reachable ===="
+  fi
+"""
+
+
 def start_retry_session(
     *,
     session: str,
@@ -171,6 +208,8 @@ def start_retry_session(
     proxy_probe_url: str | None,
     proxy_candidates: list[str],
     proxy_probe_timeout_seconds: int,
+    hf_endpoint_candidates: list[str],
+    hf_endpoint_probe_timeout_seconds: int,
     dry_run: bool,
 ) -> dict[str, Any]:
     log_dir = output_root / "logs"
@@ -189,7 +228,11 @@ attempt=0
 while true; do
   attempt=$((attempt + 1))
   echo "==== ${{attempt}} $(date -Iseconds) ===="
+  export GIT_TERMINAL_PROMPT="${{GIT_TERMINAL_PROMPT:-0}}"
+  export GIT_HTTP_LOW_SPEED_LIMIT="${{GIT_HTTP_LOW_SPEED_LIMIT:-1024}}"
+  export GIT_HTTP_LOW_SPEED_TIME="${{GIT_HTTP_LOW_SPEED_TIME:-300}}"
 {proxy_probe_shell(proxy_probe_url, proxy_candidates, proxy_probe_timeout_seconds)}
+{hf_endpoint_probe_shell(hf_endpoint_candidates, hf_endpoint_probe_timeout_seconds)}
   {command_line}
   rc=$?
   echo "==== exit ${{rc}} $(date -Iseconds) ===="
@@ -242,6 +285,19 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
                         source.get(
                             "proxy_probe_timeout_seconds",
                             config.get("download_network", {}).get("proxy_probe_timeout_seconds", 8),
+                        )
+                    ),
+                    hf_endpoint_candidates=[
+                        str(item)
+                        for item in source.get(
+                            "hf_endpoint_candidates",
+                            config.get("download_network", {}).get("hf_endpoint_candidates", []),
+                        )
+                    ],
+                    hf_endpoint_probe_timeout_seconds=int(
+                        source.get(
+                            "hf_endpoint_probe_timeout_seconds",
+                            config.get("download_network", {}).get("hf_endpoint_probe_timeout_seconds", 8),
                         )
                     ),
                     dry_run=dry_run,
@@ -383,6 +439,127 @@ def canonicalize_download_manifests(config: dict[str, Any], *, dry_run: bool) ->
     return actions
 
 
+def resolve_promotion_input_manifests(config: dict[str, Any]) -> list[Path]:
+    promotion = config.get("promotion", {})
+    paths: list[Path] = []
+    for value in promotion.get("input_manifests", []):
+        path = REPO_ROOT / str(value)
+        if path.exists():
+            paths.append(path)
+    for pattern in promotion.get("input_manifest_globs", []):
+        paths.extend(sorted(REPO_ROOT.glob(str(pattern))))
+
+    output_manifest = REPO_ROOT / str(
+        promotion.get(
+            "output_manifest",
+            "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+        )
+    )
+    seen: set[str] = {str(output_manifest.resolve())}
+    resolved: list[Path] = []
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        if (
+            path.name == "canonical_manifest_monitor_merged.json"
+            and (path.parent / "canonical_manifest_supervisor_merged.json").exists()
+        ):
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(path)
+    return resolved
+
+
+def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    promotion = config.get("promotion", {})
+    if not bool(promotion.get("enabled", False)):
+        return {"action": "disabled"}
+    manifests = resolve_promotion_input_manifests(config)
+    min_records = int(promotion.get("min_input_records", 1))
+    manifests = [path for path in manifests if manifest_record_count(path) >= min_records]
+    if not manifests:
+        return {
+            "action": "no_input_manifests",
+            "min_input_records": min_records,
+        }
+    output_manifest = REPO_ROOT / str(
+        promotion.get(
+            "output_manifest",
+            "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+        )
+    )
+    report_json = REPO_ROOT / str(
+        promotion.get("report_json", output_manifest.with_suffix(".promotion_report.json"))
+    )
+    report_md = REPO_ROOT / str(
+        promotion.get("report_md", output_manifest.with_suffix(".promotion_report.md"))
+    )
+    report_html = REPO_ROOT / str(
+        promotion.get("report_html", output_manifest.with_suffix(".promotion_report.html"))
+    )
+    newest_input_mtime = max(path.stat().st_mtime for path in manifests)
+    if output_manifest.exists() and output_manifest.stat().st_mtime >= newest_input_mtime:
+        return {
+            "action": "up_to_date",
+            "output_manifest": str(output_manifest),
+            "input_manifests": [str(path) for path in manifests],
+        }
+
+    command = [
+        str(PYTHON_BIN),
+        "scripts/promote_material_refine_targets.py",
+        "--output-manifest",
+        str(output_manifest),
+        "--report-json",
+        str(report_json),
+        "--report-md",
+        str(report_md),
+        "--report-html",
+        str(report_html),
+        "--allowed-license-buckets",
+        str(promotion.get("allowed_license_buckets", "")),
+        "--promotable-source-names",
+        str(promotion.get("promotable_source_names", "")),
+        "--min-confidence-mean",
+        str(promotion.get("min_confidence_mean", 0.70)),
+        "--min-confidence-nonzero-rate",
+        str(promotion.get("min_confidence_nonzero_rate", 0.50)),
+        "--min-target-coverage",
+        str(promotion.get("min_target_coverage", 0.50)),
+        "--max-target-prior-identity",
+        str(promotion.get("max_target_prior_identity", 0.95)),
+        "--min-valid-view-count",
+        str(promotion.get("min_valid_view_count", 1)),
+        "--min-strict-complete-view-rate",
+        str(promotion.get("min_strict_complete_view_rate", 0.80)),
+    ]
+    if not bool(promotion.get("promote_auxiliary_to_paper_main", True)):
+        command.append("--no-promote-auxiliary-to-paper-main")
+    if not bool(promotion.get("keep_unpromoted_audit_fields", True)):
+        command.append("--no-keep-unpromoted-audit-fields")
+    for manifest in manifests:
+        command.extend(["--manifest", str(manifest)])
+    if dry_run:
+        return {
+            "action": "dry_run_promote",
+            "output_manifest": str(output_manifest),
+            "input_manifests": [str(path) for path in manifests],
+            "command": command,
+        }
+    result = run_capture(command)
+    return {
+        "action": "promoted" if result.returncode == 0 else "promotion_failed",
+        "output_manifest": str(output_manifest),
+        "report_json": str(report_json),
+        "input_manifests": [str(path) for path in manifests],
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-80:],
+    }
+
+
 def manifest_record_count(path: Path) -> int:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -393,7 +570,15 @@ def manifest_record_count(path: Path) -> int:
 
 
 def newest_manifest_candidate(config: dict[str, Any]) -> Path | None:
+    min_records = int(config.get("quality", {}).get("min_manifest_records_for_audit", 1))
+    promotion = config.get("promotion", {})
+    promotion_output = REPO_ROOT / str(promotion.get("output_manifest", ""))
+    if bool(promotion.get("prefer_for_audit", True)) and promotion_output.exists():
+        if manifest_record_count(promotion_output) >= min_records:
+            return promotion_output
     patterns = [
+        str(config.get("promotion", {}).get("output_manifest", "")),
+        "output/material_refine_paper/reworked_candidates/factory_promoted/**/canonical_manifest*.json",
         "output/material_refine_dataset_factory/paper_unlock_gpu0_*/canonical_manifest_monitor_merged.json",
         "output/material_refine_dataset_factory/paper_unlock_gpu0_*/prepared_shard_*/full/canonical_manifest_full.json",
         "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
@@ -401,8 +586,9 @@ def newest_manifest_candidate(config: dict[str, Any]) -> Path | None:
     ]
     paths: list[Path] = []
     for pattern in patterns:
+        if not pattern:
+            continue
         paths.extend(REPO_ROOT.glob(pattern))
-    min_records = int(config.get("quality", {}).get("min_manifest_records_for_audit", 1))
     paths = [
         path
         for path in paths
@@ -476,6 +662,7 @@ def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]
     if args.start_downloads:
         state["actions"].append({"downloads": start_downloads(config, dry_run=args.dry_run)})
         state["actions"].append({"canonicalize_downloads": canonicalize_download_manifests(config, dry_run=args.dry_run)})
+        state["actions"].append({"promotion": promote_targets(config, dry_run=args.dry_run)})
     if args.start_render:
         launch, reason = should_launch_render(config, force=args.force_render)
         if launch:

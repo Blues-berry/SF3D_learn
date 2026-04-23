@@ -1,12 +1,15 @@
-# Paper-stage Round9 draft: boundary + render-proxy validation gate.
-# Round8 promotion failed, so Round9 starts from the steadier Round7 model weights only.
+# Paper-stage Round9 conservative boundary line.
+# Dataset readiness 2026-04-23 says Stage1-v2 strict is still single-family
+# glossy_non_metal, so this run keeps the locked 346-record paper main manifest.
+# R-v2 branches remain disabled here; they are evaluated separately by component
+# ablations because the first R-v2 smoke traded UV MAE for residual safety.
 
 train_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 val_manifest: output/material_refine_paper/latest_dataset_check_20260421/stage1_subset_merged490/paper_stage1_subset_manifest.json
 train_split: train
 val_split: val
 split_strategy: manifest
-freeze_val_manifest_to: paper_stage1_round9_boundary_render_gate_frozen_val_manifest.json
+freeze_val_manifest_to: paper_stage1_round9_conservative_boundary_frozen_val_manifest.json
 reload_manifest_every: 1
 allow_empty_val: false
 
@@ -56,40 +59,40 @@ disable_view_fusion: false
 disable_prior_inputs: false
 disable_residual_head: false
 enable_residual_gate: true
-residual_gate_bias: -1.50
-min_residual_gate: 0.025
+residual_gate_bias: -1.45
+min_residual_gate: 0.030
 prior_confidence_gate_strength: 0.55
-enable_boundary_context: true
-boundary_context_strength: 0.30
-enable_material_context: true
+enable_boundary_context: false
+boundary_context_strength: 0.0
+enable_material_context: false
 material_context_classes: 3
-material_delta_scale: 0.06
-enable_render_consistency_gate: true
-render_gate_strength: 0.30
+material_delta_scale: 0.0
+enable_render_consistency_gate: false
+render_gate_strength: 0.0
 
 train_balance_mode: material_x_source_x_prior
 train_balance_power: 1.0
 train_samples_per_epoch: 0
 train_target_quality_weights: paper_strong=1.8,paper_pseudo=1.0,research_only=0.4,smoke_only=0.0
 train_failure_tag_metadata_key: failure_tags
-train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=5.0,local_highlight_misread=2.5,over_smoothing=1.8
+train_failure_tag_weights: metal_nonmetal_confusion=3.5,boundary_bleed=4.0,local_highlight_misread=2.5,over_smoothing=2.0
 prior_dropout_prob: 0.05
 prior_dropout_start_prob: 0.04
 prior_dropout_end_prob: 0.22
 prior_dropout_warmup_epochs: 12
 
-refine_weight: 0.74
+refine_weight: 0.78
 coarse_weight: 0.30
 prior_consistency_weight: 0.18
-smoothness_weight: 0.001
-view_consistency_weight: 0.36
-edge_aware_weight: 0.10
+smoothness_weight: 0.0015
+view_consistency_weight: 0.34
+edge_aware_weight: 0.12
 edge_aware_epsilon: 1.0e-3
-boundary_bleed_weight: 0.10
-boundary_band_kernel: 7
-gradient_preservation_weight: 0.10
+boundary_bleed_weight: 0.05
+boundary_band_kernel: 9
+gradient_preservation_weight: 0.12
 metallic_classification_weight: 0.08
-material_context_weight: 0.04
+material_context_weight: 0.0
 residual_safety_weight: 0.20
 residual_safety_margin: 0.035
 view_consistency_mode: required
@@ -117,12 +120,12 @@ save_preview_contact_sheet: false
 early_stopping_patience: 8
 early_stopping_min_delta: 1.0e-5
 
-output_dir: output/material_refine_paper/stage1_round9_boundary_render_gate
+output_dir: output/material_refine_paper/stage1_round9_conservative_boundary
 report_to: wandb
 tracker_project_name: stable-fast-3d-material-refine
-tracker_run_name: material-refine-paper-stage1-round9-boundary-render-gate
+tracker_run_name: material-refine-paper-stage1-round9-conservative-boundary
 tracker_group: paper-stage1
-tracker_tags: material-refine,paper,stage1,round9,r-module-v2,boundary-aware,material-aware,render-consistency,residual-safety
+tracker_tags: material-refine,paper,stage1,round9,conservative-boundary,dataset-gated,render-proxy-gate
 wandb_mode: online
 wandb_log_artifacts: true
 wandb_artifact_policy: best_and_final
@@ -137,4 +140,4 @@ target_prior_identity_warning_threshold: 0.20
 max_target_prior_identity_rate_for_paper: 0.30
 min_nontrivial_target_count_for_paper: 128
 fail_on_target_prior_identity: true
-seed: 20260428
+seed: 20260423

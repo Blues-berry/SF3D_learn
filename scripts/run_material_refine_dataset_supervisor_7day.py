@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import time
@@ -219,11 +220,47 @@ def production_root_groups(config: dict[str, Any]) -> list[dict[str, Any]]:
     for index, item in enumerate(nested_groups):
         if not isinstance(item, dict) or not item.get("patterns"):
             continue
+        if not bool(item.get("enabled", True)):
+            continue
         group = dict(defaults)
         group.update(item)
         group.setdefault("name", f"production_group_{index}")
         groups.append(group)
     return groups
+
+
+def cleanup_disabled_production_groups(
+    config: dict[str, Any],
+    *,
+    sessions: set[str],
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    production = dict(config.get("production_roots") or {})
+    nested_groups = production.get("groups", []) or []
+    default_prefixes = [str(item) for item in production.get("required_prefixes", [])]
+    actions: list[dict[str, Any]] = []
+    for index, item in enumerate(nested_groups):
+        if not isinstance(item, dict) or bool(item.get("enabled", True)):
+            continue
+        prefixes = [str(prefix) for prefix in item.get("required_prefixes", default_prefixes)]
+        matching_sessions = sorted(
+            session
+            for session in sessions
+            if any(session.startswith(prefix) for prefix in prefixes)
+        )
+        group_actions = [
+            kill_tmux_session(session, dry_run=dry_run)
+            for session in matching_sessions
+        ]
+        actions.append(
+            {
+                "name": str(item.get("name") or f"disabled_group_{index}"),
+                "action": "cleaned_disabled_group_sessions" if matching_sessions else "no_sessions",
+                "sessions": matching_sessions,
+                "actions": group_actions,
+            }
+        )
+    return actions
 
 
 def run_script_session_name(run_script: Path) -> str:
@@ -518,6 +555,187 @@ def ensure_factory(config: dict[str, Any], *, sessions: set[str], python_bin: Pa
     return start_tmux_session(session, shell_quote(run_script), dry_run=dry_run)
 
 
+def read_factory_config(config: dict[str, Any]) -> dict[str, Any]:
+    factory = config.get("factory", {})
+    path = REPO_ROOT / str(factory.get("config", ""))
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def ps_rows() -> list[dict[str, Any]]:
+    result = run_capture(["ps", "-eo", "pid,ppid,stat,etimes,command"])
+    if result.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
+            continue
+        rows.append(
+            {
+                "pid": int(parts[0]),
+                "ppid": int(parts[1]),
+                "stat": parts[2],
+                "etimes": int(parts[3]),
+                "command": parts[4],
+            }
+        )
+    return rows
+
+
+def source_process_rows(source: dict[str, Any]) -> list[dict[str, Any]]:
+    output_root = str(source.get("output_root") or "")
+    command_items = [str(item) for item in source.get("command", [])]
+    script_token = next((item for item in command_items if item.startswith("scripts/")), "")
+    if not output_root or not script_token:
+        return []
+    return [
+        row
+        for row in ps_rows()
+        if output_root in str(row.get("command") or "") and script_token in str(row.get("command") or "")
+    ]
+
+
+def terminate_source_processes(source: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    rows = source_process_rows(source)
+    pids = sorted({int(row["pid"]) for row in rows})
+    if not pids:
+        return {"action": "no_processes"}
+    if dry_run:
+        return {"action": "dry_run_terminate_processes", "pids": pids}
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    time.sleep(2)
+    killed: list[int] = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            killed.append(pid)
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            killed.append(pid)
+    return {"action": "terminated_processes", "pids": pids, "gone_after_term": killed}
+
+
+def newest_progress_mtime(paths: list[Path]) -> float:
+    newest = 0.0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+        if path.is_dir():
+            try:
+                for child in path.rglob("*"):
+                    if child.is_file():
+                        newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def restart_download_session(source: dict[str, Any], *, reason: str, sessions: set[str], dry_run: bool) -> dict[str, Any]:
+    session = str(source.get("session") or "")
+    output_root = REPO_ROOT / str(source.get("output_root") or "")
+    run_script = output_root / "logs" / f"{session}.run.sh"
+    log_path = output_root / "logs" / f"{session}.log"
+    actions: list[dict[str, Any]] = []
+    if session and session in sessions:
+        actions.append(kill_tmux_session(session, dry_run=dry_run))
+    actions.append(terminate_source_processes(source, dry_run=dry_run))
+    if not run_script.exists():
+        return {
+            "session": session,
+            "action": "restart_deferred_missing_run_script",
+            "reason": reason,
+            "run_script": str(run_script),
+            "actions": actions,
+        }
+    command = f"bash {shell_quote(run_script)} > {shell_quote(log_path)} 2>&1"
+    actions.append(start_tmux_session(session, command, dry_run=dry_run))
+    return {"session": session, "action": "restarted", "reason": reason, "actions": actions}
+
+
+def ensure_download_health(config: dict[str, Any], *, sessions: set[str], dry_run: bool) -> list[dict[str, Any]]:
+    factory_config = read_factory_config(config)
+    if not factory_config:
+        return [{"action": "factory_config_unavailable"}]
+    actions: list[dict[str, Any]] = []
+    now = time.time()
+    for source in factory_config.get("downloads", []):
+        if not bool(source.get("enabled", True)):
+            continue
+        session = str(source.get("session") or "")
+        output_root = REPO_ROOT / str(source.get("output_root") or "")
+        log_path = output_root / "logs" / f"{session}.log"
+        process_rows = source_process_rows(source)
+        stopped = [row for row in process_rows if "T" in str(row.get("stat") or "")]
+        if stopped:
+            actions.append(
+                restart_download_session(
+                    source,
+                    reason=f"stopped_processes:{[row['pid'] for row in stopped]}",
+                    sessions=sessions,
+                    dry_run=dry_run,
+                )
+            )
+            continue
+        if session and session not in sessions:
+            output_manifest = output_root / "objaverse_cached_increment_manifest.json"
+            polyhaven_manifest = output_root / "polyhaven_material_bank_manifest.json"
+            if output_manifest.exists() or polyhaven_manifest.exists() or log_path.exists():
+                actions.append(
+                    restart_download_session(
+                        source,
+                        reason="missing_tmux_session",
+                        sessions=sessions,
+                        dry_run=dry_run,
+                    )
+                )
+            else:
+                actions.append({"session": session, "action": "waiting_for_factory_run_script"})
+            continue
+        stall_seconds = int(source.get("stall_seconds", 0) or 0)
+        if stall_seconds <= 0 or not session or session not in sessions:
+            actions.append({"session": session, "action": "healthy_or_unwatched"})
+            continue
+        progress_paths = [REPO_ROOT / str(path) for path in source.get("progress_paths", [])]
+        newest = max(
+            newest_progress_mtime(progress_paths),
+            log_path.stat().st_mtime if log_path.exists() else 0.0,
+        )
+        if newest > 0 and now - newest > stall_seconds:
+            actions.append(
+                restart_download_session(
+                    source,
+                    reason=f"stalled_no_progress_seconds={int(now - newest)}",
+                    sessions=sessions,
+                    dry_run=dry_run,
+                )
+            )
+        else:
+            actions.append(
+                {
+                    "session": session,
+                    "action": "healthy",
+                    "seconds_since_progress": max(0, int(now - newest)) if newest else None,
+                }
+            )
+    return actions
+
+
 def active_sessions_with_prefix(prefix: str, sessions: set[str]) -> list[str]:
     return sorted(session for session in sessions if session.startswith(prefix))
 
@@ -794,6 +1012,10 @@ def supervise_once(
     sessions = set(tmux_sessions())
     actions: dict[str, Any] = {}
     actions["factory"] = ensure_factory(config, sessions=sessions, python_bin=python_bin, dry_run=dry_run)
+    sessions = set(tmux_sessions())
+    actions["downloads"] = ensure_download_health(config, sessions=sessions, dry_run=dry_run)
+    sessions = set(tmux_sessions())
+    actions["disabled_groups"] = cleanup_disabled_production_groups(config, sessions=sessions, dry_run=dry_run)
     sessions = set(tmux_sessions())
 
     roots: list[dict[str, Any]] = []

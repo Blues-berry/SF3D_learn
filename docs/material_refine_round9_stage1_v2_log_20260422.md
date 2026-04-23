@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- Round8 仍在训练，full test eval 尚未生成，因此 Round9 full training 不能启动。
+- Round8 已完成 full test eval 和 promotion decision，但没有通过 Round9 初始化门禁，因此 Round9 full training 仍不能直接启动。
 - 当前主训练数据仍保持 346 条 locked Stage1 subset，不自动切换到 longrun/paper_unlock。
 - 数据侧仍在持续更新；新增多样本优先进入 diagnostic/OOD，不绕过 paper-stage 门禁。
 
@@ -91,6 +91,49 @@ launcher 设计：
 - 支持 `--dry-run true`、`--only`、`--max-variants`、`--device`、`--cuda-device-index`、`--report-to`、`--wandb-mode`。
 - 默认顺序执行，避免多个 ablation 同时抢 GPU。
 - 失败默认停止；如需继续收集失败信息，可加 `--continue-on-error true`。
+
+## R-v2 模块升级
+
+本轮已把原来的轻量 UV refiner 扩展成可选的边界感知、材质感知、渲染一致性感知 R 模块。默认配置保持关闭，因此 Round6/Round7/Round8 checkpoint 仍可按旧结构严格加载；Round9/R-v2 配置显式开启新分支。
+
+改动文件：
+
+- `sf3d/material_refine/model.py`
+- `scripts/train_material_refiner.py`
+- `configs/material_refine_train_paper_stage1_round9_boundary_render_gate.yaml`
+- `configs/material_refine_round9_rv2_component_ablation_matrix.yaml`
+
+模块设计：
+
+- 边界感知：从 UV albedo、normal、prior RM 和 view-fusion validity 中提取 differentiable boundary cues，并用 `boundary_gate_head` 调制 residual gate，目标是减少 mixed-material boundary 被抹开。
+- 材质感知：新增 `material_context_head`，从 UV 输入、initial RM、boundary cue、prior confidence 推断粗材质上下文，并输出小幅 `material_delta`；训练侧新增 `material_context_loss`，用 target RM 自动构造 rough dielectric / glossy dielectric / metal 三类弱监督。
+- 渲染一致性感知：新增 `render_gate_head`，使用 fused multi-view features、validity、initial RM 和 boundary cue 预测 render-support gate；无可靠 view 支持的位置会抑制 residual，避免只在 UV 上变好但 view/render 退化。
+- 兼容性：`init_from_checkpoint` 改成 compatible loader，会跳过 shape mismatch 和新增层，适合从 Round7 稳定权重初始化 R-v2；普通 resume 仍保持严格加载，避免误恢复到不一致结构。
+
+新增配置：
+
+- `enable_boundary_context`
+- `boundary_context_strength`
+- `enable_material_context`
+- `material_context_classes`
+- `material_delta_scale`
+- `enable_render_consistency_gate`
+- `render_gate_strength`
+- `material_context_weight`
+
+新增 R-v2 组件消融矩阵：
+
+`configs/material_refine_round9_rv2_component_ablation_matrix.yaml`
+
+覆盖：
+
+- `rv2_full`
+- `rv2_no_boundary_context`
+- `rv2_no_material_context`
+- `rv2_no_render_gate`
+- `rv2_safe_low_delta`
+
+该矩阵复用 `scripts/run_material_refine_round9_boundary_ablation.py`，用于在 full training 前隔离三类新分支的贡献。
 
 ## Stage1-v2 数据更新接口
 
@@ -260,6 +303,94 @@ tmux session：
 - 已写出 `progress_001_of_040` 到至少 `progress_005_of_040` 的 validation JSON。
 - `progress_005_of_040` 当前 UV total `0.060075`，baseline `0.114024`；residual changed pixel rate `0.5715`，regression rate `0.2261`。
 
+### Round9/R-v2 render-proxy smoke
+
+命令输出目录：
+
+`output/material_refine_paper/debug_round9_rv2_render_proxy_smoke_val`
+
+验收结果：
+
+- Round7 checkpoint 能作为 model-only init 加载到 R-v2，新增层 `missing=70`，`unexpected=0`，`skipped_shape=0`。
+- R-v2 参数量约 `1.90M`。
+- progress validation 成功触发 `progress_001_of_001`。
+- validation JSON 写入 `render_proxy_validation.enabled=true`、`residual_gate_diagnostics` 和 `loss.material_context`。
+
+关键 smoke 数值：
+
+- baseline UV total MAE `0.093270`，R-v2 refined UV total MAE `0.049377`。
+- view-proxy delta `-0.004867`，说明该极小 smoke 仍存在 view/render 退化风险。
+- residual changed pixel rate `0.4644`，regression rate `0.1749`。
+- `material_context` loss 已进入训练/验证 loss 字段，progress bar 中显示为 `mat=...`。
+
+结论：
+
+- R-v2 工程链路可用，但 smoke 不能作为论文有效性结论。
+- Round9 full training 前应先跑 R-v2 组件消融，优先选择同时不过度退化 render-proxy 和 residual safety 的配置。
+
+### Stage1-v2 diagnostic eval smoke 更新
+
+命令输出目录：
+
+`output/material_refine_paper/stage1_v2_dataset_20260422/diagnostic_eval_smoke_cpu`
+
+验收结果：
+
+- diagnostic-only manifest 可被 eval loader 正常读取。
+- `summary.json` 正常生成，rows `4`，objects `2`。
+
+关键观察：
+
+- baseline UV total MAE `0.4092`，refined UV total MAE `1.0631`。
+- view total MAE delta `-1.1576`，proxy PSNR delta `-0.9763`，proxy SSIM delta `-0.0144`。
+- refined metal confusion rate `1.0`，prior residual safety score `-0.5192`。
+
+结论：
+
+- Stage1-v2 diagnostic/OOD 通路可用。
+- 当前 with-prior ABO 模型在 no-prior scarce material diagnostic 子集上明显退化；这些数据只能用于 failure discovery/OOD 诊断，不能进入 paper-stage 主训练。
+
+### R-v2 ablation launcher dry-run
+
+命令：
+
+```bash
+/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/run_material_refine_round9_boundary_ablation.py \
+  --matrix-config configs/material_refine_round9_rv2_component_ablation_matrix.yaml \
+  --dry-run true \
+  --max-variants 2 \
+  --report-to none \
+  --wandb-mode disabled \
+  --device cpu
+```
+
+验收结果：
+
+- 成功解析 `rv2_full` 与 `rv2_no_boundary_context`。
+- launcher 默认 summary root 已按 matrix 分离，R-v2 dry-run 写入 `output/material_refine_paper/rv2_component_ablation_matrix/round9_ablation_launcher_summary.json`，不会再覆盖 boundary ablation summary。
+- 后续可用同一 launcher 顺序执行完整 R-v2 component ablation。
+
+### R-v2 component ablation smoke 已启动
+
+tmux session：
+
+`sf3d_round9_rv2_component_ablation_smoke_gpu1_20260422`
+
+launcher 日志：
+
+`output/material_refine_paper/rv2_component_ablation_matrix/launcher.log`
+
+variant 日志目录：
+
+`output/material_refine_paper/rv2_component_ablation_matrix/logs`
+
+当前已确认：
+
+- 第一个 variant `rv2_full` 已通过 preflight。
+- 设备为 `cuda:1`，`CUDA_VISIBLE_DEVICES=None`，没有硬编码绑卡。
+- Round7 checkpoint 以 model-only init 方式加载到 R-v2，新增层 `missing=70`，`unexpected=0`，`skipped_shape=0`。
+- 训练数据为 96 条 ABO locked records，验证数据为 40 条 ABO locked records；当前仍只有 `glossy_non_metal`，因此只能作为 R-v2 工程/消融 smoke，不是多材质 paper-stage 结论。
+
 观察命令：
 
 ```bash
@@ -271,3 +402,66 @@ launcher 总日志：
 ```bash
 tail -f output/material_refine_paper/round9_boundary_ablation/launcher.log
 ```
+
+R-v2 component ablation 观察命令：
+
+```bash
+tail -f output/material_refine_paper/rv2_component_ablation_matrix/logs/rv2_full.log | grep -E '\\[train\\]|\\[val\\]|\\[epoch\\]|epoch '
+```
+
+## 2026-04-23 数据同步与 Round9 适配
+
+详细中文报告：
+
+`docs/material_refine_round9_dataset_analysis_20260423.md`
+
+最新 Stage1-v2 输出：
+
+`output/material_refine_paper/stage1_v2_dataset_20260423`
+
+关键结论：
+
+- unique records 已到 `1834`。
+- strict paper 仍只有 `362`，且全部是 `ABO_locked_core / glossy_non_metal / with_prior`。
+- diverse diagnostic 有 `512`，覆盖 `metal_dominant`、`ceramic_glazed_lacquer`、`glass_metal`、`mixed_thin_boundary`、`glossy_non_metal`。
+- OOD eval 有 `256`，全部是 3D-FUTURE no-prior diagnostic/OOD。
+- current main 仍保留 locked 346，不替换为 Stage1-v2 strict。
+
+新增 readiness 输出：
+
+`output/material_refine_paper/round9_dataset_readiness_20260423/round9_dataset_readiness.json`
+
+`output/material_refine_paper/round9_dataset_readiness_20260423/round9_dataset_readiness.md`
+
+readiness 结论：
+
+- `KEEP_CURRENT_MAIN_AND_USE_STAGE1_V2_FOR_DIAGNOSTIC`
+- blocker：`strict_records=362<min_replace=384`
+- blocker：`non_glossy_paper_material_count_below_16:{}`
+
+新增 Round9 配置：
+
+- `configs/material_refine_train_paper_stage1_round9_conservative_boundary.yaml`
+- `configs/material_refine_eval_paper_stage1_round9_conservative_boundary.yaml`
+- `configs/material_refine_eval_stage1_v2_diagnostic_20260423.yaml`
+- `configs/material_refine_eval_stage1_v2_ood_20260423.yaml`
+
+已启动 Round9 conservative boundary：
+
+tmux session：
+
+`sf3d_round9_conservative_boundary_gpu1_20260423`
+
+训练日志：
+
+`output/material_refine_paper/stage1_round9_conservative_boundary/logs/train.log`
+
+启动检查：
+
+- preflight 通过。
+- paper eligible：`346/346`。
+- target_prior_identity：`0.0000`。
+- effective_view_rate：`1.0000`。
+- Round7 model-only init：`missing=0`，`unexpected=0`。
+- 训练数据：`240`，验证数据：`40`，没有混入 Stage1-v2 smoke_only。
+- 首个 validation：`progress_001_of_040`，UV total `0.061786`，baseline `0.114024`，residual regression rate `0.2349`。

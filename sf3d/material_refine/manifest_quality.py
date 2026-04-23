@@ -473,8 +473,6 @@ def audit_record(
     allowed_paper_license_buckets: set[str] | None = None,
 ) -> dict[str, Any]:
     required_fields = [
-        "canonical_mesh_path",
-        "canonical_glb_path",
         "uv_albedo_path",
         "uv_normal_path",
         "uv_prior_roughness_path",
@@ -489,11 +487,27 @@ def audit_record(
         field: resolve_record_path(manifest_path, payload, record, record.get(field))
         for field in required_fields
     }
+    canonical_asset_candidates = {
+        "canonical_mesh_path": resolve_record_path(
+            manifest_path,
+            payload,
+            record,
+            record.get("canonical_mesh_path"),
+        ),
+        "canonical_glb_path": resolve_record_path(
+            manifest_path,
+            payload,
+            record,
+            record.get("canonical_glb_path"),
+        ),
+    }
     missing = [
         field
         for field, path in resolved.items()
         if path is None or not path.exists()
     ]
+    if not any(path is not None and path.exists() for path in canonical_asset_candidates.values()):
+        missing.append("canonical_asset_path")
     prior_roughness_digest = file_digest(resolved["uv_prior_roughness_path"])
     target_roughness_digest = file_digest(resolved["uv_target_roughness_path"])
     prior_metallic_digest = file_digest(resolved["uv_prior_metallic_path"])

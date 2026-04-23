@@ -81,6 +81,16 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def default_output_root_for_matrix(matrix_path: Path) -> Path:
+    if matrix_path.name == "material_refine_round9_boundary_ablation_matrix.yaml":
+        return REPO_ROOT / "output" / "material_refine_paper" / "round9_boundary_ablation"
+    stem = matrix_path.stem
+    for prefix in ("material_refine_", "round9_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+    return REPO_ROOT / "output" / "material_refine_paper" / stem
+
+
 def run_variant(
     *,
     args: argparse.Namespace,
@@ -158,13 +168,14 @@ def main() -> None:
     if not variants:
         raise ValueError("no_round9_ablation_variants_selected")
 
-    output_root = args.output_root.resolve() if args.output_root is not None else None
-    logs_dir = (output_root or (REPO_ROOT / "output" / "material_refine_paper" / "round9_boundary_ablation")) / "logs"
+    override_output_root = args.output_root.resolve() if args.output_root is not None else None
+    summary_root = override_output_root or default_output_root_for_matrix(matrix_path)
+    logs_dir = summary_root / "logs"
     results: list[dict[str, Any]] = []
     for variant in variants:
         variant_dict = dict(variant)
         variant_name = str(variant_dict.get("name"))
-        train_config = merge_variant_config(matrix, variant_dict, output_root=output_root)
+        train_config = merge_variant_config(matrix, variant_dict, output_root=override_output_root)
         print(
             f"[round9_ablation] variant={variant_name} output={train_config['output_dir']} dry_run={args.dry_run}",
             flush=True,
@@ -178,7 +189,7 @@ def main() -> None:
             )
         )
 
-    summary_path = (output_root or (REPO_ROOT / "output" / "material_refine_paper" / "round9_boundary_ablation")) / "round9_ablation_launcher_summary.json"
+    summary_path = summary_root / "round9_ablation_launcher_summary.json"
     write_json(summary_path, {"matrix_config": str(matrix_path), "results": results})
     print(
         json.dumps({"summary": str(summary_path), "variants": [item["variant"] for item in results]}, indent=2, ensure_ascii=False),

@@ -53,6 +53,7 @@ from sf3d.material_refine.manifest_quality import (  # noqa: E402
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "material_refiner"
 DEFAULT_MANIFEST = REPO_ROOT / "output" / "material_refine" / "canonical_manifest_v1.json"
 METALLIC_THRESHOLD = 0.5
+MATERIAL_CONTEXT_GLOSSY_THRESHOLD = 0.45
 
 
 def parse_bool(value: Any) -> bool:
@@ -207,7 +208,36 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--enable-residual-gate", type=parse_bool, default=False)
     parser.add_argument("--residual-gate-bias", type=float, default=-0.5)
     parser.add_argument("--min-residual-gate", type=float, default=0.05)
+    parser.add_argument("--max-residual-gate", type=float, default=1.0)
     parser.add_argument("--prior-confidence-gate-strength", type=float, default=0.0)
+    parser.add_argument("--enable-boundary-context", type=parse_bool, default=False)
+    parser.add_argument("--boundary-context-strength", type=float, default=0.25)
+    parser.add_argument("--enable-material-context", type=parse_bool, default=False)
+    parser.add_argument("--material-context-classes", type=int, default=3)
+    parser.add_argument("--material-delta-scale", type=float, default=0.06)
+    parser.add_argument("--enable-render-consistency-gate", type=parse_bool, default=False)
+    parser.add_argument("--render-gate-strength", type=float, default=0.25)
+    parser.add_argument("--enable-dual-path-prior-init", type=parse_bool, default=False)
+    parser.add_argument("--enable-domain-prior-calibration", type=parse_bool, default=False)
+    parser.add_argument("--domain-feature-channels", type=int, default=8)
+    parser.add_argument("--prior-feature-channels", type=int, default=16)
+    parser.add_argument("--max-generator-embeddings", type=int, default=64)
+    parser.add_argument("--max-source-embeddings", type=int, default=128)
+    parser.add_argument("--enable-material-sensitive-view-encoder", type=parse_bool, default=False)
+    parser.add_argument("--enable-hard-view-routing", type=parse_bool, default=False)
+    parser.add_argument("--enable-tri-branch-fusion", type=parse_bool, default=False)
+    parser.add_argument("--enable-boundary-safety-module", type=parse_bool, default=False)
+    parser.add_argument("--boundary-safety-strength", type=float, default=0.35)
+    parser.add_argument("--boundary-residual-suppression-strength", type=float, default=0.0)
+    parser.add_argument("--enable-material-topology-reasoning", type=parse_bool, default=False)
+    parser.add_argument("--topology-feature-channels", type=int, default=16)
+    parser.add_argument("--topology-patch-size", type=int, default=16)
+    parser.add_argument("--topology-layers", type=int, default=2)
+    parser.add_argument("--topology-heads", type=int, default=2)
+    parser.add_argument("--enable-confidence-gated-trunk", type=parse_bool, default=False)
+    parser.add_argument("--uncertainty-gate-strength", type=float, default=0.25)
+    parser.add_argument("--enable-inverse-material-check", type=parse_bool, default=False)
+    parser.add_argument("--inverse-check-strength", type=float, default=0.25)
     parser.add_argument("--cuda-device-index", type=int, default=1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--amp-dtype", choices=["bfloat16", "float16"], default="bfloat16")
@@ -252,6 +282,7 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--boundary-band-kernel", type=int, default=5)
     parser.add_argument("--gradient-preservation-weight", type=float, default=0.0)
     parser.add_argument("--metallic-classification-weight", type=float, default=0.0)
+    parser.add_argument("--material-context-weight", type=float, default=0.0)
     parser.add_argument("--residual-safety-weight", type=float, default=0.0)
     parser.add_argument("--residual-safety-margin", type=float, default=0.03)
     parser.add_argument("--view-consistency-mode", choices=["auto", "required", "disabled"], default="auto")
@@ -443,6 +474,22 @@ def parse_args() -> argparse.Namespace:
     args.boundary_band_kernel = max(int(args.boundary_band_kernel), 1)
     if args.boundary_band_kernel % 2 == 0:
         args.boundary_band_kernel += 1
+    args.domain_feature_channels = max(int(args.domain_feature_channels), 1)
+    args.prior_feature_channels = max(int(args.prior_feature_channels), 1)
+    args.max_generator_embeddings = max(int(args.max_generator_embeddings), 2)
+    args.max_source_embeddings = max(int(args.max_source_embeddings), 2)
+    args.max_residual_gate = max(0.0, min(1.0, float(args.max_residual_gate)))
+    args.boundary_safety_strength = max(0.0, min(1.0, float(args.boundary_safety_strength)))
+    args.boundary_residual_suppression_strength = max(
+        0.0,
+        min(1.0, float(args.boundary_residual_suppression_strength)),
+    )
+    args.topology_feature_channels = max(int(args.topology_feature_channels), 8)
+    args.topology_patch_size = max(int(args.topology_patch_size), 4)
+    args.topology_layers = max(int(args.topology_layers), 1)
+    args.topology_heads = max(int(args.topology_heads), 1)
+    args.uncertainty_gate_strength = max(0.0, min(1.0, float(args.uncertainty_gate_strength)))
+    args.inverse_check_strength = max(0.0, min(1.0, float(args.inverse_check_strength)))
     args.save_every = max(int(args.save_every), 1)
     args.prior_dropout_prob = max(0.0, min(1.0, float(args.prior_dropout_prob)))
     if args.prior_dropout_start_prob is not None:
@@ -614,6 +661,36 @@ def metallic_classification_loss(
     return (per_texel * weight).sum() / weight.sum().clamp_min(1.0)
 
 
+def material_context_loss(
+    material_logits: torch.Tensor | None,
+    target: torch.Tensor,
+    confidence: torch.Tensor,
+) -> torch.Tensor:
+    if material_logits is None:
+        return target.new_zeros(())
+    class_count = int(material_logits.shape[1])
+    if class_count < 2:
+        return target.new_zeros(())
+    roughness = target[:, 0:1].float()
+    metallic = target[:, 1:2].float()
+    labels = torch.zeros_like(roughness, dtype=torch.long)
+    glossy_label = 1 if class_count > 1 else 0
+    metal_label = min(2, class_count - 1)
+    labels = torch.where(
+        (metallic >= METALLIC_THRESHOLD),
+        torch.full_like(labels, metal_label),
+        labels,
+    )
+    labels = torch.where(
+        (metallic < METALLIC_THRESHOLD) & (roughness < MATERIAL_CONTEXT_GLOSSY_THRESHOLD),
+        torch.full_like(labels, glossy_label),
+        labels,
+    )
+    per_texel = F.cross_entropy(material_logits.float(), labels[:, 0], reduction="none")
+    weight = confidence[:, 0].float()
+    return (per_texel * weight).sum() / weight.sum().clamp_min(1.0)
+
+
 def residual_safety_loss(
     refined: torch.Tensor,
     baseline: torch.Tensor,
@@ -721,6 +798,11 @@ def compute_losses(
         if args.metallic_classification_weight > 0.0
         else refined.new_zeros(())
     )
+    material_context = (
+        material_context_loss(outputs.get("material_logits"), target, confidence)
+        if args.material_context_weight > 0.0
+        else refined.new_zeros(())
+    )
     residual_safety = (
         residual_safety_loss(
             refined,
@@ -767,6 +849,7 @@ def compute_losses(
         + args.boundary_bleed_weight * boundary_bleed
         + args.gradient_preservation_weight * gradient_preservation
         + args.metallic_classification_weight * metallic_classification
+        + args.material_context_weight * material_context
         + args.residual_safety_weight * residual_safety
     )
     return {
@@ -780,6 +863,7 @@ def compute_losses(
         "boundary_bleed": boundary_bleed.detach(),
         "gradient_preservation": gradient_preservation.detach(),
         "metallic_classification": metallic_classification.detach(),
+        "material_context": material_context.detach(),
         "residual_safety": residual_safety.detach(),
         "residual_gate_mean": residual_gate_mean.detach(),
         "residual_delta_abs": residual_delta_abs.detach(),
@@ -1052,7 +1136,38 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         "enable_residual_gate": bool(args.enable_residual_gate),
         "residual_gate_bias": float(args.residual_gate_bias),
         "min_residual_gate": float(args.min_residual_gate),
+        "max_residual_gate": float(args.max_residual_gate),
         "prior_confidence_gate_strength": float(args.prior_confidence_gate_strength),
+        "enable_boundary_context": bool(args.enable_boundary_context),
+        "boundary_context_strength": float(args.boundary_context_strength),
+        "enable_material_context": bool(args.enable_material_context),
+        "material_context_classes": int(args.material_context_classes),
+        "material_delta_scale": float(args.material_delta_scale),
+        "enable_render_consistency_gate": bool(args.enable_render_consistency_gate),
+        "render_gate_strength": float(args.render_gate_strength),
+        "enable_dual_path_prior_init": bool(args.enable_dual_path_prior_init),
+        "enable_domain_prior_calibration": bool(args.enable_domain_prior_calibration),
+        "domain_feature_channels": int(args.domain_feature_channels),
+        "prior_feature_channels": int(args.prior_feature_channels),
+        "max_generator_embeddings": int(args.max_generator_embeddings),
+        "max_source_embeddings": int(args.max_source_embeddings),
+        "enable_material_sensitive_view_encoder": bool(args.enable_material_sensitive_view_encoder),
+        "enable_hard_view_routing": bool(args.enable_hard_view_routing),
+        "enable_tri_branch_fusion": bool(args.enable_tri_branch_fusion),
+        "enable_boundary_safety_module": bool(args.enable_boundary_safety_module),
+        "boundary_safety_strength": float(args.boundary_safety_strength),
+        "boundary_residual_suppression_strength": float(
+            args.boundary_residual_suppression_strength
+        ),
+        "enable_material_topology_reasoning": bool(args.enable_material_topology_reasoning),
+        "topology_feature_channels": int(args.topology_feature_channels),
+        "topology_patch_size": int(args.topology_patch_size),
+        "topology_layers": int(args.topology_layers),
+        "topology_heads": int(args.topology_heads),
+        "enable_confidence_gated_trunk": bool(args.enable_confidence_gated_trunk),
+        "uncertainty_gate_strength": float(args.uncertainty_gate_strength),
+        "enable_inverse_material_check": bool(args.enable_inverse_material_check),
+        "inverse_check_strength": float(args.inverse_check_strength),
     }
 
 
@@ -1874,7 +1989,30 @@ def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any
         "boundary_band_kernel": int(args.boundary_band_kernel),
         "gradient_preservation_weight": float(args.gradient_preservation_weight),
         "metallic_classification_weight": float(args.metallic_classification_weight),
+        "material_context_weight": float(args.material_context_weight),
         "residual_safety_weight": float(args.residual_safety_weight),
+        "r_module_v2": {
+            "enable_dual_path_prior_init": bool(args.enable_dual_path_prior_init),
+            "enable_domain_prior_calibration": bool(args.enable_domain_prior_calibration),
+            "enable_boundary_context": bool(args.enable_boundary_context),
+            "boundary_context_strength": float(args.boundary_context_strength),
+            "enable_material_context": bool(args.enable_material_context),
+            "material_context_classes": int(args.material_context_classes),
+            "material_delta_scale": float(args.material_delta_scale),
+            "enable_render_consistency_gate": bool(args.enable_render_consistency_gate),
+            "render_gate_strength": float(args.render_gate_strength),
+            "enable_material_sensitive_view_encoder": bool(args.enable_material_sensitive_view_encoder),
+            "enable_hard_view_routing": bool(args.enable_hard_view_routing),
+            "enable_tri_branch_fusion": bool(args.enable_tri_branch_fusion),
+            "enable_boundary_safety_module": bool(args.enable_boundary_safety_module),
+            "max_residual_gate": float(args.max_residual_gate),
+            "boundary_residual_suppression_strength": float(
+                args.boundary_residual_suppression_strength
+            ),
+            "enable_material_topology_reasoning": bool(args.enable_material_topology_reasoning),
+            "enable_confidence_gated_trunk": bool(args.enable_confidence_gated_trunk),
+            "enable_inverse_material_check": bool(args.enable_inverse_material_check),
+        },
         "errors": errors,
         "warnings": warnings,
         "manifest_identity_audit": {
@@ -1950,6 +2088,7 @@ def print_train_interval(payload: dict[str, Any], device: str) -> None:
         f"bnd={format_metric(payload.get('train/boundary_bleed'))} "
         f"grad_pres={format_metric(payload.get('train/gradient_preservation'))} "
         f"metal_cls={format_metric(payload.get('train/metallic_classification'))} "
+        f"mat_ctx={format_metric(payload.get('train/material_context'))} "
         f"res_safe={format_metric(payload.get('train/residual_safety'))} "
         f"grad={format_metric(grad)} "
         f"view_sup_rate={format_metric(view_rate, 4) if view_rate is not None else 'n/a'} "
@@ -2011,6 +2150,7 @@ def update_epoch_progress_bar(
                 f"lr={format_metric(payload.get('lr'), 7)}",
                 f"ref={format_metric(payload.get('train/refine_l1'), 4)}",
                 f"bnd={format_metric(payload.get('train/boundary_bleed'), 4)}",
+                f"mat={format_metric(payload.get('train/material_context'), 4)}",
                 f"gn={format_metric(payload.get('train/grad_norm'), 3)}",
                 f"v={format_metric(payload.get('train/effective_view_supervision_rate'), 2)}",
                 f"sps={format_metric(payload.get('train/samples_per_second'), 2)}",
@@ -2695,6 +2835,7 @@ def evaluate(
         "boundary_bleed": 0.0,
         "gradient_preservation": 0.0,
         "metallic_classification": 0.0,
+        "material_context": 0.0,
         "residual_safety": 0.0,
         "residual_gate_mean": 0.0,
         "residual_delta_abs": 0.0,
@@ -2922,6 +3063,27 @@ def save_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
         json.dumps(make_json_serializable(payload), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def load_compatible_model_state(
+    model: MaterialRefiner,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str], list[str]]:
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = []
+    unexpected = []
+    for key, value in state_dict.items():
+        if key not in model_state:
+            unexpected.append(key)
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            skipped_shape.append(key)
+            continue
+        compatible_state[key] = value
+    missing, load_unexpected = model.load_state_dict(compatible_state, strict=False)
+    unexpected.extend(load_unexpected)
+    return list(missing), list(unexpected), skipped_shape
 
 
 def save_checkpoint(
@@ -3310,17 +3472,19 @@ def main() -> None:
         init_path = args.init_from_checkpoint
         checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected, skipped_shape = load_compatible_model_state(model, state_dict)
         print(
             "[init] "
             f"checkpoint={short_path(init_path.resolve())} "
             f"source_epoch={checkpoint.get('epoch', 'n/a') if isinstance(checkpoint, dict) else 'n/a'} "
-            f"missing={len(missing)} unexpected={len(unexpected)}"
+            f"missing={len(missing)} unexpected={len(unexpected)} skipped_shape={len(skipped_shape)}"
         )
         if missing:
             print(f"[init:warning] missing_keys={','.join(missing[:12])}")
         if unexpected:
             print(f"[init:warning] unexpected_keys={','.join(unexpected[:12])}")
+        if skipped_shape:
+            print(f"[init:warning] shape_mismatch_skipped={','.join(skipped_shape[:12])}")
     model_info = model_parameter_summary(model)
     runtime_info = system_runtime_info(args, device)
     runtime_info.update(

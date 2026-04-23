@@ -1,0 +1,70 @@
+# Round11b / shape-compatible R-8 boundary-gradient guard overlay.
+#
+# This supersedes the first Round11 guard attempt. The first attempt changed
+# topology feature dimensionality, which changed refine_head input shape and
+# partially reinitialized the trunk. Round11b keeps all Round10 tensor shapes
+# compatible and tests only safety gates / loss reweighting.
+
+output_dir: output/material_refine_paper/stage1_round11b_r8_boundary_gradient_guard_compatible
+init_from_checkpoint: output/material_refine_paper/stage1_round10_r8_full/best.pt
+resume:
+
+epochs: 14
+learning_rate: 2.5e-5
+min_learning_rate: 2.5e-6
+warmup_steps: 80
+plateau_patience: 3
+early_stopping_patience: 5
+
+# Shape-compatible safety valves.
+residual_gate_bias: -1.65
+min_residual_gate: 0.01
+max_residual_gate: 0.52
+prior_confidence_gate_strength: 0.68
+uncertainty_gate_strength: 0.32
+
+enable_boundary_safety_module: true
+boundary_safety_strength: 0.58
+boundary_residual_suppression_strength: 0.55
+
+# Keep Round10 topology shape so the refine trunk can load intact.
+enable_material_topology_reasoning: true
+topology_feature_channels: 16
+topology_patch_size: 16
+topology_layers: 2
+topology_heads: 2
+
+# Avoid introducing a randomly initialized render gate in this compatibility run.
+# Render consistency remains a validation/eval gate; inverse check is inherited
+# from Round10 and stays active.
+enable_render_consistency_gate: false
+render_gate_strength: 0.0
+enable_inverse_material_check: true
+inverse_check_strength: 0.40
+
+# Loss policy: rebalance away from pure UV, but keep enough refine pressure to
+# avoid collapsing back to the original prior.
+refine_weight: 0.70
+coarse_weight: 0.25
+prior_consistency_weight: 0.22
+smoothness_weight: 8.0e-4
+view_consistency_weight: 0.40
+edge_aware_weight: 0.18
+boundary_bleed_weight: 0.18
+boundary_band_kernel: 9
+gradient_preservation_weight: 0.28
+metallic_classification_weight: 0.08
+material_context_weight: 0.03
+residual_safety_weight: 0.32
+residual_safety_margin: 0.025
+
+validation_progress_milestones: 40
+render_proxy_validation_milestone_interval: 5
+render_proxy_validation_max_batches: 6
+save_only_best_checkpoint: true
+keep_last_checkpoints: 4
+
+tracker_run_name: material-refine-paper-stage1-round11b-r8-boundary-gradient-guard-compatible
+tracker_group: paper-stage1-r8
+tracker_tags: material-refine,paper,stage1,round11b,r8,boundary-guard,gradient-safe,shape-compatible
+seed: 20260425

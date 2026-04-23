@@ -932,3 +932,342 @@
   * input: `512` local Objaverse records from recovered cached canonical manifest。
   * material labels: `unknown_pending_second_pass=496`，`ceramic_glazed_lacquer=8`，`mixed_thin_boundary=6`，`metal_dominant=2`。
   * 该队列已加入 supervisor group `objaverse_cached_topup`，后续会被 7-day supervisor 合并/审计/重启。
+
+### 2026-04-22 network resilience hardening
+
+* 已增强下载 wrapper 的抗断连能力：
+  * `scripts/run_material_refine_dataset_factory.py` 每次 retry 前会重新探测代理候选。
+  * 代理候选扩展为 `env`、`http://127.0.0.1:51081`、`http://127.0.0.1:7890`、`http://127.0.0.1:7891`、`http://127.0.0.1:10809`、`direct`。
+  * 新增 HuggingFace endpoint/mirror 探测：`env`、`https://huggingface.co`、`https://hf-mirror.com`，自动设置 `HF_ENDPOINT`。
+  * 下载脚本默认设置 `GIT_TERMINAL_PROMPT=0`、`GIT_HTTP_LOW_SPEED_LIMIT=1024`、`GIT_HTTP_LOW_SPEED_TIME=300`，避免 Git/LFS 半断连时长时间假死。
+* 已增强 7-day supervisor 的下载 watchdog：
+  * `scripts/run_material_refine_dataset_supervisor_7day.py` 会读取 factory config 中每个 download job 的 `stall_seconds` 与 `progress_paths`。
+  * 若下载 tmux 消失、下载进程变成 stopped (`T`) 状态、或日志/产物超过阈值无进展，会清理残留进程并从 `.run.sh` 自动重启。
+  * watchdog 当前覆盖 PolyHaven HDRI、Objaverse cached、Objaverse GitHub/LFS、Objaverse strict retry、PolyHaven material bank。
+* 已增加 cron-safe 保活脚本：
+  * script: `scripts/ensure_material_refine_data_stack_alive.sh`
+  * 已安装 user crontab：每 `5` 分钟检查并补拉 `sf3d_material_refine_dataset_factory_gpu0` 与 `sf3d_material_refine_dataset_7day_supervisor`。
+  * cron log: `output/material_refine_dataset_factory/supervisor_7day/cron_ensure_data_stack_alive.log`
+  * 用 `flock` 防重入，断 SSH 不影响；若 tmux session 意外消失，也会在 5 分钟内被重新拉起。
+* 已验证：
+  * factory/download sessions 已重启并生成新版 `.run.sh`。
+  * Objaverse cached 日志已显示自动选择 `http://127.0.0.1:51081` 与 `https://huggingface.co`。
+  * supervisor 单次 pass 正常，`recent_errors.count=0`，GPU1 无数据进程。
+完整版主结构：8 模块设计
+模块 A：Dual-Path Prior Initialization
+
+这是原来的 prior/no-prior 统一模块，但做强。
+
+目标
+
+统一处理：
+
+with prior
+no prior
+输入
+uv_albedo
+uv_normal
+uv_mask
+uv_prior_roughness
+uv_prior_metallic
+prior_confidence
+generator_id embedding
+source/domain embedding
+结构
+
+两条路：
+
+A1. Prior-adaptation path
+
+有 prior 时：
+
+编码 prior
+估计 prior reliability
+输出 prior_feat
+A2. Prior-bootstrap path
+
+无 prior 时：
+
+从 uv_albedo + uv_normal + mask 预测一个 coarse RM
+同时输出 bootstrap_confidence
+输出
+rm_init_uv
+init_confidence_uv
+prior_feat_uv
+domain_feat_uv
+创新点 1
+Generator-/Source-aware Prior Calibration
+
+也就是你新增的第一个大创新点：
+
+不把所有上游 prior 一视同仁，而是显式建模不同 generator/source 的 prior 可靠性差异。
+
+这比单纯 with prior / no prior 更强，因为它解释了为什么不同源的材质先验应该被不同程度信任。
+
+模块 B：Material-sensitive Multi-view Encoder
+
+这是多视图分支，但比之前更大。
+
+输入（每个视图）
+RGB
+mask
+depth
+normal
+position
+uv correspondence
+view angle
+local highlight map
+silhouette/boundary cue
+light condition embedding
+输出
+
+每个视图产生：
+
+view_feat_k
+material_logit_k
+highlight_response_k
+view_quality_k
+结构
+
+推荐：
+
+共享 backbone：ConvNeXt-Tiny-lite / ResNet18-lite
+轻量 FPN 聚合多尺度信息
+两个辅助头：
+material type head
+highlight response head
+创新点 2
+Material-sensitive View Encoding
+
+不是简单编码多视图，而是显式提取：
+
+材质类别倾向
+局部高光响应
+边界敏感 cue
+
+这样能更正面地打 metal_nonmetal_confusion 和 local_highlight_misread。
+
+模块 C：Hard-view Routing and Importance Estimation
+
+这是你现在 hard-view 思路的升级版。
+
+输入
+
+来自每个视图的：
+
+view_feat_k
+view_quality_k
+highlight cue
+grazing cue
+thin-boundary cue
+visibility stats
+输出
+global_weight_k
+boundary_weight_k
+highlight_weight_k
+作用
+
+不要所有视图走一条融合逻辑，而是做：
+
+普通区域融合
+边界区域融合
+高光区域融合
+创新点 3
+Region-specific Hard-view Routing
+
+也就是第三个新增创新点：
+
+不同区域需要不同视图证据，边界、镜面高光、普通区域应该使用不同的视图聚合策略。
+
+这个点很强，因为它不是普通加权平均，而是区域选择性多视图证据路由。
+
+模块 D：Tri-branch UV Fusion
+
+这是前面 routing 的对应融合模块。
+
+三条支路
+D1. Global branch
+
+聚合所有可见视图的全局信息
+
+D2. Boundary branch
+
+聚合与边界最相关的视图证据
+
+D3. Highlight branch
+
+聚合与高光/镜面响应最相关的视图证据
+
+融合结果
+
+得到：
+
+global_uv_feat
+boundary_uv_feat
+highlight_uv_feat
+view_coverage_uv
+view_uncertainty_uv
+创新点 4
+Tri-branch UV Evidence Fusion
+
+这是第四个新增创新点：
+
+将 view-space 证据按功能拆成三类 UV 特征分支，而不是直接压成一张融合图。
+
+这会让你论文结构明显变强，因为图上能画出三路信息流。
+
+模块 E：Mask-aware Boundary Safety Module
+
+这是边界模块，但继续升级成核心模块，而不是一个 loss 分支。
+
+输入
+uv_mask
+boundary band
+distance-to-boundary map
+boundary_uv_feat
+uv_normal
+uv_albedo
+rm_init_uv
+输出
+boundary_gate_uv
+safe_update_mask_uv
+bleed_risk_uv
+功能
+
+它决定三个问题：
+
+哪些地方容易 boundary bleed
+哪些地方允许大更新
+哪些地方只能做保守修正
+
+这个模块非常适合写成主创新之一，因为它正对你当前最麻烦的失败模式。
+
+模块 F：Material Topology Reasoning Module
+
+这个是我建议你新增的第五个创新点，也是很值得加的。
+
+为什么要加
+
+你现在的 RM 精修容易只看局部纹理和局部视图响应，但材质常常具有区域连续性和拓扑一致性：
+
+某个金属部件应整体偏 metal
+某个釉面区域 roughness 变化应平滑但不乱跳
+细边界区域往往不应跨材质泄漏
+结构做法
+
+在 UV domain 上建立一个轻量拓扑推理单元：
+
+可选实现
+superpixel / patch graph
+non-local attention
+region token reasoning
+
+我建议你先做轻量版：
+
+把 UV atlas 切成 patch tokens
+用一个 2~4 层轻量 Transformer / Graph block
+对 patch 间的材质一致性做建模
+输出
+topology_feat_uv
+material_region_logits
+region_consistency_score
+创新点 5
+Material Topology Reasoning
+
+这是一个很像“论文方法点”的模块，因为它把你方法从 pixel/texel 级提升到 region 级。
+
+模块 G：Confidence-Gated Residual Refinement Trunk
+
+这是主干，但现在它不再只是吃输入拼接，而是吃上面所有模块输出。
+
+输入拼接
+uv_albedo
+uv_normal
+rm_init_uv
+prior_feat_uv
+domain_feat_uv
+global_uv_feat
+boundary_uv_feat
+highlight_uv_feat
+view_uncertainty_uv
+boundary_gate_uv
+safe_update_mask_uv
+bleed_risk_uv
+topology_feat_uv
+结构
+
+建议：
+
+主干：ResUNet / UNet with residual blocks
+编码 4 层
+bottleneck 加 1~2 个 attention block
+解码 4 层
+skip connection 保留细节
+输出头
+
+至少 6 个头：
+
+Δroughness_uv
+Δmetallic_uv
+change_gate_uv
+uncertainty_uv
+material_type_logits_uv
+boundary_stability_uv
+更新方式
+RM
+refined
+=RM
+init
++g
+change
+	​
+
+⊙ΔRM
+
+并且：
+
+safe_update_mask
+控制大幅更新区域
+boundary_gate
+抑制边界过冲
+uncertainty
+控制损失权重与输出可信度
+模块 H：Render-consistency and Inverse-check Head
+
+这是你方法的最后一个大块，也是第六个新增创新点。
+
+为什么值得加
+
+因为你现在一个核心痛点就是：
+
+UV 指标在下降，但最终 render 没变好，甚至退化
+
+所以要把“render consistency”从 eval 指标上升为方法结构。
+
+结构
+
+这个模块做两件事：
+
+H1. Render proxy supervision
+
+把 refined RM + geometry + albedo + normal 放进 canonical render pipeline
+生成固定视角/光照下的 render proxy
+和 target render 做比较
+
+H2. Inverse-check consistency
+
+从 render proxy 中再提取材质响应特征，检查是否和 refined RM 一致
+
+比如：
+
+高光位置是否合理
+边界材质响应是否异常
+金属/non-metal 响应是否反常
+创新点 6
+Inverse Material-response Consistency Check
+
+这是我给你新增的第六个创新点：
+
+不仅正向从 RM 渲染出图像，还反向检查图像中的材质响应是否与预测材质图匹配。
+
+这个点很“论文化”，会显得方法完整，不只是单向预测。

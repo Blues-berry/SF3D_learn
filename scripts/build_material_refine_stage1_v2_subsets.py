@@ -22,7 +22,6 @@ DEFAULT_PAPER_LICENSE_BUCKETS = {
     "cc_by_nc_4_0",
     "cc_by_nc_4_0_pending_reconcile",
     "custom_tianchi_research_noncommercial_no_redistribution",
-    "unknown",
 }
 
 
