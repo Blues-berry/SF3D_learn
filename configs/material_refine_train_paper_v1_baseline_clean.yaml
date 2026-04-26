@@ -1,18 +1,15 @@
-# Round13 / Stage1-v3 view-render-boundary guard.
+# Paper-v1 clean baseline training entry.
 #
-# Round12 is a useful data-adaptation run, but the balanced heldout exposed a
-# UV-vs-render disagreement: UV RM improves while view RM, PSNR/SSIM/LPIPS, and
-# boundary bleed regress. Round13 starts from Round12 weights and makes the R-8
-# module more conservative in low-view-evidence and high-bleed-risk regions.
+# This is the first clean W&B project run after deleting legacy experiment
+# outputs. It intentionally starts without previous material-refiner checkpoints;
+# dataset/canonical bundles are preserved and reused.
 
-# Use the newest strict paper candidates for training so Round13 benefits from
-# data growth; validation remains balanced by material family below.
-train_manifest: output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_strict_paper_candidates.json
-val_manifest: output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_balanced_paper_manifest.json
+train_manifest: output/material_refine_paper/version1_dataset_20260426/stage1_v3_strict_paper_candidates.json
+val_manifest: output/material_refine_paper/version1_dataset_20260426/stage1_v3_balanced_paper_manifest.json
 train_split: train
 val_split: val
 split_strategy: manifest
-freeze_val_manifest_to: stage1_v3_round13_view_render_boundary_guard_frozen_val_manifest.json
+freeze_val_manifest_to: paper_v1_baseline_clean_v2_frozen_val_manifest.json
 reload_manifest_every: 1
 allow_empty_val: false
 
@@ -23,33 +20,32 @@ val_target_quality_tiers: paper_strong,paper_pseudo
 train_paper_splits: paper_train
 val_paper_splits: paper_val_iid
 
-epochs: 12
+epochs: 18
 max_train_steps: 0
 batch_size: 2
 val_batch_size: 2
 num_workers: 4
 grad_accumulation_steps: 8
-learning_rate: 1.2e-5
+learning_rate: 1.0e-5
 min_learning_rate: 2.0e-6
 weight_decay: 1.0e-2
 optimizer: adamw
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
-adam_amsgrad: false
 lr_scheduler: plateau
 warmup_steps: 40
 plateau_factor: 0.5
-plateau_patience: 2
+plateau_patience: 3
 plateau_threshold: 3.0e-4
 grad_clip_norm: 0.75
 
 atlas_size: 512
 buffer_resolution: 256
-train_view_sample_count: 14
+train_view_sample_count: 8
 train_min_hard_views: 4
 train_randomize_view_subset: true
-val_view_sample_count: 24
+val_view_sample_count: 12
 val_min_hard_views: 4
 val_balance_key: material_family
 val_records_per_balance_group: 16
@@ -58,22 +54,19 @@ amp_dtype: bfloat16
 cuda_device_index: 1
 matmul_precision: high
 allow_tf32: true
+torch_num_threads: 4
+torch_num_interop_threads: 2
 
 disable_view_fusion: false
 disable_prior_inputs: false
 disable_residual_head: false
 enable_residual_gate: true
-residual_gate_bias: -1.85
+residual_gate_bias: -1.75
 min_residual_gate: 0.005
-max_residual_gate: 0.38
-prior_confidence_gate_strength: 0.68
-enable_boundary_context: false
-boundary_context_strength: 0.0
-enable_material_context: false
-material_context_classes: 3
-material_delta_scale: 0.0
+max_residual_gate: 0.44
+prior_confidence_gate_strength: 0.64
 enable_render_consistency_gate: true
-render_gate_strength: 0.48
+render_gate_strength: 0.40
 
 enable_dual_path_prior_init: true
 enable_domain_prior_calibration: true
@@ -85,19 +78,26 @@ enable_material_sensitive_view_encoder: true
 enable_hard_view_routing: true
 enable_tri_branch_fusion: true
 enable_boundary_safety_module: true
-boundary_safety_strength: 0.66
-boundary_residual_suppression_strength: 0.58
-view_uncertainty_residual_suppression_strength: 0.46
-bleed_risk_residual_suppression_strength: 0.62
+boundary_safety_strength: 0.62
+boundary_residual_suppression_strength: 0.56
+view_uncertainty_residual_suppression_strength: 0.42
+bleed_risk_residual_suppression_strength: 0.58
 enable_material_topology_reasoning: true
 topology_feature_channels: 16
-topology_patch_size: 16
+topology_patch_size: 32
 topology_layers: 2
 topology_heads: 2
+topology_residual_suppression_strength: 0.30
 enable_confidence_gated_trunk: true
-uncertainty_gate_strength: 0.42
+uncertainty_gate_strength: 0.38
+residual_delta_init_std: 1.0e-3
+trunk_uncertainty_init_bias: -1.0
+trunk_boundary_stability_init_bias: 1.0
 enable_inverse_material_check: true
-inverse_check_strength: 0.46
+inverse_check_strength: 0.40
+enable_material_evidence_calibration: true
+material_evidence_channels: 16
+material_evidence_strength: 0.75
 
 train_balance_mode: material_x_source_x_prior
 train_balance_power: 1.35
@@ -129,39 +129,49 @@ view_consistency_mode: required
 eval_every: 1
 validation_steps: 0
 validation_progress_milestones: 40
-render_proxy_validation_milestone_interval: 2
-render_proxy_validation_max_batches: 8
-max_validation_batches: 0
+render_proxy_validation_milestone_interval: 1
+render_proxy_validation_max_batches: 6
+val_enable_lpips: true
+val_lpips_max_images: 12
+max_validation_batches: 12
 save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: true
-keep_last_checkpoints: 4
-init_from_checkpoint: output/material_refine_paper/stage1_v3_round12_balanced_data_adaptation/best.pt
+keep_last_checkpoints: 3
+init_from_checkpoint:
 resume:
-log_every: 1
+
+log_every: 2
 progress_bar: true
 progress_bar_leave: false
 progress_bar_mininterval: 0.5
 train_line_logs: false
+terminal_json_logs: false
 val_preview_samples: 8
 wandb_val_preview_max: 8
 wandb_log_preview_grid: false
 save_preview_contact_sheet: false
-early_stopping_patience: 4
+early_stopping_patience: 8
 early_stopping_min_delta: 1.0e-5
+early_stopping_scope: epoch
+validation_selection_metric: uv_render_guarded
+selection_view_rm_penalty: 0.80
+selection_psnr_penalty: 0.35
+selection_residual_regression_penalty: 0.12
 
-output_dir: output/material_refine_paper/stage1_v3_round13_view_render_boundary_guard
+output_dir: output/material_refine_paper/paper_v1_baseline_clean_v5_20260426
 report_to: wandb
-tracker_project_name: stable-fast-3d-material-refine
-tracker_run_name: material-refine-stage1-v3-round13-view-render-boundary-guard
-tracker_group: stage1-v3-method-iteration
-tracker_tags: material-refine,stage1-v3,round13,view-render-boundary-guard,residual-safe,no-paper-claim
+tracker_project_name: stable-fast-3d-material-refine-paper-v1-clean
+tracker_run_name: paper-v1-baseline-clean-v5-gpu1
+tracker_group: paper-v1-baseline-training
+tracker_tags: material-refine,paper-v1,baseline,clean-project,gpu1,preview-fixed,metrics-fixed,trainable-cold-start,bf16-no-gradscaler,thread-capped
 wandb_mode: online
+wandb_dir: wandb
 wandb_log_artifacts: true
 wandb_artifact_policy: best_and_final
 wandb_watch: false
 export_training_curves: true
-terminal_json_logs: false
+
 startup_probe_batches: 1
 startup_probe_device_transfer: true
 dataset_distribution_topk: 12
@@ -170,4 +180,4 @@ target_prior_identity_warning_threshold: 0.20
 max_target_prior_identity_rate_for_paper: 0.30
 min_nontrivial_target_count_for_paper: 400
 fail_on_target_prior_identity: true
-seed: 20260429
+seed: 20260426

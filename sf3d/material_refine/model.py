@@ -243,9 +243,18 @@ class DualPathPriorInitialization(nn.Module):
         nn.init.zeros_(adapter_out.weight)
         nn.init.zeros_(adapter_out.bias)
         adapter_out.bias.data[0] = 8.0
-        nn.init.zeros_(self.bootstrapper.out_conv.weight)
-        nn.init.zeros_(self.bootstrapper.out_conv.bias)
-        self.bootstrapper.out_conv.bias.data[2] = -1.0
+        with torch.no_grad():
+            nn.init.zeros_(self.bootstrapper.out_conv.weight)
+            nn.init.zeros_(self.bootstrapper.out_conv.bias)
+            # A fully zero bootstrap head is safe, but it makes clean
+            # no-prior training start from a spatially constant RM atlas for a
+            # surprisingly long time. Keep the confidence head conservative
+            # while giving RM/feature channels a tiny feature-dependent
+            # cold-start signal.
+            nn.init.normal_(self.bootstrapper.out_conv.weight[:2], mean=0.0, std=1.0e-3)
+            if self.bootstrapper.out_conv.weight.shape[0] > 3:
+                nn.init.normal_(self.bootstrapper.out_conv.weight[3:], mean=0.0, std=1.0e-3)
+            self.bootstrapper.out_conv.bias[2] = -1.0
 
     def forward(
         self,
@@ -265,6 +274,7 @@ class DualPathPriorInitialization(nn.Module):
             )
         )
         prior_reliability = torch.sigmoid(adapter_raw[:, :1]) * prior_confidence
+        prior_presence = (prior_confidence > 1e-4).to(prior.dtype) * uv_mask
         prior_feat = adapter_raw[:, 1:]
 
         bootstrap_raw = self.bootstrapper(torch.cat([uv_albedo, uv_normal, uv_mask, domain_feat], dim=1))
@@ -272,13 +282,17 @@ class DualPathPriorInitialization(nn.Module):
         bootstrap_confidence = torch.sigmoid(bootstrap_raw[:, 2:3]) * uv_mask
         bootstrap_feat = bootstrap_raw[:, 3:]
 
-        rm_init = prior * prior_reliability + bootstrap_rm * (1.0 - prior_reliability)
+        # Confidence can be intentionally low for SF3D scalar/factor priors.  It
+        # should reduce update trust, not replace an existing prior with the
+        # no-prior bootstrap.  This keeps a fresh residual refiner initialized as
+        # "SF3D prior + learned residual" instead of a flat bootstrap map.
+        rm_init = prior * prior_presence + bootstrap_rm * (1.0 - prior_presence)
         init_confidence = torch.where(
-            prior_confidence > 0.0,
+            prior_presence > 0.0,
             prior_reliability,
             bootstrap_confidence,
         ).clamp(0.0, 1.0)
-        prior_feat_uv = prior_feat * prior_confidence + bootstrap_feat * (1.0 - prior_confidence)
+        prior_feat_uv = prior_feat * prior_presence + bootstrap_feat * (1.0 - prior_presence)
         return {
             "rm_init_uv": rm_init.clamp(0.0, 1.0),
             "init_confidence_uv": init_confidence,
@@ -609,7 +623,15 @@ class TriBranchUVFusion(nn.Module):
         )
         view_coverage = ((global_valid + boundary_valid + highlight_valid) / 3.0).clamp(0.0, 1.0)
         branch_stack = torch.stack([global_uv_feat, boundary_uv_feat, highlight_uv_feat], dim=1)
-        view_uncertainty = branch_stack.var(dim=1, unbiased=False).mean(dim=1, keepdim=True).sqrt()
+        # sqrt(var) has an infinite derivative at exactly zero.  The three
+        # fused branches are often identical in early cold-start training, so
+        # add epsilon before sqrt to keep BF16 gradients finite.
+        view_uncertainty = (
+            branch_stack.var(dim=1, unbiased=False)
+            .mean(dim=1, keepdim=True)
+            .clamp_min(1.0e-6)
+            .sqrt()
+        )
         view_uncertainty = _normalize_per_sample(view_uncertainty) * view_coverage
         branch_context = torch.cat(
             [global_uv_feat, boundary_uv_feat, highlight_uv_feat, view_coverage, view_uncertainty],
@@ -938,7 +960,8 @@ class MaterialEvidenceCalibrationModule(nn.Module):
         ceiling_detail = torch.sigmoid(raw[:, 5:6])
 
         prior_confidence = prior_confidence.clamp(0.0, 1.0) * uv_mask
-        no_prior = (1.0 - prior_confidence).clamp(0.0, 1.0)
+        prior_presence = (prior_confidence > 1e-4).to(initial_rm.dtype) * uv_mask
+        no_prior = (1.0 - prior_presence).clamp(0.0, 1.0)
         clean_view_support = (
             view_highlight_response.clamp(0.0, 1.0)
             * (1.0 - view_uncertainty.clamp(0.0, 1.0))
@@ -952,7 +975,7 @@ class MaterialEvidenceCalibrationModule(nn.Module):
         ).clamp(0.0, 1.0)
         no_prior_ceiling = (0.02 + 0.80 * view_evidence).clamp(0.02, 1.0)
         prior_ceiling = (prior_rm[:, 1:2] + 0.35 * (1.0 - prior_confidence)).clamp(0.0, 1.0)
-        metallic_ceiling = (prior_confidence * prior_ceiling + no_prior * no_prior_ceiling).clamp(0.0, 1.0)
+        metallic_ceiling = (prior_presence * prior_ceiling + no_prior * no_prior_ceiling).clamp(0.0, 1.0)
 
         strength = float(max(0.0, min(1.0, strength)))
         nonmetal_safety = (0.50 + 0.50 * nonmetal_probability).clamp(0.0, 1.0)
@@ -1024,6 +1047,9 @@ class MaterialRefiner(BaseModule):
         topology_residual_suppression_strength: float = 0.0
         enable_confidence_gated_trunk: bool = False
         uncertainty_gate_strength: float = 0.25
+        residual_delta_init_std: float = 1.0e-3
+        trunk_uncertainty_init_bias: float = -1.0
+        trunk_boundary_stability_init_bias: float = 1.0
         enable_inverse_material_check: bool = False
         inverse_check_strength: float = 0.25
         enable_material_evidence_calibration: bool = False
@@ -1117,8 +1143,21 @@ class MaterialRefiner(BaseModule):
             base_channels=self.cfg.base_channels,
         )
         if self.cfg.enable_confidence_gated_trunk:
-            nn.init.zeros_(self.refine_head.out_conv.weight)
-            nn.init.zeros_(self.refine_head.out_conv.bias)
+            with torch.no_grad():
+                nn.init.zeros_(self.refine_head.out_conv.weight)
+                nn.init.zeros_(self.refine_head.out_conv.bias)
+                # Clean baseline runs do not load a mature checkpoint. If all
+                # confidence-gated outputs start at exactly zero, delta remains
+                # visually constant across early validations and the model looks
+                # broken even though gradients technically exist. Initialize
+                # only the RM delta channels with a tiny feature-dependent
+                # signal; leave gates/material logits neutral and safe.
+                init_std = float(max(0.0, self.cfg.residual_delta_init_std))
+                if init_std > 0.0:
+                    nn.init.normal_(self.refine_head.out_conv.weight[:2], mean=0.0, std=init_std)
+                if refine_out_channels >= 5:
+                    self.refine_head.out_conv.bias[3] = float(self.cfg.trunk_uncertainty_init_bias)
+                    self.refine_head.out_conv.bias[4] = float(self.cfg.trunk_boundary_stability_init_bias)
         context_channels = max(8, min(32, self.cfg.base_channels))
         if self.cfg.enable_boundary_context:
             self.boundary_gate_head = nn.Sequential(

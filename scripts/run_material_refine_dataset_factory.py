@@ -281,6 +281,22 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
         if not bool(source.get("enabled", True)):
             actions.append({"name": source.get("name"), "action": "disabled"})
             continue
+        progress_paths = [repo_path(value) for value in source.get("progress_paths", [])]
+        skip_if_primary_progress_exists = bool(
+            source.get(
+                "skip_if_primary_progress_exists",
+                config.get("download_network", {}).get("skip_if_primary_progress_exists_default", False),
+            )
+        )
+        if skip_if_primary_progress_exists and progress_paths and progress_paths[0].exists():
+            actions.append(
+                {
+                    "name": source.get("name"),
+                    "action": "skipped_primary_progress_exists",
+                    "progress_path": str(progress_paths[0]),
+                }
+            )
+            continue
         session = str(source["session"])
         if session_exists(session):
             actions.append({"name": source.get("name"), "session": session, "action": "already_running"})
@@ -326,6 +342,43 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
             }
         )
     return actions
+
+
+def build_local_object_sources(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    local_sources = config.get("local_object_sources", {})
+    if not bool(local_sources.get("enabled", False)):
+        return {"action": "disabled"}
+    output_root = repo_path(
+        local_sources.get("output_root", "output/material_refine_aux_downloads/local_object_sources_canonical")
+    )
+    output_json = output_root / "material_refine_manifest_local_object_increment.json"
+    refresh_seconds = float(local_sources.get("refresh_seconds", 86400))
+    if output_json.exists() and refresh_seconds > 0:
+        age_seconds = max(0.0, time.time() - output_json.stat().st_mtime)
+        if age_seconds < refresh_seconds:
+            return {
+                "action": "up_to_date",
+                "output_json": str(output_json),
+                "age_seconds": round(age_seconds, 1),
+                "refresh_seconds": refresh_seconds,
+            }
+    command = [
+        str(PYTHON_BIN),
+        "scripts/build_material_refine_local_object_manifest.py",
+        "--output-root",
+        str(output_root),
+        "--max-total-records",
+        str(local_sources.get("max_total_records", 3600)),
+    ]
+    if dry_run:
+        return {"action": "dry_run_build_local_object_sources", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "local_object_sources_built" if result.returncode == 0 else "local_object_sources_failed",
+        "output_json": str(output_json),
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-40:],
+    }
 
 
 def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -788,6 +841,52 @@ def analyze_hdri_usage(config: dict[str, Any], *, dry_run: bool) -> dict[str, An
     }
 
 
+def run_post_ingest_cleanup(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    cleanup = config.get("post_ingest_cleanup", {})
+    if not bool(cleanup.get("enabled", False)):
+        return {"action": "disabled"}
+    candidate_roots = [str(value) for value in cleanup.get("candidate_roots", [])]
+    if not candidate_roots:
+        return {"action": "no_candidate_roots"}
+
+    command = [
+        str(PYTHON_BIN),
+        "scripts/cleanup_material_refine_processed_sources.py",
+        "--mode",
+        "report" if dry_run else str(cleanup.get("mode", "report")),
+        "--min-age-seconds",
+        str(cleanup.get("min_age_seconds", 86400)),
+        "--max-actions",
+        str(cleanup.get("max_actions", 64)),
+        "--trash-root",
+        str(repo_path(cleanup.get("trash_root", "output/material_refine_cleanup/trash"))),
+        "--output-json",
+        str(repo_path(cleanup.get("output_json", "output/material_refine_cleanup/post_ingest_cleanup_report.json"))),
+    ]
+    for value in cleanup.get("protected_manifests", []):
+        command.extend(["--protected-manifest", str(repo_path(value))])
+    for pattern in cleanup.get("protected_manifest_globs", []):
+        command.extend(["--protected-manifest-glob", str(pattern)])
+    for value in candidate_roots:
+        command.extend(["--candidate-root", str(repo_path(value))])
+    for value in cleanup.get("candidate_name_prefixes", []):
+        command.extend(["--candidate-name-prefix", str(value)])
+    for value in cleanup.get("active_roots", []):
+        command.extend(["--active-root", str(repo_path(value))])
+    for pattern in cleanup.get("active_root_globs", []):
+        command.extend(["--active-root-glob", str(pattern)])
+
+    if dry_run:
+        return {"action": "dry_run_post_ingest_cleanup", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "post_ingest_cleanup_ran" if result.returncode == 0 else "post_ingest_cleanup_failed",
+        "returncode": result.returncode,
+        "output_json": str(repo_path(cleanup.get("output_json", "output/material_refine_cleanup/post_ingest_cleanup_report.json"))),
+        "stdout_tail": result.stdout.splitlines()[-40:],
+    }
+
+
 def manifest_record_count(path: Path) -> int:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -888,11 +987,13 @@ def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]
         "actions": [],
     }
     if args.start_downloads:
+        state["actions"].append({"local_object_sources": build_local_object_sources(config, dry_run=args.dry_run)})
         state["actions"].append({"downloads": start_downloads(config, dry_run=args.dry_run)})
         state["actions"].append({"canonicalize_downloads": canonicalize_download_manifests(config, dry_run=args.dry_run)})
         state["actions"].append({"promotion": promote_targets(config, dry_run=args.dry_run)})
         state["actions"].append({"stage1_v3": build_stage1_v3_subsets(config, dry_run=args.dry_run)})
         state["actions"].append({"hdri_usage": analyze_hdri_usage(config, dry_run=args.dry_run)})
+        state["actions"].append({"post_ingest_cleanup": run_post_ingest_cleanup(config, dry_run=args.dry_run)})
     if args.start_render:
         launch, reason = should_launch_render(config, force=args.force_render)
         if launch:

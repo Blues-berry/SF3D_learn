@@ -96,6 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iid-test-ratio", type=float, default=0.10)
     parser.add_argument("--material-holdout-ratio", type=float, default=0.08)
     parser.add_argument(
+        "--trust-manifest-audit-fields",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip expensive re-auditing and trust existing per-record quality fields. "
+            "Use only for manifests already produced by the material-refine audit/promotion pipeline."
+        ),
+    )
+    parser.add_argument(
         "--fill-deficits",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -686,15 +695,26 @@ def main() -> None:
     all_records: list[dict[str, Any]] = []
     for manifest in args.manifest:
         payload, records = load_manifest(manifest)
-        audit_payload = audit_manifest(
-            manifest,
-            max_records=-1,
-            identity_warning_threshold=float(args.identity_like_threshold),
-            max_target_prior_identity_rate_for_paper=0.30,
-            min_nontrivial_target_count_for_paper=128,
-            allowed_paper_license_buckets=allowed_license_buckets,
-        )
-        rows = row_by_object_id(audit_payload)
+        if bool(args.trust_manifest_audit_fields):
+            audit_payload = {
+                "summary": {
+                    **summarize(records),
+                    "trusted_manifest_audit_fields": True,
+                    "source_manifest_records": len(records),
+                },
+                "records": [],
+            }
+            rows = {}
+        else:
+            audit_payload = audit_manifest(
+                manifest,
+                max_records=-1,
+                identity_warning_threshold=float(args.identity_like_threshold),
+                max_target_prior_identity_rate_for_paper=0.30,
+                min_nontrivial_target_count_for_paper=128,
+                allowed_paper_license_buckets=allowed_license_buckets,
+            )
+            rows = row_by_object_id(audit_payload)
         for record in records:
             all_records.append(merge_audit_fields(record, rows.get(object_key(record)), source_manifest=manifest))
         source_audits[str(manifest.resolve())] = audit_payload.get("summary", {})

@@ -4,7 +4,8 @@
     "Data-only supervisor: keeps download, render/preprocess, merge, audit, and validation loops alive for seven days.",
     "GPU1 may be fully used by data-only render/preprocess sessions when this accelerates dataset readiness.",
     "No training command is launched from this supervisor.",
-    "Storage policy: future heavy render/preprocess roots are supervised under /4T; active repo-output runs are not moved."
+    "Storage policy: future heavy render/preprocess roots are supervised under /4T; active repo-output runs are not moved.",
+    "2026-04-26 policy: do not resume legacy 3D-FUTURE / 3D furniture roots; future dataset expansion is driven by factory no-3DFUTURE inputs plus Objaverse/ABO/benchmark/material/HDRI sources."
   ],
   "storage_policy": {
     "large_render_output_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
@@ -49,10 +50,7 @@
     ]
   },
   "production_roots": {
-    "patterns": [
-      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*",
-      "output/material_refine_dataset_factory/longrun_gpu0_*"
-    ],
+    "patterns": [],
     "latest_only": true,
     "required_prefixes": [
       "sf3d_longrun_material_refine_shard",
@@ -62,6 +60,7 @@
     "groups": [
       {
         "name": "scarce_material_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_2*",
           "output/material_refine_dataset_factory/scarce_material_gpu0_2*"
@@ -75,6 +74,7 @@
       },
       {
         "name": "scarce_fast_unlock_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_fast_unlock_*",
           "output/material_refine_dataset_factory/scarce_material_gpu0_fast_unlock_*"
@@ -88,6 +88,7 @@
       },
       {
         "name": "scarce_gpu1_limited_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*"
         ],
@@ -99,6 +100,7 @@
       },
       {
         "name": "scarce_gpu1_full_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*"
         ],
@@ -123,6 +125,7 @@
       },
       {
         "name": "scarce_gpu1_safe_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*"
         ],
@@ -134,6 +137,7 @@
       },
       {
         "name": "scarce_gpu1_ceramic_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_[0-9]*"
         ],
@@ -145,6 +149,7 @@
       },
       {
         "name": "scarce_gpu1_ceramic_retry_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_retry_*"
         ],
@@ -156,6 +161,7 @@
       },
       {
         "name": "scarce_gpu1_glossy_topup",
+        "enabled": false,
         "patterns": [
           "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*"
         ],
@@ -181,7 +187,7 @@
     ]
   },
   "paper_unlock": {
-    "enabled": true,
+    "enabled": false,
     "root_pattern": "output/material_refine_dataset_factory/paper_unlock_gpu0_*",
     "latest_only": true,
     "target_eligible_records": 128,
@@ -205,7 +211,7 @@
       "CYCLES_SAMPLES": "8",
       "REFRESH_PARTIAL_EVERY": "1",
       "MERGED_MONITOR_POLL_SECONDS": "30",
-      "LONGRUN_INPUT_MANIFESTS": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "LONGRUN_INPUT_MANIFESTS": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_no_3dfuture.json",
       "PAPER_MAIN_SOURCES": "ABO_locked_core",
       "AUXILIARY_SOURCES": "",
       "PRIORITY_MATERIAL_FAMILIES": "metal_dominant,glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal",

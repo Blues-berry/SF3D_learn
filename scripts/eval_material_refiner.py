@@ -52,6 +52,7 @@ GROUP_DIAGNOSTIC_MIN_COUNT = 16
 MAIN_METRIC_NAMES = [
     "uv_rm_mae",
     "view_rm_mae",
+    "proxy_render_mse",
     "proxy_render_psnr",
     "proxy_render_ssim",
     "proxy_render_lpips",
@@ -73,6 +74,72 @@ MODEL_CFG_OVERRIDE_KEYS = [
     "evidence_update_budget_strength",
     "evidence_update_budget_floor",
 ]
+PAPER_MAIN_VARIANT_LABELS = {
+    "ours_full": "Ours Full",
+    "prior_smoothing": "Prior Smoothing",
+    "scalar_broadcast": "Scalar Broadcast",
+    "no_view_refiner": "Ours w/o View",
+    "no_residual_refiner": "Ours w/o Residual",
+}
+PAPER_MAIN_METRIC_COLUMNS = ["uv_rm_mae", "view_rm_mae", "psnr", "ssim", "lpips"]
+
+
+def paper_main_metric_row(
+    *,
+    method: str,
+    side: str,
+    metrics_main: dict[str, Any],
+    metric_basis: str,
+    note: str = "",
+) -> dict[str, Any]:
+    return {
+        "method": method,
+        "metric_side": side,
+        "metric_basis": metric_basis,
+        "note": note,
+        "uv_rm_mae": (metrics_main.get("uv_rm_mae") or {}).get("total", {}).get(side),
+        "view_rm_mae": (metrics_main.get("view_rm_mae") or {}).get("total", {}).get(side),
+        "psnr": (metrics_main.get("proxy_render_psnr") or {}).get(side),
+        "ssim": (metrics_main.get("proxy_render_ssim") or {}).get(side),
+        "lpips": (metrics_main.get("proxy_render_lpips") or {}).get(side),
+    }
+
+
+def build_paper_main_table_entries(eval_variant: str, metrics_main: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    if eval_variant == "ours_full":
+        rows.append(
+            paper_main_metric_row(
+                method="SF3D Original",
+                side="baseline",
+                metrics_main=metrics_main,
+                metric_basis="canonicalized_sf3d_prior_proxy",
+                note=(
+                    "Raw SF3D GLB/render is the required visual baseline; "
+                    "metric values use the canonicalized SF3D prior proxy until raw-original render metrics are exported."
+                ),
+            )
+        )
+    rows.append(
+        paper_main_metric_row(
+            method="SF3D Canonical Prior",
+            side="baseline",
+            metrics_main=metrics_main,
+            metric_basis="canonical_uv_prior",
+            note="Canonical UV/view metric baseline from uv_prior_roughness and uv_prior_metallic.",
+        )
+    )
+    variant_label = PAPER_MAIN_VARIANT_LABELS.get(eval_variant)
+    if variant_label:
+        rows.append(
+            paper_main_metric_row(
+                method=variant_label,
+                side="refined",
+                metrics_main=metrics_main,
+                metric_basis="eval_variant_refined_output",
+            )
+        )
+    return rows
 
 
 def parse_bool(value: Any) -> bool:
@@ -227,8 +294,17 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--wandb-log-group-breakdowns",
         type=parse_bool,
-        default=True,
-        help="Upload compact stratified diagnostics for small, paper-relevant groups only.",
+        default=False,
+        help=(
+            "Upload compact material_family/prior_label diagnostics only. Defaults off; "
+            "full group breakdowns stay in summary.json/report.html."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-log-paper-main-table",
+        type=parse_bool,
+        default=False,
+        help="Upload the compact paper main table to W&B. Defaults off; table stays in summary.json/report.html.",
     )
     parser.add_argument("--wandb-log-artifacts", type=parse_bool, default=True)
     parser.add_argument(
@@ -288,29 +364,18 @@ def compact_eval_group_logs(
     logs: dict[str, Any] = {}
     group_axes = [
         ("material_family", "by_material_family"),
-        ("paper_split", "by_paper_split"),
-        ("target_quality_tier", "by_target_quality_tier"),
-        ("generator_id", "by_generator_id"),
-        ("source_name", "by_source_name"),
         ("prior_label", "by_prior_label"),
     ]
     metric_names = [
         "count",
-        "baseline_total_mae",
         "refined_total_mae",
         "improvement_total",
-        "baseline_psnr",
         "refined_psnr",
-        "baseline_ssim",
         "refined_ssim",
-        "baseline_lpips",
         "refined_lpips",
-        "baseline_boundary_bleed_score",
         "refined_boundary_bleed_score",
-        "baseline_metal_confusion_rate",
         "refined_metal_confusion_rate",
         "prior_residual_safety_score",
-        "prior_residual_regression_rate",
     ]
     for axis_name, payload_key in group_axes:
         groups = summary_payload.get(payload_key) or {}
@@ -558,6 +623,20 @@ def compute_masked_psnr(
     if mse <= 1e-12:
         return 99.0
     return float(20.0 * math.log10(1.0 / math.sqrt(mse)))
+
+
+def compute_masked_mse(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+) -> float | None:
+    visible = mask.astype(bool)
+    if prediction.shape != target.shape or visible.sum() == 0:
+        return None
+    diff = prediction - target
+    if diff.ndim == 3:
+        visible = np.broadcast_to(visible[..., None], diff.shape)
+    return float(np.mean(np.square(diff[visible])))
 
 
 def compute_masked_ssim(
@@ -1287,6 +1366,11 @@ def build_metric_availability(
             "available_count": count_pair("baseline_psnr", "refined_psnr"),
             "reason": render_metric_mode,
         },
+        "proxy_render_mse": {
+            "available": count_pair("baseline_mse", "refined_mse") > 0,
+            "available_count": count_pair("baseline_mse", "refined_mse"),
+            "reason": render_metric_mode,
+        },
         "proxy_render_ssim": {
             "available": count_pair("baseline_ssim", "refined_ssim") > 0,
             "available_count": count_pair("baseline_ssim", "refined_ssim"),
@@ -1902,6 +1986,7 @@ def main() -> None:
                     target_view,
                     mask_np,
                 )
+                baseline_mse = refined_mse = None
                 baseline_psnr = refined_psnr = None
                 baseline_ssim = refined_ssim = None
                 baseline_lpips = refined_lpips = None
@@ -1919,6 +2004,8 @@ def main() -> None:
                         rm_map=refined_view,
                         mask=mask_np,
                     )
+                    baseline_mse = compute_masked_mse(baseline_proxy, reference_rgb_hwc, mask_np)
+                    refined_mse = compute_masked_mse(refined_proxy, reference_rgb_hwc, mask_np)
                     baseline_psnr = compute_masked_psnr(baseline_proxy, reference_rgb_hwc, mask_np)
                     refined_psnr = compute_masked_psnr(refined_proxy, reference_rgb_hwc, mask_np)
                     baseline_ssim = compute_masked_ssim(baseline_proxy, reference_rgb_hwc, mask_np)
@@ -1979,6 +2066,8 @@ def main() -> None:
                         - (refined_rough_mae + refined_metal_mae),
                         "baseline_psnr": baseline_psnr,
                         "refined_psnr": refined_psnr,
+                        "baseline_mse": baseline_mse,
+                        "refined_mse": refined_mse,
                         "baseline_ssim": baseline_ssim,
                         "refined_ssim": refined_ssim,
                         "baseline_lpips": baseline_lpips,
@@ -2236,6 +2325,13 @@ def main() -> None:
             higher_is_better=True,
             mode=args.render_metric_mode,
         ),
+        "proxy_render_mse": collect_optional_pair(
+            rows,
+            "baseline_mse",
+            "refined_mse",
+            higher_is_better=False,
+            mode=args.render_metric_mode,
+        ),
         "proxy_render_ssim": collect_optional_pair(
             rows,
             "baseline_ssim",
@@ -2400,6 +2496,19 @@ def main() -> None:
         summary_payload=summary_payload,
         diagnostic_min_group_count=args.diagnostic_min_group_count,
     )
+    summary_payload["paper_main_table"] = {
+        "method_order": [
+            "SF3D Original",
+            "SF3D Canonical Prior",
+            "Prior Smoothing",
+            "Scalar Broadcast",
+            "Ours w/o View",
+            "Ours w/o Residual",
+            "Ours Full",
+        ],
+        "metric_columns": PAPER_MAIN_METRIC_COLUMNS,
+        "entries": build_paper_main_table_entries(args.eval_variant, metrics_main),
+    }
     summary_path = output_dir / "summary.json"
     summary_payload["summary_json"] = str(summary_path.resolve())
     summary_path.write_text(
@@ -2419,64 +2528,58 @@ def main() -> None:
 
     if run is not None:
         log_payload = {
-            "eval/baseline_total_mae": summary_payload["baseline_total_mae"],
-            "eval/refined_total_mae": summary_payload["refined_total_mae"],
-            "eval/avg_improvement_total": summary_payload["avg_improvement_total"],
             "eval/effective_view_supervision_rate": summary_payload["effective_view_supervision_rate"],
-            "eval/metal_nonmetal/baseline_f1": summary_payload["metal_nonmetal"]["baseline_f1"],
-            "eval/metal_nonmetal/refined_f1": summary_payload["metal_nonmetal"]["refined_f1"],
-            "eval/metal_nonmetal/baseline_auroc": summary_payload["metal_nonmetal"]["baseline_auroc"],
-            "eval/metal_nonmetal/refined_auroc": summary_payload["metal_nonmetal"]["refined_auroc"],
-            "eval/runtime/avg_batch_seconds": summary_payload["runtime"]["avg_batch_seconds"],
             "eval/runtime/avg_object_seconds": summary_payload["runtime"]["avg_object_seconds"],
-            "eval/runtime/seconds_per_batch": summary_payload["runtime"]["avg_batch_seconds"],
-            "eval/runtime/seconds_per_object": summary_payload["runtime"]["avg_object_seconds"],
-            "eval/runtime/ms_per_object": summary_payload["runtime"]["avg_object_seconds"] * 1000.0,
-            "eval/runtime/objects_per_second": 1.0 / max(summary_payload["runtime"]["avg_object_seconds"], 1e-9),
-            "eval/object_level/refined_total_mae": summary_payload["object_level"]["refined_total_mae"],
             "eval/object_level/avg_improvement_total": summary_payload["object_level"]["avg_improvement_total"],
             "eval/memory/peak_allocated_gb": summary_payload["memory"]["peak_allocated_gb"],
-            "eval/memory/peak_reserved_gb": summary_payload["memory"]["peak_reserved_gb"],
-            "eval/data/rows": summary_payload["rows"],
-            "eval/data/objects": summary_payload["objects"],
-            "eval/data/material_family_count": len(summary_payload.get("by_material_family") or {}),
         }
         main_metrics = summary_payload["metrics_main"]
         special_metrics = summary_payload["metrics_material_specific"]
         log_payload.update(
             {
                 "eval/main/psnr": main_metrics["proxy_render_psnr"]["refined"],
-                "eval/main/baseline_psnr": main_metrics["proxy_render_psnr"]["baseline"],
+                "eval/main/mse": main_metrics["proxy_render_mse"]["refined"],
                 "eval/main/ssim": main_metrics["proxy_render_ssim"]["refined"],
-                "eval/main/baseline_ssim": main_metrics["proxy_render_ssim"]["baseline"],
                 "eval/main/lpips": main_metrics["proxy_render_lpips"]["refined"],
-                "eval/main/baseline_lpips": main_metrics["proxy_render_lpips"]["baseline"],
                 "eval/rm/uv_total_mae": main_metrics["uv_rm_mae"]["total"]["refined"],
-                "eval/rm/baseline_uv_total_mae": main_metrics["uv_rm_mae"]["total"]["baseline"],
                 "eval/rm/view_total_mae": main_metrics["view_rm_mae"]["total"]["refined"],
-                "eval/rm/baseline_view_total_mae": main_metrics["view_rm_mae"]["total"]["baseline"],
                 "eval/special/boundary_bleed_score": special_metrics["boundary_bleed_score"]["refined"],
-                "eval/special/baseline_boundary_bleed_score": special_metrics["boundary_bleed_score"]["baseline"],
                 "eval/special/metal_confusion_rate": special_metrics["metal_nonmetal_confusion"]["uv_level"]["refined"]["confusion_rate"],
-                "eval/special/baseline_metal_confusion_rate": special_metrics["metal_nonmetal_confusion"]["uv_level"]["baseline"]["confusion_rate"],
                 "eval/special/highlight_localization_error": special_metrics["highlight_localization_error"]["refined"],
-                "eval/special/baseline_highlight_localization_error": special_metrics["highlight_localization_error"]["baseline"],
                 "eval/special/rm_gradient_preservation": special_metrics["rm_gradient_preservation"]["refined"],
-                "eval/special/baseline_rm_gradient_preservation": special_metrics["rm_gradient_preservation"]["baseline"],
                 "eval/special/prior_residual_safety": special_metrics["prior_residual_safety"]["safety_score"],
-                "eval/special/prior_residual_regression_rate": special_metrics["prior_residual_safety"]["regression_rate"],
-                "eval/diagnostics/metric_disagreement": float(summary_payload["metrics_diagnostics"]["metric_disagreement"]["has_disagreement"]),
-                "eval/diagnostics/warning_count": float(len(summary_payload["metric_warnings"])),
             }
         )
         if args.wandb_log_group_breakdowns:
             log_payload.update(compact_eval_group_logs(summary_payload))
-        log_payload.update(flatten_for_logging(summary_payload["failure_tag_reduction"], prefix="eval/failure_tag_reduction"))
+        for tag in FAILURE_TAGS:
+            tag_payload = (summary_payload.get("failure_tag_reduction") or {}).get(tag) or {}
+            reduction = tag_payload.get("reduction")
+            if reduction is not None:
+                log_payload[f"eval/failure_tag_reduction/{tag}/reduction"] = reduction
         log_payload = {key: value for key, value in log_payload.items() if value is not None}
         sanitized_logs, skipped_logs = sanitize_log_dict(log_payload)
         if skipped_logs:
             print(json.dumps({"skipped_eval_logs": skipped_logs}, ensure_ascii=False))
         run.log(sanitized_logs)
+
+        if wandb is not None and bool(args.wandb_log_paper_main_table):
+            paper_table = wandb.Table(
+                columns=[
+                    "method",
+                    *PAPER_MAIN_METRIC_COLUMNS,
+                    "metric_basis",
+                    "note",
+                ]
+            )
+            for row in summary_payload["paper_main_table"]["entries"]:
+                paper_table.add_data(
+                    row.get("method"),
+                    *[row.get(metric) for metric in PAPER_MAIN_METRIC_COLUMNS],
+                    row.get("metric_basis"),
+                    row.get("note"),
+                )
+            run.log({"eval/paper_main_table_entries": paper_table})
 
         if wandb is not None and bool(args.wandb_log_top_cases):
             preview_table = wandb.Table(

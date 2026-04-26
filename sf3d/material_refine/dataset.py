@@ -411,9 +411,10 @@ class CanonicalMaterialDataset(Dataset):
             min_hard_views=self.min_hard_views_per_sample,
             randomize_views=self.randomize_view_subset,
         )
-        has_effective_view_supervision = bool(record.view_supervision_ready) and (
-            view_uvs is not None and view_meta["view_targets"] is not None
-        )
+        # View RM PNGs from some generated bundles are diagnostic artifacts and
+        # may be quantized incorrectly.  Training/eval use UV targets projected
+        # through view_uvs, so UV correspondence is the strict supervision gate.
+        has_effective_view_supervision = bool(record.view_supervision_ready) and (view_uvs is not None)
 
         return {
             "object_id": record.object_id,

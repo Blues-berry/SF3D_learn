@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-mode", choices=["auto", "online", "offline", "disabled"], default="auto")
     parser.add_argument("--wandb-dir", type=Path, default=None)
     parser.add_argument("--wandb-log-artifacts", type=parse_bool, default=True)
+    parser.add_argument(
+        "--wandb-max-panel-images",
+        type=int,
+        default=8,
+        help="Only upload this many sample panels to W&B. All panels remain saved locally.",
+    )
+    parser.add_argument(
+        "--wandb-log-panel-table",
+        type=parse_bool,
+        default=False,
+        help="Legacy compatibility switch. Defaults off to avoid uploading per-object detailed panel tables.",
+    )
+    parser.add_argument(
+        "--wandb-log-full-panel-artifact",
+        type=parse_bool,
+        default=False,
+        help="If true, upload the full panel directory as an artifact. Defaults off; local files are the source of truth.",
+    )
     return parser
 
 
@@ -124,6 +143,29 @@ def load_image(path: str | Path | None, *, size: int, mode: str = "RGB") -> Imag
         background.alpha_composite(image)
         image = background.convert("RGB")
     return image.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def fmt_metric(value: Any) -> str:
+    number = finite_float(value)
+    return "N/A" if number is None else f"{number:.5f}"
+
+
+def mean_metric(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [finite_float(row.get(key)) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return float(np.mean(values))
 
 
 def label_image(image: Image.Image, label: str) -> Image.Image:
@@ -245,9 +287,9 @@ def build_panel(
         f"source={row.get('source_name')} | {row.get('prior_label')} | {row.get('view_name')}"
     )
     metrics = (
-        f"baseline_total={float(row.get('baseline_total_mae', 0.0)):.5f}  "
-        f"refined_total={float(row.get('refined_total_mae', 0.0)):.5f}  "
-        f"improvement={float(row.get('improvement_total', 0.0)):.5f}"
+        f"baseline_total={fmt_metric(row.get('baseline_total_mae'))}  "
+        f"refined_total={fmt_metric(row.get('refined_total_mae'))}  "
+        f"improvement={fmt_metric(row.get('improvement_total'))}"
     )
     draw.text((14, 14), title, fill=(242, 247, 255))
     draw.text((14, 42), metrics, fill=(180, 205, 224))
@@ -270,7 +312,7 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
                     "<div class='meta'>"
                     f"generator={row.get('generator_id', 'unknown')} | "
                     f"source={row.get('source_name')} | prior={row.get('prior_label')} | "
-                    f"improvement={float(row.get('improvement_total', 0.0)):.6f}"
+                    f"improvement={fmt_metric(row.get('improvement_total'))}"
                     "</div>",
                     f"<img src='{panel_path.name}' alt='{row.get('object_id')} comparison panel'>",
                     "</section>",
@@ -307,6 +349,11 @@ def main() -> None:
     manifest_payload, records = load_records(args.manifest)
     metrics_rows = json.loads(args.metrics.read_text())
     selected_rows = choose_object_rows(metrics_rows, args.max_panels)
+    missing_baseline_rows = [
+        row.get("object_id")
+        for row in selected_rows
+        if finite_float(row.get("baseline_total_mae")) is None
+    ]
 
     panel_paths = []
     for row in selected_rows:
@@ -327,6 +374,21 @@ def main() -> None:
         "metrics": str(args.metrics.resolve()),
         "output_dir": str(output_dir.resolve()),
         "panels": len(panel_paths),
+        "wandb_policy": {
+            "upload_per_object_table": bool(args.wandb_log_panel_table),
+            "max_panel_images": int(args.wandb_max_panel_images),
+            "full_panel_artifact": bool(args.wandb_log_full_panel_artifact),
+            "details_saved_locally": True,
+        },
+        "metrics_mean": {
+            "baseline_total_mae": mean_metric(selected_rows, "baseline_total_mae"),
+            "refined_total_mae": mean_metric(selected_rows, "refined_total_mae"),
+            "improvement_total": mean_metric(selected_rows, "improvement_total"),
+        },
+        "warnings": [
+            f"missing_baseline_total_mae:{object_id}"
+            for object_id in missing_baseline_rows
+        ],
         "selected_object_ids": [row.get("object_id") for row in selected_rows],
     }
     summary_path = output_dir / "validation_comparison_summary.json"
@@ -349,8 +411,34 @@ def main() -> None:
         dir_path=args.wandb_dir,
     )
     if run is not None:
-        run.log({"validation_panels/count": len(panel_paths)})
-        if wandb is not None:
+        run.log(
+            {
+                "validation_panels/count": len(panel_paths),
+                "validation_panels/uploaded_panel_count": min(
+                    len(panel_paths),
+                    max(int(args.wandb_max_panel_images), 0),
+                ),
+                "validation_panels/baseline_total_mae_mean": summary["metrics_mean"]["baseline_total_mae"],
+                "validation_panels/refined_total_mae_mean": summary["metrics_mean"]["refined_total_mae"],
+                "validation_panels/improvement_total_mean": summary["metrics_mean"]["improvement_total"],
+                "validation_panels/missing_baseline_total_mae_count": len(missing_baseline_rows),
+            }
+        )
+        if wandb is not None and int(args.wandb_max_panel_images) > 0:
+            sample_panels = [
+                wandb.Image(
+                    str(panel_path),
+                    caption=(
+                        f"{row.get('object_id')} | "
+                        f"SF3D={fmt_metric(row.get('baseline_total_mae'))} "
+                        f"Pred={fmt_metric(row.get('refined_total_mae'))} "
+                        f"gain={fmt_metric(row.get('improvement_total'))}"
+                    ),
+                )
+                for row, panel_path in zip(selected_rows, panel_paths)
+            ][: max(int(args.wandb_max_panel_images), 0)]
+            run.log({"validation_panels/sample_panels": sample_panels})
+        if wandb is not None and bool(args.wandb_log_panel_table):
             table = wandb.Table(
                 columns=[
                     "object_id",
@@ -376,11 +464,14 @@ def main() -> None:
                 )
             run.log({"validation_panels/table": table})
         if args.wandb_log_artifacts:
+            artifact_paths = [summary_path, html_path]
+            if bool(args.wandb_log_full_panel_artifact):
+                artifact_paths.append(output_dir)
             log_path_artifact(
                 run,
                 name=f"{run.name}-validation-panels",
                 artifact_type="validation-panels",
-                paths=[summary_path, html_path, output_dir],
+                paths=artifact_paths,
             )
         run.finish()
 

@@ -67,14 +67,20 @@ def build_record(row: dict[str, Any]) -> dict[str, Any] | None:
         return None
     object_id = str(row.get("object_id") or f"objaverse_{row.get('source_uid')}")
     source_format = str(row.get("format") or Path(local_path).suffix.lstrip(".") or "unknown").lower()
+    provider = str(row.get("source") or row.get("source_provider") or "mixed").strip().lower() or "mixed"
+    provider_safe = "".join(character if character.isalnum() else "_" for character in provider).strip("_") or "mixed"
     return {
         "record_version": MANIFEST_VERSION,
         "object_id": object_id,
         "source_uid": str(row.get("source_uid") or object_id),
         "source_name": "Objaverse-XL_strict_filtered_increment",
+        "source_name_detail": f"Objaverse-XL_{provider_safe}_strict_filtered_increment",
+        "source_provider": provider,
         "source_dataset": "objaverse_xl_strict_filtered",
+        "source_dataset_detail": f"objaverse_xl_{provider_safe}_strict_filtered",
         "pool_name": "pool_A_direct_object_supervision",
         "generator_id": "objaverse_xl_strict_filtered_increment",
+        "generator_id_detail": f"objaverse_xl_{provider_safe}_strict_filtered_increment",
         "license_bucket": str(row.get("license_bucket") or "unknown_per_object"),
         "source_model_path": local_path,
         "source_texture_root": str(Path(local_path).parent),
@@ -105,7 +111,7 @@ def build_record(row: dict[str, Any]) -> dict[str, Any] | None:
         "include_in_full": True,
         "processing_status": "unprepared",
         "smoke_source_bucket": "",
-        "notes": "downloaded_objaverse_xl_strict_filtered_increment",
+        "notes": f"downloaded_objaverse_xl_strict_filtered_increment; provider={provider}",
     }
 
 

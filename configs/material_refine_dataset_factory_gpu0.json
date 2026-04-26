@@ -4,7 +4,8 @@
     "Continuous dataset expansion plan for SF3D material-refine data only; no training is launched here.",
     "GPU policy allows data-only render/preprocess work to fully use GPU1 when needed; no training is launched here.",
     "Pool-A paper promotion remains gated by license/import/target-quality audits; auxiliary and benchmark pools are explicitly marked.",
-    "Storage policy: future heavy render/preprocess outputs go to /4T; repo output keeps lightweight reports/manifests."
+    "Storage policy: future heavy render/preprocess outputs go to /4T; repo output keeps lightweight reports/manifests.",
+    "2026-04-26 policy: do not use 3D-FUTURE / 3D furniture as a future dataset source; preserve only legacy records already present in fixed Stage1-v3 manifests."
   ],
   "storage_policy": {
     "large_render_output_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
@@ -32,7 +33,8 @@
     "proxy_probe_timeout_seconds": 8,
     "hf_endpoint_candidates": ["env", "https://huggingface.co", "https://hf-mirror.com"],
     "hf_endpoint_probe_timeout_seconds": 8,
-    "default_probe_url": "https://huggingface.co/"
+    "default_probe_url": "https://huggingface.co/",
+    "skip_if_primary_progress_exists_default": true
   },
   "targets": {
     "production_total_objects": 12000,
@@ -54,10 +56,10 @@
     {
       "name": "3D-FUTURE_highlight_local_8k",
       "pool": "Pool-A auxiliary upgrade queue",
-      "role": "local high-throughput no-prior object expansion",
+      "role": "deprecated_legacy_training_only_do_not_use_for_future_expansion",
       "manifest": "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
       "license_policy": "research_noncommercial_separate_bucket",
-      "promotion_gate": "license/import/target-quality gate before paper_main"
+      "promotion_gate": "disabled for future promotion; keep only records already fixed in current Stage1-v3 manifests"
     },
     {
       "name": "Objaverse-XL_cached_strict_increment",
@@ -70,10 +72,10 @@
     {
       "name": "Objaverse-XL_github_lfs_increment",
       "pool": "Pool-A auxiliary upgrade queue",
-      "role": "GitHub/LFS permissive object expansion now that git-lfs is installed",
+      "role": "disabled by default for future longruns; GitHub rows include scene-like repositories unless object-safe whitelisted",
       "manifest": "output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json",
       "license_policy": "mixed individual licenses; filtered before render",
-      "promotion_gate": "license + import + material-probe + target gate"
+      "promotion_gate": "object-safe whitelist + license + import + material-probe + target gate"
     },
     {
       "name": "Objaverse-XL_strict_filtered_retry",
@@ -82,6 +84,38 @@
       "manifest_glob": "output/material_refine_aux_downloads/objaverse_strict*/objaverse_xl_strict_filtered_manifest.json",
       "license_policy": "noncommercial/ND/unknown blocked",
       "promotion_gate": "downloaded local asset + import + target gate"
+    },
+    {
+      "name": "Objaverse-XL_smithsonian_increment",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "permissive real-object/source-diversity expansion, no 3D-FUTURE",
+      "manifest": "output/material_refine_aux_downloads/objaverse_smithsonian_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "license_policy": "mixed individual licenses; noncommercial/ND/unknown blocked before render",
+      "promotion_gate": "downloaded local asset + import + material-probe + target gate"
+    },
+    {
+      "name": "Objaverse-XL_thingiverse_increment",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "mechanical/thin-boundary/source-diversity expansion, no 3D-FUTURE",
+      "manifest": "output/material_refine_aux_downloads/objaverse_thingiverse_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "license_policy": "mixed individual licenses; noncommercial/ND/unknown blocked before render",
+      "promotion_gate": "downloaded local asset + import + material-probe + target gate"
+    },
+    {
+      "name": "Objaverse-XL_sketchfab_scarce_increment",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "scarce material-family expansion for ceramic/glass/mixed boundary, no 3D-FUTURE",
+      "manifest": "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "license_policy": "mixed individual licenses; noncommercial/ND/unknown blocked before render",
+      "promotion_gate": "downloaded local asset + import + material-probe + target gate"
+    },
+    {
+      "name": "Local_non_3dfuture_object_sources",
+      "pool": "Pool-A auxiliary upgrade queue",
+      "role": "local GSO/Kenney/Smithsonian/Omni/Khronos object expansion; no 3D-FUTURE",
+      "manifest": "output/material_refine_aux_downloads/local_object_sources_canonical/material_refine_manifest_local_object_increment.json",
+      "license_policy": "source-specific buckets; non-reviewed licenses remain auxiliary until reconcile",
+      "promotion_gate": "import + material-probe + target gate + license reconcile"
     },
     {
       "name": "PolyHaven_HDRI",
@@ -127,13 +161,17 @@
     "session_prefix": "sf3d_longrun_material_refine",
     "output_base_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
     "input_manifests": [
-      "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
+      "output/highlight_pool_a_8k/material_refine_manifest_pool_a_no_3dfuture.json",
       "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json",
-      "output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json"
+      "output/material_refine_aux_downloads/local_object_sources_canonical/material_refine_manifest_local_object_increment.json"
     ],
     "input_manifest_globs": [
       "output/material_refine_aux_downloads/objaverse_cached_factory_canonical/material_refine_manifest_objaverse_increment.json",
       "output/material_refine_aux_downloads/objaverse_cached_scarce_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_smithsonian_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_thingiverse_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory_canonical/material_refine_manifest_objaverse_increment.json",
       "output/material_refine_aux_downloads/objaverse_strict_factory_canonical/material_refine_manifest_objaverse_increment.json",
       "output/material_refine_aux_downloads/objaverse_strict*/canonical/material_refine_manifest_objaverse_increment.json"
     ],
@@ -156,6 +194,12 @@
     "cycles_samples": 8,
     "refresh_partial_every": 3,
     "merged_monitor_poll_seconds": 90
+  },
+  "local_object_sources": {
+    "enabled": true,
+    "output_root": "output/material_refine_aux_downloads/local_object_sources_canonical",
+    "max_total_records": 3600,
+    "refresh_seconds": 86400
   },
   "downloads": [
     {
@@ -250,8 +294,152 @@
       ]
     },
     {
-      "name": "objaverse_github_lfs_cached_increment",
+      "name": "objaverse_smithsonian_cached_increment",
       "enabled": true,
+      "session": "sf3d_factory_objaverse_smithsonian_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_smithsonian_factory",
+      "retry_seconds": 900,
+      "timeout_seconds": 7200,
+      "stall_seconds": 9000,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_smithsonian_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_smithsonian_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/smithsonian"
+      ],
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_smithsonian_factory",
+        "--sources",
+        "smithsonian",
+        "--target",
+        "1500",
+        "--processes",
+        "10",
+        "--priority-material-families",
+        "ceramic_glazed_lacquer,glass_metal,mixed_thin_boundary,glossy_non_metal,metal_dominant",
+        "--target-material-family-ratios",
+        "ceramic_glazed_lacquer=0.30,glass_metal=0.25,mixed_thin_boundary=0.20,glossy_non_metal=0.15,metal_dominant=0.10",
+        "--source-priority",
+        "smithsonian",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_thingiverse_cached_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_thingiverse_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_thingiverse_factory",
+      "retry_seconds": 900,
+      "timeout_seconds": 7200,
+      "stall_seconds": 9000,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_thingiverse_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_thingiverse_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/thingiverse"
+      ],
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_thingiverse_factory",
+        "--sources",
+        "thingiverse",
+        "--target",
+        "1200",
+        "--processes",
+        "8",
+        "--priority-material-families",
+        "mixed_thin_boundary,metal_dominant,glass_metal,glossy_non_metal,ceramic_glazed_lacquer",
+        "--target-material-family-ratios",
+        "mixed_thin_boundary=0.35,metal_dominant=0.25,glass_metal=0.15,glossy_non_metal=0.15,ceramic_glazed_lacquer=0.10",
+        "--source-priority",
+        "thingiverse",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_sketchfab_scarce_cached_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_sketchfab_scarce_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory",
+      "retry_seconds": 900,
+      "timeout_seconds": 7200,
+      "stall_seconds": 9000,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/hf-objaverse-v1"
+      ],
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory",
+        "--sources",
+        "sketchfab",
+        "--target",
+        "2500",
+        "--processes",
+        "12",
+        "--priority-material-families",
+        "glass_metal,ceramic_glazed_lacquer,mixed_thin_boundary,glossy_non_metal,metal_dominant",
+        "--target-material-family-ratios",
+        "glass_metal=0.30,ceramic_glazed_lacquer=0.25,mixed_thin_boundary=0.25,glossy_non_metal=0.15,metal_dominant=0.05",
+        "--source-priority",
+        "sketchfab",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_permissive_mixed_cached_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_permissive_mixed_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory",
+      "retry_seconds": 900,
+      "timeout_seconds": 7200,
+      "stall_seconds": 9000,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/hf-objaverse-v1"
+      ],
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory",
+        "--sources",
+        "smithsonian,thingiverse,sketchfab",
+        "--target",
+        "4000",
+        "--processes",
+        "12",
+        "--priority-material-families",
+        "glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal,metal_dominant",
+        "--target-material-family-ratios",
+        "glass_metal=0.25,mixed_thin_boundary=0.25,ceramic_glazed_lacquer=0.25,glossy_non_metal=0.15,metal_dominant=0.10",
+        "--source-priority",
+        "smithsonian,thingiverse,sketchfab",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_github_lfs_cached_increment",
+      "enabled": false,
       "session": "sf3d_factory_objaverse_github_lfs_increment",
       "output_root": "output/material_refine_aux_downloads/objaverse_github_lfs_factory",
       "retry_seconds": 1200,
@@ -349,6 +537,30 @@
       "output_root": "output/material_refine_aux_downloads/objaverse_cached_scarce_factory_canonical"
     },
     {
+      "name": "objaverse_smithsonian_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_smithsonian_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_smithsonian_factory_canonical"
+    },
+    {
+      "name": "objaverse_thingiverse_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_thingiverse_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_thingiverse_factory_canonical"
+    },
+    {
+      "name": "objaverse_sketchfab_scarce_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_sketchfab_scarce_factory_canonical"
+    },
+    {
+      "name": "objaverse_permissive_mixed_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_permissive_mixed_factory_canonical"
+    },
+    {
       "name": "objaverse_github_lfs_factory_to_canonical",
       "enabled": true,
       "input_json": "output/material_refine_aux_downloads/objaverse_github_lfs_factory/objaverse_cached_increment_manifest.json",
@@ -370,18 +582,6 @@
       "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
       "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
       "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_monitor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_monitor_merged.json",
       "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
       "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
       "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
@@ -397,7 +597,7 @@
     "report_html": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.html",
     "min_input_mtime_age_seconds": 600,
     "allowed_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
-    "promotable_source_names": "ABO_locked_core,3D-FUTURE_highlight_local_8k,Objaverse-XL_strict_filtered_increment",
+    "promotable_source_names": "ABO_locked_core,Objaverse-XL_strict_filtered_increment",
     "promote_auxiliary_to_paper_main": true,
     "keep_unpromoted_audit_fields": true,
     "min_confidence_mean": 0.70,
@@ -430,7 +630,7 @@
     "ood_min_per_material_family": 24,
     "paper_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
     "material_quotas": "metal_dominant:0.30,ceramic_glazed_lacquer:0.20,glass_metal:0.15,mixed_thin_boundary:0.20,glossy_non_metal:0.15",
-    "main_train_source_names": "ABO_locked_core,3D-FUTURE_highlight_local_8k",
+    "main_train_source_names": "ABO_locked_core,Objaverse-XL_strict_filtered_increment,Objaverse-XL_cached_strict_increment",
     "train_ratio": 0.70,
     "val_ratio": 0.12,
     "iid_test_ratio": 0.10,
@@ -453,15 +653,41 @@
     "manifest_globs": [
       "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
       "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_supervisor_merged.json",
-      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_supervisor_merged.json",
       "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
       "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
       "output/material_refine_dataset_factory/paper_unlock_gpu0_*/canonical_manifest_supervisor_merged.json"
+    ]
+  },
+  "post_ingest_cleanup": {
+    "enabled": true,
+    "mode": "trash",
+    "min_age_seconds": 172800,
+    "max_actions": 24,
+    "trash_root": "/4T/CXY/sf3d_material_refine_cleanup_trash",
+    "output_json": "output/material_refine_cleanup/post_ingest_cleanup_report.json",
+    "protected_manifests": [
+      "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_balanced_paper_manifest.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_strict_paper_candidates.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_diagnostic_manifest.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_ood_eval_manifest.json"
+    ],
+    "protected_manifest_globs": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json"
+    ],
+    "active_root_globs": [],
+    "candidate_name_prefixes": [
+      "longrun_gpu0_",
+      "scarce_material_gpu0_",
+      "paper_unlock_gpu0_",
+      "objaverse_cached_gpu0_"
+    ],
+    "candidate_roots": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory",
+      "output/material_refine_dataset_factory"
     ]
   },
   "quality": {

@@ -16,12 +16,12 @@ from typing import Any
 
 PROJECT_ROOT = Path("/home/ubuntu/ssd_work/projects/stable-fast-3d")
 DEFAULT_PREPARED_MANIFEST = (
-    PROJECT_ROOT / "output" / "highlight_pool_a_8k" / "prepared_gpu1" / "full" / "canonical_manifest_pool_a_8k_full.json"
+    PROJECT_ROOT / "output" / "highlight_pool_a_8k" / "material_refine_manifest_pool_a_no_3dfuture.json"
 )
 DEFAULT_HDRI_MANIFEST = (
     PROJECT_ROOT / "output" / "highlight_pool_a_8k" / "aux_sources" / "polyhaven_hdri_bank_60.json"
 )
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output" / "highlight_pool_a_8k" / "polyhaven_stress_gpu1"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output" / "highlight_pool_a_8k" / "polyhaven_stress_gpu0_no_3dfuture"
 DEFAULT_BLENDER_BIN = Path(
     "/4T/CXY/Neural_Gaffer_original/scripts/Objavarse_rendering/blender-3.2.2-linux-x64/blender"
 )
@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-manifest", type=Path, default=None)
     parser.add_argument("--summary-md", type=Path, default=None)
     parser.add_argument("--blender-bin", type=Path, default=DEFAULT_BLENDER_BIN)
-    parser.add_argument("--cuda-device-index", type=str, default="1")
+    parser.add_argument("--cuda-device-index", type=str, default="0")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--cycles-samples", type=int, default=8)

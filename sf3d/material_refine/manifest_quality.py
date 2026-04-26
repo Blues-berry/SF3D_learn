@@ -172,6 +172,16 @@ def parse_confidence_summary(value: Any) -> dict[str, float]:
     return {}
 
 
+def parse_record_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def confidence_active_mean(confidence_summary: dict[str, float]) -> float:
     if "active_mean" in confidence_summary:
         return float(confidence_summary.get("active_mean") or 0.0)
@@ -493,6 +503,7 @@ def audit_record(
     record: dict[str, Any],
     *,
     allowed_paper_license_buckets: set[str] | None = None,
+    fast: bool = False,
 ) -> dict[str, Any]:
     required_fields = [
         "uv_albedo_path",
@@ -530,28 +541,59 @@ def audit_record(
     ]
     if not any(path is not None and path.exists() for path in canonical_asset_candidates.values()):
         missing.append("canonical_asset_path")
-    prior_roughness_digest = file_digest(resolved["uv_prior_roughness_path"])
-    target_roughness_digest = file_digest(resolved["uv_target_roughness_path"])
-    prior_metallic_digest = file_digest(resolved["uv_prior_metallic_path"])
-    target_metallic_digest = file_digest(resolved["uv_target_metallic_path"])
-    same_roughness = (
+    explicit_identity_available = record.get("target_prior_identity") not in {None, "", "None"}
+    explicit_prior_copy = parse_record_bool(record.get("target_is_prior_copy"))
+    should_hash_rm = not fast and not explicit_identity_available and not explicit_prior_copy
+    prior_roughness_digest = file_digest(resolved["uv_prior_roughness_path"]) if should_hash_rm else None
+    target_roughness_digest = file_digest(resolved["uv_target_roughness_path"]) if should_hash_rm else None
+    prior_metallic_digest = file_digest(resolved["uv_prior_metallic_path"]) if should_hash_rm else None
+    target_metallic_digest = file_digest(resolved["uv_target_metallic_path"]) if should_hash_rm else None
+    same_roughness = bool(
         prior_roughness_digest is not None
         and prior_roughness_digest == target_roughness_digest
     )
-    same_metallic = (
+    same_metallic = bool(
         prior_metallic_digest is not None
         and prior_metallic_digest == target_metallic_digest
     )
     same_rm_pair = same_roughness and same_metallic
     explicit_confidence_summary = parse_confidence_summary(record.get("target_confidence_summary"))
-    confidence_summary = (
-        explicit_confidence_summary
-        if explicit_confidence_summary
-        else confidence_summary_from_path(resolved["uv_target_confidence_path"])
+    if explicit_confidence_summary:
+        confidence_summary = explicit_confidence_summary
+    elif fast:
+        confidence_summary = {
+            "mean": float(record.get("target_confidence_mean") or 0.0),
+            "nonzero_rate": float(record.get("target_confidence_nonzero_rate") or 0.0),
+            "active_mean": float(record.get("target_confidence_active_mean") or record.get("target_confidence_mean") or 0.0),
+        }
+    else:
+        confidence_summary = confidence_summary_from_path(resolved["uv_target_confidence_path"])
+    explicit_view_ready = record.get("view_supervision_ready") not in {None, "", "None"}
+    if fast and explicit_view_ready:
+        views = int(record.get("valid_view_count") or 0)
+        has_buffer_root = (
+            resolved["canonical_buffer_root"] is not None
+            and resolved["canonical_buffer_root"].exists()
+        )
+        ready_views = views if parse_record_bool(record.get("view_supervision_ready")) and has_buffer_root else 0
+        view_counts = {field: ready_views for field in VIEW_BUFFER_FIELD_CANDIDATES}
+        view_counts.update(
+            {
+                "views": views,
+                "effective_view_supervision_views": ready_views,
+                "strict_complete_views": ready_views,
+            }
+        )
+    else:
+        view_counts = view_buffer_field_presence(resolved["canonical_buffer_root"])
+    explicit_material_family = str(record.get("material_family") or "").strip()
+    needs_texture_stats = not fast or explicit_material_family not in MATERIAL_FAMILIES or explicit_material_family == "unknown"
+    target_metallic_stats = (
+        grayscale_stats_from_path(resolved["uv_target_metallic_path"]) if needs_texture_stats else {}
     )
-    view_counts = view_buffer_field_presence(resolved["canonical_buffer_root"])
-    target_metallic_stats = grayscale_stats_from_path(resolved["uv_target_metallic_path"])
-    target_roughness_stats = grayscale_stats_from_path(resolved["uv_target_roughness_path"])
+    target_roughness_stats = (
+        grayscale_stats_from_path(resolved["uv_target_roughness_path"]) if needs_texture_stats else {}
+    )
     target_prior_identity = (
         float(record.get("target_prior_identity"))
         if record.get("target_prior_identity") not in {None, "", "None"}
@@ -567,7 +609,7 @@ def audit_record(
         target_prior_identity is not None
         and float(target_prior_identity) >= NEAR_COPY_TARGET_PRIOR_IDENTITY_THRESHOLD
     )
-    target_is_prior_copy = bool(record.get("target_is_prior_copy")) or same_rm_pair or target_is_near_copy
+    target_is_prior_copy = explicit_prior_copy or same_rm_pair or target_is_near_copy
     target_source_type = infer_target_source_type(
         record,
         target_is_prior_copy=target_is_prior_copy,
@@ -859,6 +901,7 @@ def audit_manifest(
     max_target_prior_identity_rate_for_paper: float = DEFAULT_MAX_TARGET_PRIOR_IDENTITY_RATE_FOR_PAPER,
     min_nontrivial_target_count_for_paper: int = DEFAULT_MIN_NONTRIVIAL_TARGET_COUNT_FOR_PAPER,
     allowed_paper_license_buckets: set[str] | None = None,
+    fast: bool = False,
 ) -> dict[str, Any]:
     payload, records = load_manifest_records(manifest_path, max_records=max_records)
     rows = [
@@ -867,6 +910,7 @@ def audit_manifest(
             payload,
             record,
             allowed_paper_license_buckets=allowed_paper_license_buckets,
+            fast=fast,
         )
         for record in records
     ]

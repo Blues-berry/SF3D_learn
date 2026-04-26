@@ -22,6 +22,10 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 
+_LPIPS_MODEL: Any | None = None
+_LPIPS_DEVICE: str | None = None
+_LPIPS_FAILURE: str | None = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -239,6 +243,9 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--topology-residual-suppression-strength", type=float, default=0.0)
     parser.add_argument("--enable-confidence-gated-trunk", type=parse_bool, default=False)
     parser.add_argument("--uncertainty-gate-strength", type=float, default=0.25)
+    parser.add_argument("--residual-delta-init-std", type=float, default=1.0e-3)
+    parser.add_argument("--trunk-uncertainty-init-bias", type=float, default=-1.0)
+    parser.add_argument("--trunk-boundary-stability-init-bias", type=float, default=1.0)
     parser.add_argument("--enable-inverse-material-check", type=parse_bool, default=False)
     parser.add_argument("--inverse-check-strength", type=float, default=0.25)
     parser.add_argument("--enable-material-evidence-calibration", type=parse_bool, default=False)
@@ -252,6 +259,8 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--matmul-precision", choices=["highest", "high", "medium"], default="high")
     parser.add_argument("--allow-tf32", type=parse_bool, default=True)
+    parser.add_argument("--torch-num-threads", type=int, default=0)
+    parser.add_argument("--torch-num-interop-threads", type=int, default=0)
     parser.add_argument(
         "--train-balance-mode",
         choices=[
@@ -315,6 +324,8 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default=4,
         help="Maximum validation batches used for lightweight render-proxy metrics. 0 means full validation loader.",
     )
+    parser.add_argument("--val-enable-lpips", type=parse_bool, default=True)
+    parser.add_argument("--val-lpips-max-images", type=int, default=12)
     parser.add_argument("--max-validation-batches", type=int, default=0, help="0 evaluates the full validation loader.")
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--checkpointing-steps", type=int, default=0)
@@ -521,6 +532,8 @@ def parse_args() -> argparse.Namespace:
     if args.prior_dropout_end_prob is not None:
         args.prior_dropout_end_prob = max(0.0, min(1.0, float(args.prior_dropout_end_prob)))
     args.prior_dropout_warmup_epochs = max(int(args.prior_dropout_warmup_epochs), 0)
+    args.torch_num_threads = max(int(args.torch_num_threads), 0)
+    args.torch_num_interop_threads = max(int(args.torch_num_interop_threads), 0)
     args.min_nontrivial_target_count_for_paper = max(int(args.min_nontrivial_target_count_for_paper), 0)
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
@@ -899,16 +912,15 @@ def compute_losses(
         else refined.new_ones(())
     )
 
-    if (
-        args.view_consistency_mode != "disabled"
-        and batch.get("view_targets") is not None
-        and batch.get("view_uvs") is not None
-    ):
+    if args.view_consistency_mode != "disabled" and batch.get("view_uvs") is not None:
         sampled_refined = sample_uv_maps_to_view(refined, batch["view_uvs"])
         view_mask = batch["view_masks"].clamp(0.0, 1.0)
         supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
         view_mask = view_mask * supervision_mask.view(-1, 1, 1, 1, 1)
-        view_targets = batch["view_targets"]
+        # Some generated canonical bundles store per-view RM PNGs as RGBA masks
+        # with 0/1 byte RGB values, which become nearly black after normalization.
+        # The reliable supervision source is the UV target plus UV correspondence.
+        view_targets = sample_uv_maps_to_view(target, batch["view_uvs"])
         view_consistency = (
             (sampled_refined - view_targets).abs() * view_mask
         ).sum() / view_mask.sum().clamp_min(1.0)
@@ -1159,39 +1171,178 @@ def balance_validation_records(
 
 
 def compact_dataset_wandb_logs(data_state: dict[str, Any]) -> dict[str, Any]:
-    val_balance = data_state.get("val_balance") or {}
-    val_summary = data_state.get("val") or {}
-    train_summary = data_state.get("train") or {}
-    logs: dict[str, Any] = {
-        "dataset/train_records": train_summary.get("records", 0),
-        "dataset/val_records": val_summary.get("records", 0),
-        "dataset/train_batches": data_state.get("train_batches", 0),
-        "dataset/val_batches": data_state.get("val_batches", 0),
-        "dataset/val_balance_group_count": len((val_balance.get("groups") or {})),
-        "dataset/val_balance_warning_count": len((val_balance.get("warnings") or [])),
-    }
-    for group_key, count in (val_balance.get("groups") or {}).items():
-        safe_group_key = str(group_key).replace("/", "_")
-        logs[f"dataset/val_material_family/{safe_group_key}/count"] = count
-    return logs
+    _ = data_state
+    # Dataset constants and balance breakdowns are saved under dataset_state/*.json.
+    # Keeping them out of W&B avoids dashboard clutter and makes the main charts
+    # reflect model behavior instead of static manifest metadata.
+    return {}
 
 
 def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
-    allowed_exact = {"epoch", "optimizer_step", "global_batch_step", "lr"}
-    allowed_prefixes = (
-        "train/",
-        "memory/gpu_allocated_gb",
-        "memory/gpu_reserved_gb",
-        "memory/gpu_max_allocated_gb",
-    )
+    allowed_exact = {
+        "epoch",
+        "optimizer_step",
+        "global_batch_step",
+        "lr",
+        "trainer/global_step",
+        "trainer/epoch",
+        "trainer/optimizer_step",
+        "trainer/global_batch_step",
+        "trainer/progress_fraction",
+        "optim/lr",
+        "throughput/samples_per_second",
+        "throughput/seconds_per_batch",
+        "train/total",
+        "train/refine_l1",
+        "train/boundary_bleed",
+        "train/gradient_preservation",
+        "train/residual_safety",
+        "train/effective_view_supervision_rate",
+    }
     blocked_prefixes = ("progress/",)
     filtered: dict[str, Any] = {}
     for key, value in logs.items():
         if key.startswith(blocked_prefixes):
             continue
-        if key in allowed_exact or key.startswith(allowed_prefixes):
+        if key in allowed_exact:
             filtered[key] = value
     return filtered
+
+
+def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
+    allowed_exact = {
+        "epoch",
+        "optimizer_step",
+        "global_batch_step",
+        "lr",
+        "trainer/global_step",
+        "trainer/epoch",
+        "trainer/optimizer_step",
+        "trainer/global_batch_step",
+        "optim/lr",
+        "best/val_uv_total_mae",
+        "best/selection_metric",
+        "best/epoch",
+        "val/uv_total_mae",
+        "val/improvement_uv_total_mae",
+        "val/improvement_rate",
+        "val/regression_rate",
+        "val/effective_view_supervision_rate",
+        "val/loss/total",
+        "val/rm/uv_total_mae",
+        "val/rm/view_total_mae",
+        "val/main/mse",
+        "val/main/psnr",
+        "val/main/ssim",
+        "val/main/lpips",
+        "val/special/boundary_bleed_score",
+        "val/special/metal_confusion_rate",
+        "val/special/highlight_localization_error",
+        "val/special/rm_gradient_preservation",
+        "val/special/prior_residual_safety",
+        "val/object_level/avg_improvement_total",
+        "eval/rm/uv_total_mae",
+        "eval/rm/view_total_mae",
+        "eval/main/mse",
+        "eval/main/psnr",
+        "eval/main/ssim",
+        "eval/main/lpips",
+        "eval/special/boundary_bleed_score",
+        "eval/special/metal_confusion_rate",
+        "eval/special/highlight_localization_error",
+        "eval/special/rm_gradient_preservation",
+        "eval/special/prior_residual_safety",
+        "eval/improvement_rate",
+        "eval/regression_rate",
+        "eval/effective_view_supervision_rate",
+        "eval/object_level/avg_improvement_total",
+    }
+    return {key: value for key, value in logs.items() if key in allowed_exact}
+
+
+def add_step_context(
+    logs: dict[str, Any],
+    *,
+    epoch: int,
+    optimizer_step: int,
+    global_batch_step: int | None = None,
+    learning_rate: float | None = None,
+    progress_fraction: float | None = None,
+) -> dict[str, Any]:
+    enriched = dict(logs)
+    enriched["trainer/global_step"] = int(optimizer_step)
+    enriched["trainer/epoch"] = int(epoch)
+    enriched["trainer/optimizer_step"] = int(optimizer_step)
+    if global_batch_step is not None:
+        enriched["trainer/global_batch_step"] = int(global_batch_step)
+    if learning_rate is not None:
+        enriched["optim/lr"] = float(learning_rate)
+        enriched["trainer/lr"] = float(learning_rate)
+    if progress_fraction is not None:
+        enriched["trainer/progress_fraction"] = float(progress_fraction)
+    return enriched
+
+
+def configure_wandb_step_metrics(run: Any | None) -> None:
+    if run is None or wandb is None:
+        return
+    try:
+        wandb.define_metric("trainer/global_step")
+        wandb.define_metric("trainer/epoch")
+        for metric_key in (
+            "optim/lr",
+            "throughput/samples_per_second",
+            "throughput/seconds_per_batch",
+            "train/total",
+            "train/refine_l1",
+            "train/boundary_bleed",
+            "train/gradient_preservation",
+            "train/residual_safety",
+            "train/effective_view_supervision_rate",
+            "val/uv_total_mae",
+            "val/rm/uv_total_mae",
+            "val/rm/view_total_mae",
+            "val/main/mse",
+            "val/main/psnr",
+            "val/main/ssim",
+            "val/main/lpips",
+            "val/special/boundary_bleed_score",
+            "val/special/metal_confusion_rate",
+            "val/special/highlight_localization_error",
+            "val/special/rm_gradient_preservation",
+            "val/special/prior_residual_safety",
+            "val/object_level/avg_improvement_total",
+            "eval/rm/uv_total_mae",
+            "eval/rm/view_total_mae",
+            "eval/main/mse",
+            "eval/main/psnr",
+            "eval/main/ssim",
+            "eval/main/lpips",
+            "eval/special/boundary_bleed_score",
+            "eval/special/metal_confusion_rate",
+            "eval/special/highlight_localization_error",
+            "eval/special/rm_gradient_preservation",
+            "eval/special/prior_residual_safety",
+            "eval/improvement_rate",
+            "eval/regression_rate",
+            "eval/effective_view_supervision_rate",
+            "eval/object_level/avg_improvement_total",
+            "val/improvement_uv_total_mae",
+            "val/improvement_rate",
+            "val/regression_rate",
+            "val/effective_view_supervision_rate",
+            "val/loss/total",
+            "best/selection_metric",
+            "best/epoch",
+        ):
+            wandb.define_metric(metric_key, step_metric="trainer/global_step")
+        wandb.define_metric(
+            "best/val_uv_total_mae",
+            step_metric="trainer/global_step",
+            summary="min",
+        )
+    except Exception as exc:  # noqa: BLE001 - W&B metric setup should not block training.
+        print(f"[wandb:warning] define_metric_failed={type(exc).__name__}: {exc}")
 
 
 def build_loader(
@@ -1263,6 +1414,9 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "enable_confidence_gated_trunk": bool(args.enable_confidence_gated_trunk),
         "uncertainty_gate_strength": float(args.uncertainty_gate_strength),
+        "residual_delta_init_std": float(args.residual_delta_init_std),
+        "trunk_uncertainty_init_bias": float(args.trunk_uncertainty_init_bias),
+        "trunk_boundary_stability_init_bias": float(args.trunk_boundary_stability_init_bias),
         "enable_inverse_material_check": bool(args.enable_inverse_material_check),
         "inverse_check_strength": float(args.inverse_check_strength),
         "enable_material_evidence_calibration": bool(args.enable_material_evidence_calibration),
@@ -1769,6 +1923,12 @@ def batch_probe_payload(batch: dict[str, Any]) -> dict[str, Any]:
     identity_delta = ((target - baseline).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
     prior_rate = float(sum(bool(item) for item in batch["has_material_prior"]) / max(sample_count, 1))
     effective_view_rate = float(batch["has_effective_view_supervision"].float().mean().item())
+    projected_view_targets = None
+    if batch.get("view_uvs") is not None:
+        try:
+            projected_view_targets = sample_uv_maps_to_view(target, batch["view_uvs"])
+        except Exception:
+            projected_view_targets = None
     return {
         "samples": sample_count,
         "object_ids": [str(item) for item in batch["object_id"][: min(sample_count, 4)]],
@@ -1788,7 +1948,8 @@ def batch_probe_payload(batch: dict[str, Any]) -> dict[str, Any]:
         "view_features": tensor_probe_stats(batch.get("view_features")),
         "view_masks": tensor_probe_stats(batch.get("view_masks")),
         "view_uvs": tensor_probe_stats(batch.get("view_uvs")),
-        "view_targets": tensor_probe_stats(batch.get("view_targets")),
+        "view_targets_png_raw": tensor_probe_stats(batch.get("view_targets")),
+        "view_targets_projected_uv": tensor_probe_stats(projected_view_targets),
     }
 
 
@@ -1866,7 +2027,8 @@ def probe_dataloader(
             "uv_target_confidence",
             "view_features",
             "view_uvs",
-            "view_targets",
+            "view_targets_png_raw",
+            "view_targets_projected_uv",
         ):
             print(f"[data:{label}:tensor] {key} {tensor_probe_text(first_batch.get(key, {}))}")
     return payload
@@ -1989,6 +2151,12 @@ def wandb_auth_hint() -> str:
 def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    print(
+        "[preflight:start] "
+        f"device={device} train_manifest={args.train_manifest} "
+        f"audit_records={args.preflight_audit_records}",
+        flush=True,
+    )
     manifest_paths = {
         "train_manifest": args.train_manifest,
         "val_manifest": args.val_manifest,
@@ -2028,16 +2196,29 @@ def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any
     manifest_summary = None
     if Path(args.train_manifest).exists():
         try:
+            print(
+                "[preflight:audit:start] "
+                f"manifest={Path(args.train_manifest)} "
+                f"max_records={int(args.preflight_audit_records)}",
+                flush=True,
+            )
             manifest_audit = audit_manifest(
                 Path(args.train_manifest),
                 max_records=int(args.preflight_audit_records),
                 identity_warning_threshold=float(args.target_prior_identity_warning_threshold),
                 max_target_prior_identity_rate_for_paper=float(args.max_target_prior_identity_rate_for_paper),
                 min_nontrivial_target_count_for_paper=int(args.min_nontrivial_target_count_for_paper),
+                fast=True,
             )
             manifest_summary = manifest_audit.get("summary") or {}
             manifest_audit_path = Path(args.output_dir) / "preflight_manifest_audit.json"
             save_json(manifest_audit_path, manifest_audit)
+            print(
+                "[preflight:audit:done] "
+                f"records={manifest_summary.get('records')} "
+                f"paper_eligible={manifest_summary.get('paper_stage_eligible_records')}",
+                flush=True,
+            )
             identity_rate = float(manifest_summary.get("target_prior_identity_rate", 0.0))
             if (
                 manifest_summary.get("records", 0) > 0
@@ -2475,6 +2656,57 @@ def grayscale_rgb_image(tensor: torch.Tensor) -> Image.Image:
     return tensor_to_pil(tensor.detach().cpu(), grayscale=True).convert("RGB")
 
 
+def enhanced_grayscale_rgb_image(
+    tensor: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    gamma: float = 0.65,
+    lower_percentile: float = 2.0,
+    upper_percentile: float = 98.0,
+) -> Image.Image:
+    value = tensor.detach().cpu().float().clamp(0.0, 1.0).squeeze(0).numpy()
+    valid = np.ones_like(value, dtype=bool)
+    if mask is not None:
+        valid = mask.detach().cpu().float().squeeze(0).numpy() > 0.05
+    visible_values = value[valid]
+    if visible_values.size >= 8:
+        low = float(np.percentile(visible_values, lower_percentile))
+        high = float(np.percentile(visible_values, upper_percentile))
+        if high > low + 1e-5:
+            value = (value - low) / (high - low)
+    value = np.clip(value, 0.0, 1.0)
+    value = np.power(value, max(float(gamma), 1e-4))
+    if mask is not None:
+        value = value * valid.astype(np.float32)
+    data = (value * 255.0).round().astype(np.uint8)
+    return Image.fromarray(np.stack([data, data, data], axis=-1), mode="RGB")
+
+
+def enhanced_rgb_tensor_image(
+    tensor: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    gamma: float = 0.65,
+) -> Image.Image:
+    image = tensor.detach().cpu().float()[:3].clamp(0.0, 1.0).numpy()
+    valid = np.ones(image.shape[1:], dtype=bool)
+    if mask is not None:
+        valid = mask.detach().cpu().float().squeeze(0).numpy() > 0.05
+    for channel in range(image.shape[0]):
+        channel_values = image[channel]
+        visible_values = channel_values[valid]
+        if visible_values.size >= 8:
+            low = float(np.percentile(visible_values, 2.0))
+            high = float(np.percentile(visible_values, 98.0))
+            if high > low + 1e-5:
+                image[channel] = (channel_values - low) / (high - low)
+    image = np.power(np.clip(image, 0.0, 1.0), max(float(gamma), 1e-4))
+    if mask is not None:
+        image = image * valid[None, :, :].astype(np.float32)
+    data = (np.moveaxis(image, 0, -1) * 255.0).round().astype(np.uint8)
+    return Image.fromarray(data, mode="RGB")
+
+
 def rgb_tensor_image(
     tensor: torch.Tensor,
     *,
@@ -2675,6 +2907,9 @@ def save_validation_preview(
     baseline_metallic_mae: float,
     refined_roughness_mae: float,
     refined_metallic_mae: float,
+    source_name: str = "unknown_source",
+    material_family: str = "unknown_material",
+    prior_label: str = "unknown_prior",
 ) -> Path:
     preview_dir = output_dir / "validation_previews" / validation_label
     preview_dir.mkdir(parents=True, exist_ok=True)
@@ -2684,12 +2919,16 @@ def save_validation_preview(
         view_features[preview_view_index, 0:3],
         mask=view_masks[preview_view_index],
     )
+    preview_view_enhanced = enhanced_rgb_tensor_image(
+        view_features[preview_view_index, 0:3],
+        mask=view_masks[preview_view_index],
+    )
 
-    tile_size = 176
-    row_label_width = 96
-    gutter = 10
+    tile_size = 128
+    row_label_width = 90
+    gutter = 8
     title_height = 70
-    columns = 4
+    columns = 7
     tile_width = tile_size
     tile_height = tile_size + 34
     canvas_width = row_label_width + columns * tile_width + (columns + 1) * gutter
@@ -2697,28 +2936,37 @@ def save_validation_preview(
         (
             "Input",
             [
-                compact_labeled_image(preview_view, "SF3D", size=tile_size),
+                compact_labeled_image(preview_view, "View", size=tile_size),
+                compact_labeled_image(preview_view_enhanced, "View γ", size=tile_size),
                 compact_labeled_image(rgb_tensor_image(uv_albedo), "Albedo", size=tile_size),
+                compact_labeled_image(enhanced_rgb_tensor_image(uv_albedo), "Albedo γ", size=tile_size),
                 compact_labeled_image(rgb_tensor_image(uv_normal), "Normal", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(confidence), "Conf", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(confidence), "Conf γ", size=tile_size),
             ],
         ),
         (
             "Rough",
             [
                 compact_labeled_image(grayscale_rgb_image(baseline[0:1]), "SF3D", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[0:1], mask=confidence), "SF3D γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(target_roughness), "GT", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(target_roughness, mask=confidence), "GT γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(refined[0:1]), "Pred", size=tile_size),
-                compact_labeled_image(delta_heatmap_image(refined[0:1], target_roughness), "Error", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(refined[0:1], mask=confidence), "Pred γ", size=tile_size),
+                compact_labeled_image(delta_heatmap_image(refined[0:1], target_roughness), "Err", size=tile_size),
             ],
         ),
         (
             "Metal",
             [
                 compact_labeled_image(grayscale_rgb_image(baseline[1:2]), "SF3D", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[1:2], mask=confidence), "SF3D γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(target_metallic), "GT", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(target_metallic, mask=confidence), "GT γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(refined[1:2]), "Pred", size=tile_size),
-                compact_labeled_image(delta_heatmap_image(refined[1:2], target_metallic), "Error", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(refined[1:2], mask=confidence), "Pred γ", size=tile_size),
+                compact_labeled_image(delta_heatmap_image(refined[1:2], target_metallic), "Err", size=tile_size),
             ],
         ),
     ]
@@ -2733,7 +2981,10 @@ def save_validation_preview(
     draw.text((12, 10), str(object_id), font=title_font, fill=(8, 12, 18))
     draw.text(
         (12, 38),
-        f"SF3D {baseline_total:.4f} | Pred {refined_total:.4f} | gain {improvement:+.4f}",
+        (
+            f"SF3D/Prior {baseline_total:.4f} | Pred {refined_total:.4f} | "
+            f"gain {improvement:+.4f} | {prior_label} | {material_family} | {source_name}"
+        ),
         font=detail_font,
         fill=(68, 76, 88),
     )
@@ -2818,12 +3069,100 @@ def psnr_from_mse(mse: float) -> float | None:
     return float(10.0 * math.log10(1.0 / mse))
 
 
+def masked_global_ssim_torch(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> float | None:
+    if prediction.numel() == 0 or target.shape != prediction.shape:
+        return None
+    weight = mask.expand_as(prediction).to(prediction.dtype)
+    denom = weight.sum().clamp_min(1.0)
+    mu_x = (prediction * weight).sum() / denom
+    mu_y = (target * weight).sum() / denom
+    var_x = ((prediction - mu_x).square() * weight).sum() / denom
+    var_y = ((target - mu_y).square() * weight).sum() / denom
+    cov_xy = ((prediction - mu_x) * (target - mu_y) * weight).sum() / denom
+    c1 = 0.01**2
+    c2 = 0.03**2
+    ssim = ((2.0 * mu_x * mu_y + c1) * (2.0 * cov_xy + c2)) / (
+        (mu_x.square() + mu_y.square() + c1) * (var_x + var_y + c2)
+    )
+    return float(ssim.detach().clamp(-1.0, 1.0).cpu().item())
+
+
+def get_lpips_model(enabled: bool, device: str) -> Any | None:
+    global _LPIPS_DEVICE, _LPIPS_FAILURE, _LPIPS_MODEL
+    if not enabled:
+        return None
+    if _LPIPS_MODEL is not None and _LPIPS_DEVICE == device:
+        return _LPIPS_MODEL
+    if _LPIPS_FAILURE is not None:
+        return None
+    try:
+        import lpips  # type: ignore
+
+        model = lpips.LPIPS(net="alex").to(device).eval()
+    except Exception as exc:  # noqa: BLE001 - optional metric should not block training.
+        _LPIPS_FAILURE = f"{type(exc).__name__}: {exc}"
+        print(f"[metric:warning] lpips_unavailable={_LPIPS_FAILURE}")
+        return None
+    _LPIPS_MODEL = model
+    _LPIPS_DEVICE = device
+    return _LPIPS_MODEL
+
+
+def rm_to_lpips_rgb(rm_view: torch.Tensor) -> torch.Tensor:
+    if rm_view.shape[1] == 1:
+        rgb = rm_view.expand(-1, 3, -1, -1)
+    else:
+        rough = rm_view[:, 0:1]
+        metal = rm_view[:, 1:2]
+        rgb = torch.cat([rough, metal, rough], dim=1)
+    return rgb.clamp(0.0, 1.0) * 2.0 - 1.0
+
+
+def compute_lpips_rm_proxy(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    device: str,
+    enabled: bool,
+    max_images: int,
+) -> float | None:
+    model = get_lpips_model(enabled, device)
+    if model is None or max_images <= 0:
+        return None
+    pred = prediction.reshape(-1, prediction.shape[2], prediction.shape[3], prediction.shape[4])
+    tgt = target.reshape(-1, target.shape[2], target.shape[3], target.shape[4])
+    m = mask.reshape(-1, 1, mask.shape[-2], mask.shape[-1])
+    valid = m.flatten(1).sum(dim=1) > 8
+    if not bool(valid.any()):
+        return None
+    pred = pred[valid][:max_images] * m[valid][:max_images]
+    tgt = tgt[valid][:max_images] * m[valid][:max_images]
+    with torch.no_grad():
+        distances = model(rm_to_lpips_rgb(pred), rm_to_lpips_rgb(tgt))
+    return float(distances.mean().detach().cpu().item())
+
+
+def safe_wandb_key(value: Any) -> str:
+    safe = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in str(value or "unknown")
+    )
+    return safe.strip("_") or "unknown"
+
+
 def finalize_render_proxy_metrics(store: dict[str, float]) -> dict[str, Any]:
     denom = max(float(store.get("denom", 0.0)), 1.0)
     baseline_mae = float(store.get("baseline_abs", 0.0) / denom)
     refined_mae = float(store.get("refined_abs", 0.0) / denom)
     baseline_mse = float(store.get("baseline_sq", 0.0) / denom)
     refined_mse = float(store.get("refined_sq", 0.0) / denom)
+    ssim_count = max(float(store.get("ssim_count", 0.0)), 1.0)
+    lpips_count = max(float(store.get("lpips_count", 0.0)), 1.0)
     return {
         "enabled": True,
         "available": bool(store.get("available_batches", 0.0) > 0.0),
@@ -2833,13 +3172,29 @@ def finalize_render_proxy_metrics(store: dict[str, float]) -> dict[str, Any]:
         "baseline_view_rm_mae": baseline_mae,
         "refined_view_rm_mae": refined_mae,
         "view_rm_mae_delta": baseline_mae - refined_mae,
+        "baseline_proxy_rm_mse": baseline_mse,
+        "refined_proxy_rm_mse": refined_mse,
+        "proxy_rm_mse_delta": baseline_mse - refined_mse,
         "baseline_proxy_rm_psnr": psnr_from_mse(baseline_mse),
         "refined_proxy_rm_psnr": psnr_from_mse(refined_mse),
+        "baseline_proxy_rm_ssim": float(store.get("baseline_ssim", 0.0) / ssim_count)
+        if store.get("ssim_count", 0.0) > 0.0
+        else None,
+        "refined_proxy_rm_ssim": float(store.get("refined_ssim", 0.0) / ssim_count)
+        if store.get("ssim_count", 0.0) > 0.0
+        else None,
+        "baseline_proxy_rm_lpips": float(store.get("baseline_lpips", 0.0) / lpips_count)
+        if store.get("lpips_count", 0.0) > 0.0
+        else None,
+        "refined_proxy_rm_lpips": float(store.get("refined_lpips", 0.0) / lpips_count)
+        if store.get("lpips_count", 0.0) > 0.0
+        else None,
         "proxy_rm_psnr_delta": (
             None
             if psnr_from_mse(baseline_mse) is None or psnr_from_mse(refined_mse) is None
             else psnr_from_mse(refined_mse) - psnr_from_mse(baseline_mse)
         ),
+        "lpips_status": "available" if store.get("lpips_count", 0.0) > 0.0 else (_LPIPS_FAILURE or "not_computed"),
         "mode": "view_projected_rm_proxy",
     }
 
@@ -2850,8 +3205,11 @@ def update_render_proxy_metrics(
     batch: dict[str, torch.Tensor],
     baseline: torch.Tensor,
     refined: torch.Tensor,
+    target: torch.Tensor,
+    args: argparse.Namespace,
+    device: str,
 ) -> None:
-    if batch.get("view_targets") is None or batch.get("view_uvs") is None:
+    if batch.get("view_uvs") is None:
         return
     view_mask = batch["view_masks"].clamp(0.0, 1.0)
     supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
@@ -2859,9 +3217,36 @@ def update_render_proxy_metrics(
     denom = float(view_mask.sum().detach().cpu().item()) * float(refined.shape[1])
     if denom <= 0.0:
         return
-    target_views = batch["view_targets"]
+    target_views = sample_uv_maps_to_view(target, batch["view_uvs"])
     baseline_views = sample_uv_maps_to_view(baseline, batch["view_uvs"])
     refined_views = sample_uv_maps_to_view(refined, batch["view_uvs"])
+    baseline_ssim = masked_global_ssim_torch(baseline_views, target_views, view_mask)
+    refined_ssim = masked_global_ssim_torch(refined_views, target_views, view_mask)
+    if baseline_ssim is not None and refined_ssim is not None:
+        store["baseline_ssim"] += baseline_ssim
+        store["refined_ssim"] += refined_ssim
+        store["ssim_count"] += 1.0
+    if bool(getattr(args, "val_enable_lpips", True)):
+        baseline_lpips = compute_lpips_rm_proxy(
+            baseline_views,
+            target_views,
+            view_mask,
+            device=device,
+            enabled=True,
+            max_images=int(getattr(args, "val_lpips_max_images", 12)),
+        )
+        refined_lpips = compute_lpips_rm_proxy(
+            refined_views,
+            target_views,
+            view_mask,
+            device=device,
+            enabled=True,
+            max_images=int(getattr(args, "val_lpips_max_images", 12)),
+        )
+        if baseline_lpips is not None and refined_lpips is not None:
+            store["baseline_lpips"] += baseline_lpips
+            store["refined_lpips"] += refined_lpips
+            store["lpips_count"] += 1.0
     baseline_error = baseline_views - target_views
     refined_error = refined_views - target_views
     store["baseline_abs"] += float((baseline_error.abs() * view_mask).sum().detach().cpu().item())
@@ -2934,6 +3319,95 @@ def update_residual_gate_diagnostics(
     )
 
 
+def _metric_float(value: torch.Tensor) -> float:
+    return float(value.detach().float().cpu().item())
+
+
+def update_validation_special_metrics(
+    store: dict[str, float],
+    *,
+    batch: dict[str, torch.Tensor],
+    baseline: torch.Tensor,
+    refined: torch.Tensor,
+    target: torch.Tensor,
+    confidence: torch.Tensor,
+) -> None:
+    _ = batch, baseline
+    confidence = confidence.float().clamp(0.0, 1.0)
+    error = (refined.float() - target.float()).abs()
+    channel_weight = confidence.expand_as(error)
+
+    target_edge = rm_gradient_magnitude(target.float()).detach()
+    edge_max = target_edge.flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(1e-6)
+    edge_norm = (target_edge / edge_max).clamp(0.0, 1.0)
+    edge_band = F.max_pool2d(edge_norm, kernel_size=7, stride=1, padding=3).clamp(0.0, 1.0)
+    boundary_weight = edge_band.expand_as(error) * channel_weight
+    interior_weight = (1.0 - edge_band).expand_as(error) * channel_weight
+    boundary_denom = boundary_weight.sum()
+    interior_denom = interior_weight.sum()
+    if _metric_float(boundary_denom) > 0.0 and _metric_float(interior_denom) > 0.0:
+        boundary_error = (error * boundary_weight).sum() / boundary_denom.clamp_min(1.0)
+        interior_error = (error * interior_weight).sum() / interior_denom.clamp_min(1.0)
+        store["boundary_bleed_score"] += _metric_float(boundary_error - interior_error)
+        store["boundary_bleed_count"] += 1.0
+
+    metallic_target = (target[:, 1:2].float() >= METALLIC_THRESHOLD).to(refined.dtype)
+    metallic_pred = (refined[:, 1:2].float() >= METALLIC_THRESHOLD).to(refined.dtype)
+    metal_denom = confidence.sum()
+    if _metric_float(metal_denom) > 0.0:
+        confusion = ((metallic_pred != metallic_target).to(refined.dtype) * confidence).sum()
+        store["metal_confusion_rate"] += _metric_float(confusion / metal_denom.clamp_min(1.0))
+        store["metal_confusion_count"] += 1.0
+
+    highlight_mask = (target[:, 0:1].float() <= 0.35).to(refined.dtype) * confidence
+    highlight_denom = highlight_mask.sum()
+    if _metric_float(highlight_denom) > 0.0:
+        highlight_error = (error.mean(dim=1, keepdim=True) * highlight_mask).sum()
+        store["highlight_localization_error"] += _metric_float(highlight_error / highlight_denom.clamp_min(1.0))
+        store["highlight_count"] += 1.0
+
+    refined_grad = rm_gradient_magnitude(refined.float())
+    target_grad = rm_gradient_magnitude(target.float())
+    grad_weight = confidence
+    grad_denom = grad_weight.sum()
+    if _metric_float(grad_denom) > 0.0:
+        refined_mean = (refined_grad * grad_weight).sum() / grad_denom.clamp_min(1.0)
+        target_mean = (target_grad * grad_weight).sum() / grad_denom.clamp_min(1.0)
+        refined_centered = refined_grad - refined_mean
+        target_centered = target_grad - target_mean
+        var_refined = (refined_centered.square() * grad_weight).sum() / grad_denom.clamp_min(1.0)
+        var_target = (target_centered.square() * grad_weight).sum() / grad_denom.clamp_min(1.0)
+        if _metric_float(var_refined) > 1e-8 and _metric_float(var_target) > 1e-8:
+            corr = (
+                (refined_centered * target_centered * grad_weight).sum()
+                / grad_denom.clamp_min(1.0)
+                / (var_refined.sqrt() * var_target.sqrt()).clamp_min(1e-6)
+            )
+            store["rm_gradient_preservation"] += _metric_float(corr.clamp(-1.0, 1.0))
+            store["rm_gradient_count"] += 1.0
+
+
+def finalize_validation_special_metrics(store: dict[str, float]) -> dict[str, Any]:
+    def mean(name: str, count_name: str) -> float | None:
+        count = float(store.get(count_name, 0.0))
+        if count <= 0.0:
+            return None
+        return float(store.get(name, 0.0) / count)
+
+    return {
+        "boundary_bleed_score": mean("boundary_bleed_score", "boundary_bleed_count"),
+        "metal_confusion_rate": mean("metal_confusion_rate", "metal_confusion_count"),
+        "highlight_localization_error": mean("highlight_localization_error", "highlight_count"),
+        "rm_gradient_preservation": mean("rm_gradient_preservation", "rm_gradient_count"),
+        "metric_availability": {
+            "boundary_bleed_score_batches": int(store.get("boundary_bleed_count", 0.0)),
+            "metal_confusion_rate_batches": int(store.get("metal_confusion_count", 0.0)),
+            "highlight_localization_error_batches": int(store.get("highlight_count", 0.0)),
+            "rm_gradient_preservation_batches": int(store.get("rm_gradient_count", 0.0)),
+        },
+    }
+
+
 def evaluate(
     model: MaterialRefiner,
     loader: DataLoader,
@@ -2994,6 +3468,7 @@ def evaluate(
     render_proxy_store: dict[str, float] = defaultdict(float)
     residual_gate_store: dict[str, float] = defaultdict(float)
     residual_gate_cases: list[dict[str, Any]] = []
+    special_metric_store: dict[str, float] = defaultdict(float)
 
     with torch.no_grad():
         for batch in loader:
@@ -3018,6 +3493,14 @@ def evaluate(
             confidence = batch["uv_target_confidence"].clamp(0.0, 1.0)
             refined = outputs["refined"]
             baseline = outputs["baseline"]
+            update_validation_special_metrics(
+                special_metric_store,
+                batch=batch,
+                baseline=baseline,
+                refined=refined,
+                target=target,
+                confidence=confidence,
+            )
             if render_proxy_enabled and (
                 args.render_proxy_validation_max_batches <= 0
                 or render_proxy_store["batches"] < args.render_proxy_validation_max_batches
@@ -3028,6 +3511,9 @@ def evaluate(
                     batch=batch,
                     baseline=baseline,
                     refined=refined,
+                    target=target,
+                    args=args,
+                    device=device,
                 )
 
             per_sample_weight = confidence.flatten(1).sum(dim=1).clamp_min(1.0)
@@ -3061,6 +3547,7 @@ def evaluate(
             for item_index, object_id in enumerate(batch["object_id"]):
                 generator_id = str(batch["generator_id"][item_index])
                 source_name = str(batch["source_name"][item_index])
+                material_family = str(batch["material_family"][item_index])
                 prior_name = "with_prior" if bool(batch["has_material_prior"][item_index]) else "without_prior"
                 supervision_tier = str(batch["supervision_tier"][item_index])
                 metric_kwargs = {
@@ -3120,6 +3607,9 @@ def evaluate(
                         baseline_metallic_mae=float(baseline_metallic_mae[item_index].item()),
                         refined_roughness_mae=float(roughness_mae[item_index].item()),
                         refined_metallic_mae=float(metallic_mae[item_index].item()),
+                        source_name=source_name,
+                        material_family=material_family,
+                        prior_label=prior_name,
                     )
                     preview_paths.append(preview_path)
                     baseline_total = float(baseline_total_mae[item_index].item())
@@ -3130,6 +3620,7 @@ def evaluate(
                             "object_id": object_id,
                             "generator_id": generator_id,
                             "source_name": source_name,
+                            "material_family": material_family,
                             "prior_label": prior_name,
                             "baseline_total_mae": baseline_total,
                             "refined_total_mae": refined_total,
@@ -3184,6 +3675,7 @@ def evaluate(
                 "mode": "view_projected_rm_proxy",
             }
         ),
+        "special_metrics": finalize_validation_special_metrics(special_metric_store),
         "residual_gate_diagnostics": finalize_residual_gate_diagnostics(residual_gate_store),
         "residual_gate_cases": residual_gate_cases,
         "preview_paths": [str(path.resolve()) for path in preview_paths],
@@ -3389,11 +3881,34 @@ def reload_data_if_needed(
             min_hard_views_per_sample=args.val_min_hard_views,
             randomize_view_subset=False,
         )
-        val_records, val_balance_summary = balance_validation_records(val_dataset.records, args)
-        val_balance_summary["source"] = (
-            "frozen_manifest" if frozen_val_manifest is not None else "live_manifest"
-        )
-        val_dataset.records = val_records
+        if frozen_val_manifest is not None:
+            # The frozen manifest already encodes the audited object-level
+            # validation order.  Re-balancing again can silently move with-prior
+            # samples out of the first validation window and make previews look
+            # single-source even when the frozen set is mixed.
+            val_balance_summary = {
+                "enabled": True,
+                "key": str(args.val_balance_key),
+                "source": "frozen_manifest_preserved_order",
+                "original_records": len(val_dataset.records),
+                "selected_records": len(val_dataset.records),
+                "max_records": None,
+                "records_per_group": int(getattr(args, "val_records_per_balance_group", 0)),
+                "expected_groups": list(getattr(args, "val_expected_balance_groups", []) or []),
+                "groups": dict(
+                    sorted(
+                        Counter(
+                            record_field_value(record, str(args.val_balance_key))
+                            for record in val_dataset.records
+                        ).items()
+                    )
+                ),
+                "warnings": [],
+            }
+        else:
+            val_records, val_balance_summary = balance_validation_records(val_dataset.records, args)
+            val_balance_summary["source"] = "live_manifest"
+            val_dataset.records = val_records
         val_loader = build_loader(
             val_dataset,
             batch_size=args.val_batch_size if args.val_batch_size > 0 else args.batch_size,
@@ -3441,6 +3956,7 @@ def run_validation_cycle(
     output_dir: Path,
     epoch: int,
     optimizer_step: int,
+    global_batch_step: int,
     run: Any | None,
     scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     learning_rate: float,
@@ -3521,64 +4037,76 @@ def run_validation_cycle(
                 )
                 for item in preview_items[: args.wandb_val_preview_max]
             ]
+        improvement_payload = val_payload.get("improvement_uv_mae") or {}
+        special_metrics = val_payload.get("special_metrics") or {}
+        residual_diag = val_payload.get("residual_gate_diagnostics") or {}
         log_payload = {
             "epoch": epoch,
             "optimizer_step": optimizer_step,
+            "global_batch_step": global_batch_step,
             "lr": learning_rate,
             "best/selection_metric": best_val_metric,
             "best/epoch": best_epoch,
-            "best/selection_mode": str(args.validation_selection_metric),
-            "val/selection_metric": monitored_metric,
+            "best/val_uv_total_mae": val_payload["uv_mae"]["total"],
             "val/uv_total_mae": val_payload["uv_mae"]["total"],
-            "val/uv_roughness_mae": val_payload["uv_mae"]["roughness"],
-            "val/uv_metallic_mae": val_payload["uv_mae"]["metallic"],
-            "val/baseline_uv_total_mae": val_payload["baseline_uv_mae"]["total"],
-            "val/baseline_uv_roughness_mae": val_payload["baseline_uv_mae"]["roughness"],
-            "val/baseline_uv_metallic_mae": val_payload["baseline_uv_mae"]["metallic"],
-            "val/improvement_uv_total_mae": val_payload["improvement_uv_mae"]["total"],
-            "val/improvement_uv_roughness_mae": val_payload["improvement_uv_mae"]["roughness"],
-            "val/improvement_uv_metallic_mae": val_payload["improvement_uv_mae"]["metallic"],
-            "val/improvement_rate": val_payload["improvement_uv_mae"]["improvement_rate"],
-            "val/regression_rate": val_payload["improvement_uv_mae"]["regression_rate"],
+            "val/rm/uv_total_mae": val_payload["uv_mae"]["total"],
+            "val/improvement_uv_total_mae": improvement_payload.get("total"),
+            "val/improvement_rate": improvement_payload.get("improvement_rate"),
+            "val/regression_rate": improvement_payload.get("regression_rate"),
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
-            "val/view_consistency_enabled": bool(val_payload.get("view_consistency_enabled", False)),
+            "val/object_level/avg_improvement_total": improvement_payload.get("total"),
+            "eval/rm/uv_total_mae": val_payload["uv_mae"]["total"],
+            "eval/improvement_rate": improvement_payload.get("improvement_rate"),
+            "eval/regression_rate": improvement_payload.get("regression_rate"),
+            "eval/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
+            "eval/object_level/avg_improvement_total": improvement_payload.get("total"),
         }
-        if args.validation_selection_metric == "uv_total":
-            log_payload["best/val_uv_total_mae"] = best_val_metric
+        if val_payload.get("loss"):
+            log_payload["val/loss/total"] = val_payload["loss"].get("total")
         render_proxy = val_payload.get("render_proxy_validation") or {}
-        if bool(render_proxy.get("enabled")):
-            log_payload.update(
-                {
-                    "val/render_proxy/baseline_view_rm_mae": render_proxy.get("baseline_view_rm_mae"),
-                    "val/render_proxy/refined_view_rm_mae": render_proxy.get("refined_view_rm_mae"),
-                    "val/render_proxy/view_rm_mae_delta": render_proxy.get("view_rm_mae_delta"),
-                    "val/render_proxy/baseline_rm_psnr": render_proxy.get("baseline_proxy_rm_psnr"),
-                    "val/render_proxy/refined_rm_psnr": render_proxy.get("refined_proxy_rm_psnr"),
-                    "val/render_proxy/rm_psnr_delta": render_proxy.get("proxy_rm_psnr_delta"),
-                }
-            )
-        for key, value in selection_components.items():
-            log_payload[f"val/selection/{key}"] = value
-        residual_diag = val_payload.get("residual_gate_diagnostics") or {}
-        log_payload.update(
-            {
-                "val/residual_gate/changed_pixel_rate": residual_diag.get("changed_pixel_rate"),
-                "val/residual_gate/unnecessary_change_rate": residual_diag.get("unnecessary_change_rate"),
-                "val/residual_gate/regression_rate": residual_diag.get("regression_rate"),
-                "val/residual_gate/safe_improvement_rate": residual_diag.get("safe_improvement_rate"),
-                "val/residual_gate/mean_residual_abs": residual_diag.get("mean_residual_abs"),
-            }
+        if bool(render_proxy.get("available")):
+            log_payload["val/rm/view_total_mae"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["val/main/mse"] = render_proxy.get("refined_proxy_rm_mse")
+            log_payload["val/main/psnr"] = render_proxy.get("refined_proxy_rm_psnr")
+            log_payload["val/main/ssim"] = render_proxy.get("refined_proxy_rm_ssim")
+            log_payload["val/main/lpips"] = render_proxy.get("refined_proxy_rm_lpips")
+            log_payload["eval/rm/view_total_mae"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["eval/main/mse"] = render_proxy.get("refined_proxy_rm_mse")
+            log_payload["eval/main/psnr"] = render_proxy.get("refined_proxy_rm_psnr")
+            log_payload["eval/main/ssim"] = render_proxy.get("refined_proxy_rm_ssim")
+            log_payload["eval/main/lpips"] = render_proxy.get("refined_proxy_rm_lpips")
+        for metric_name in (
+            "boundary_bleed_score",
+            "metal_confusion_rate",
+            "highlight_localization_error",
+            "rm_gradient_preservation",
+        ):
+            metric_value = special_metrics.get(metric_name)
+            log_payload[f"val/special/{metric_name}"] = metric_value
+            log_payload[f"eval/special/{metric_name}"] = metric_value
+        residual_safety = residual_diag.get("safe_improvement_rate")
+        log_payload["val/special/prior_residual_safety"] = residual_safety
+        log_payload["eval/special/prior_residual_safety"] = residual_safety
+        log_payload = add_step_context(
+            log_payload,
+            epoch=epoch,
+            optimizer_step=optimizer_step,
+            global_batch_step=global_batch_step,
+            learning_rate=learning_rate,
         )
-        if train_total is not None:
-            log_payload["train/epoch_total"] = train_total
-        log_payload.update(flatten_for_logging(val_payload["loss"], prefix="val/loss"))
+        log_payload = filter_validation_wandb_logs(log_payload)
         sanitized_logs, skipped_logs = sanitize_log_dict(log_payload)
         if skipped_logs:
             print(f"[wandb:skip] validation_label={validation_label} keys={','.join(skipped_logs)}")
         if sanitized_logs:
             run.log(sanitized_logs, step=optimizer_step)
         if preview_images:
-            preview_log_payload: dict[str, Any] = {"val/comparison_panels": preview_images}
+            preview_log_payload: dict[str, Any] = {}
+            grouped_preview_images: dict[str, list[Any]] = defaultdict(list)
+            for item, image in zip(preview_items[: args.wandb_val_preview_max], preview_images):
+                grouped_preview_images[safe_wandb_key(item.get("source_name", "unknown"))].append(image)
+            for source_key, images in grouped_preview_images.items():
+                preview_log_payload[f"val_preview/{source_key}/comparison_panels"] = images
             if (
                 wandb is not None
                 and preview_contact_sheet is not None
@@ -3588,12 +4116,20 @@ def run_validation_cycle(
                     str(preview_contact_sheet),
                     caption=f"{validation_label} preview grid",
                 )
+            preview_log_payload = add_step_context(
+                preview_log_payload,
+                epoch=epoch,
+                optimizer_step=optimizer_step,
+                global_batch_step=global_batch_step,
+                learning_rate=learning_rate,
+            )
             run.log(preview_log_payload, step=optimizer_step)
 
     return val_payload, float(best_val_metric), int(best_epoch), improved
 
 
 def main() -> None:
+    print("[startup] imports_ready parse_args_start", flush=True)
     args = parse_args()
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3607,8 +4143,16 @@ def main() -> None:
     save_json(output_dir / "train_args.json", vars(args))
 
     set_seed(args.seed)
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
+    if args.torch_num_interop_threads > 0:
+        try:
+            torch.set_num_interop_threads(args.torch_num_interop_threads)
+        except RuntimeError as exc:
+            print(f"[system:warning] set_num_interop_threads_failed={type(exc).__name__}: {exc}")
     device = resolve_device(args)
     amp_dtype = resolve_amp_dtype(args)
+    gradient_scaler_enabled = device.startswith("cuda") and amp_dtype == torch.float16
     preflight_payload = run_preflight_checks(args, device)
     if args.preflight_only:
         return
@@ -3642,6 +4186,7 @@ def main() -> None:
         resume=args.wandb_resume_mode,
         dir_path=args.wandb_dir,
     )
+    configure_wandb_step_metrics(run)
 
     model_cfg = build_model_cfg(args)
     model = MaterialRefiner(model_cfg)
@@ -3670,6 +4215,9 @@ def main() -> None:
     runtime_info.update(
         {
             "amp_dtype": args.amp_dtype,
+            "gradient_scaler_enabled": gradient_scaler_enabled,
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
             "matmul_precision": args.matmul_precision,
             "allow_tf32": bool(args.allow_tf32),
             "optimizer": args.optimizer,
@@ -3698,7 +4246,11 @@ def main() -> None:
             min_lr=args.min_learning_rate,
         )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda"))
+    # BF16 has a wide exponent range and should not use loss scaling.  Leaving
+    # GradScaler enabled under BF16 produced non-finite grad-norm diagnostics in
+    # clean cold-start runs and made it hard to tell whether optimizer steps were
+    # actually effective.  Keep scaling for FP16 only.
+    scaler = torch.amp.GradScaler("cuda", enabled=gradient_scaler_enabled)
     history_path = output_dir / "history.json"
     history = json.loads(history_path.read_text()) if history_path.exists() else []
     state_path = output_dir / "train_state.json"
@@ -3779,6 +4331,13 @@ def main() -> None:
             if skipped:
                 print(f"[wandb:skip] epoch={epoch} dataset_keys={','.join(skipped)}")
             if run is not None and data_state_logs:
+                data_state_logs = add_step_context(
+                    data_state_logs,
+                    epoch=epoch,
+                    optimizer_step=optimizer_step,
+                    global_batch_step=global_batch_step,
+                    learning_rate=current_lr(optimizer),
+                )
                 run.log(data_state_logs, step=optimizer_step)
             if not startup_report_written:
                 assert train_dataset is not None and train_loader is not None
@@ -3892,6 +4451,12 @@ def main() -> None:
             ):
                 outputs = model(batch)
                 losses = compute_losses(outputs, batch, args)
+                if not torch.isfinite(losses["total"]).all():
+                    object_preview = ",".join(str(item) for item in batch.get("object_id", [])[:4])
+                    raise FloatingPointError(
+                        "nonfinite_training_loss:"
+                        f"epoch={epoch};batch_index={batch_index};objects={object_preview}"
+                    )
                 scaled_total = losses["total"] / args.grad_accumulation_steps
 
             scaler.scale(scaled_total).backward()
@@ -3918,6 +4483,13 @@ def main() -> None:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 last_grad_norm = float(grad_norm.detach().cpu().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+                if not math.isfinite(last_grad_norm):
+                    object_preview = ",".join(str(item) for item in batch.get("object_id", [])[:4])
+                    raise FloatingPointError(
+                        "nonfinite_gradient_norm:"
+                        f"epoch={epoch};batch_index={batch_index};optimizer_step={optimizer_step + 1};"
+                        f"objects={object_preview}"
+                    )
 
             scaler.step(optimizer)
             scaler.update()
@@ -3962,6 +4534,8 @@ def main() -> None:
                     "train/batches_per_log_window": interval_steps,
                     "train/samples_per_second": interval_examples / interval_seconds,
                     "train/seconds_per_batch": interval_seconds / max(interval_steps, 1),
+                    "throughput/samples_per_second": interval_examples / interval_seconds,
+                    "throughput/seconds_per_batch": interval_seconds / max(interval_steps, 1),
                     "progress/epoch_index": epoch,
                     "progress/epoch_total": args.epochs,
                     "progress/batch_step": batch_index,
@@ -3987,8 +4561,19 @@ def main() -> None:
                     "progress/val_records": val_records,
                     "progress/planned_samples": epoch_planned_samples,
                 }
+                interval_logs["trainer/global_step_total"] = interval_logs["progress/global_step_total"]
+                interval_logs["trainer/epoch_step"] = epoch_optimizer_step
+                interval_logs["trainer/epoch_steps_total"] = epoch_optimizer_steps_total
                 if interval_examples > 0:
                     interval_logs["train/effective_view_supervision_rate"] = interval["effective_view_supervision_samples"] / interval_examples
+                interval_logs = add_step_context(
+                    interval_logs,
+                    epoch=epoch,
+                    optimizer_step=optimizer_step,
+                    global_batch_step=global_batch_step,
+                    learning_rate=current_lr(optimizer),
+                    progress_fraction=session_progress,
+                )
                 if last_grad_norm is not None:
                     interval_logs["train/grad_norm"] = last_grad_norm
                 for key, value in interval.items():
@@ -4071,6 +4656,7 @@ def main() -> None:
                     output_dir=output_dir,
                     epoch=epoch,
                     optimizer_step=optimizer_step,
+                    global_batch_step=global_batch_step,
                     run=run,
                     scheduler=scheduler,
                     learning_rate=current_lr(optimizer),
@@ -4165,6 +4751,7 @@ def main() -> None:
                 output_dir=output_dir,
                 epoch=epoch,
                 optimizer_step=optimizer_step,
+                global_batch_step=global_batch_step,
                 run=run,
                 scheduler=scheduler,
                 learning_rate=current_lr(optimizer),

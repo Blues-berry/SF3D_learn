@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -124,15 +125,35 @@ def maybe_init_wandb(
         init_kwargs["resume"] = resume or "allow"
     if dir_path:
         init_kwargs["dir"] = str(Path(dir_path))
+    online_init_timeout = float(os.environ.get("WANDB_INIT_TIMEOUT", "180"))
+    offline_init_timeout = float(os.environ.get("WANDB_OFFLINE_INIT_TIMEOUT", "90"))
     if hasattr(wandb, "Settings"):
         init_kwargs["settings"] = wandb.Settings(
             start_method="thread",
-            init_timeout=20.0 if resolved_mode == "online" else 90.0,
-            x_service_wait=15.0 if resolved_mode == "online" else 30.0,
+            init_timeout=online_init_timeout if resolved_mode == "online" else offline_init_timeout,
+            x_service_wait=60.0 if resolved_mode == "online" else 30.0,
         )
+    attempts = 2 if resolved_mode == "online" else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return wandb.init(**init_kwargs)
+        except Exception as exc:
+            if resolved_mode != "online" or attempt >= attempts:
+                last_exc = exc
+                break
+            print(
+                json.dumps(
+                    {
+                        "wandb_init_retry": attempt,
+                        "wandb_init_failed": f"{type(exc).__name__}: {exc}",
+                        "wandb_init_timeout": online_init_timeout,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            time.sleep(5.0)
+    exc = last_exc
     try:
-        return wandb.init(**init_kwargs)
-    except Exception as exc:
         if resolved_mode == "online":
             print(
                 json.dumps(
@@ -147,11 +168,22 @@ def maybe_init_wandb(
             if hasattr(wandb, "Settings"):
                 init_kwargs["settings"] = wandb.Settings(
                     start_method="thread",
-                    init_timeout=30.0,
-                    x_service_wait=10.0,
+                    init_timeout=offline_init_timeout,
+                    x_service_wait=30.0,
                 )
             return wandb.init(**init_kwargs)
-        raise
+        raise exc
+    except Exception as fallback_exc:
+        print(
+            json.dumps(
+                {
+                    "wandb_disabled_after_init_failure": f"{type(fallback_exc).__name__}: {fallback_exc}",
+                    "wandb_requested_mode": resolved_mode,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return None
 
 
 def log_path_artifact(
