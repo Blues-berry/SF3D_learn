@@ -14,7 +14,7 @@ from PIL import Image
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare SF3D baseline material attributes against refined RM atlas outputs.",
+        description="Compare input prior material attributes against refined RM atlas outputs.",
     )
     parser.add_argument("--metrics-json", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -131,16 +131,16 @@ def save_plot(rows: list[dict[str, Any]], summary: dict[str, Any], output_path: 
     width = 0.36
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle("SF3D Baseline vs Material Refiner Attribute Comparison", fontsize=15)
+    fig.suptitle("Input Prior vs Material Refiner Attribute Comparison", fontsize=15)
 
-    axes[0, 0].bar(x - width / 2, [source_summary[label]["baseline_roughness_mean"] for label in labels], width, label="SF3D baseline")
+    axes[0, 0].bar(x - width / 2, [source_summary[label]["baseline_roughness_mean"] for label in labels], width, label="Input prior")
     axes[0, 0].bar(x + width / 2, [source_summary[label]["refined_roughness_mean"] for label in labels], width, label="Refined")
     axes[0, 0].set_title("Roughness Mean")
     axes[0, 0].set_xticks(x, labels, rotation=15, ha="right")
     axes[0, 0].set_ylim(0, 1)
     axes[0, 0].legend()
 
-    axes[0, 1].bar(x - width / 2, [source_summary[label]["baseline_metallic_mean"] for label in labels], width, label="SF3D baseline")
+    axes[0, 1].bar(x - width / 2, [source_summary[label]["baseline_metallic_mean"] for label in labels], width, label="Input prior")
     axes[0, 1].bar(x + width / 2, [source_summary[label]["refined_metallic_mean"] for label in labels], width, label="Refined")
     axes[0, 1].set_title("Metallic Mean")
     axes[0, 1].set_xticks(x, labels, rotation=15, ha="right")
@@ -160,8 +160,8 @@ def save_plot(rows: list[dict[str, Any]], summary: dict[str, Any], output_path: 
     axes[1, 1].scatter(rough_x, rough_y, label="roughness", alpha=0.72)
     axes[1, 1].scatter(metal_x, metal_y, label="metallic", alpha=0.72)
     axes[1, 1].plot([0, 1], [0, 1], color="black", linewidth=1, linestyle="--")
-    axes[1, 1].set_title("Per-Asset Baseline vs Refined Mean")
-    axes[1, 1].set_xlabel("SF3D baseline mean")
+    axes[1, 1].set_title("Per-Asset Input Prior vs Refined Mean")
+    axes[1, 1].set_xlabel("Input prior mean")
     axes[1, 1].set_ylabel("Refined mean")
     axes[1, 1].set_xlim(0, 1)
     axes[1, 1].set_ylim(0, 1)
@@ -179,7 +179,7 @@ def save_html(summary: dict[str, Any], plot_path: Path, output_path: Path) -> No
         "<style>body{font-family:Arial,sans-serif;background:#10151d;color:#edf2f7;margin:0;padding:24px}.wrap{max-width:1280px;margin:auto}.card{background:#18202b;border-radius:18px;padding:18px;margin:16px 0}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #334052;padding:8px;text-align:left}img{max-width:100%;border-radius:14px;background:white}</style>",
         "</head><body><div class='wrap'>",
         "<h1>Material Attribute Comparison</h1>",
-        "<p>Baseline means SF3D original roughness/metallic prior atlas. Refined means the material refiner output atlas.</p>",
+        "<p>Baseline means the input prior roughness/metallic atlas used by the refiner. It may come from SF3D, an external asset prior, a scalar broadcast prior, or a fallback/no-prior default depending on prior_source_type.</p>",
         f"<div class='card'><img src='{html.escape(plot_path.name)}' alt='attribute comparison'></div>",
         "<div class='card'><h2>By Source</h2><table><thead><tr><th>Group</th><th>Count</th><th>Baseline R</th><th>Refined R</th><th>|ΔR|</th><th>Baseline M</th><th>Refined M</th><th>|ΔM|</th></tr></thead><tbody>",
     ]
