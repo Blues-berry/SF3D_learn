@@ -29,6 +29,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--processes", type=int, default=8)
     parser.add_argument("--file-types", type=str, default="glb,gltf,obj,fbx")
     parser.add_argument(
+        "--priority-material-families",
+        type=str,
+        default="",
+        help="Comma-separated material families used as a deterministic tie-breaker during selection.",
+    )
+    parser.add_argument(
+        "--target-material-family-ratios",
+        type=str,
+        default="",
+        help="Comma-separated material quotas, for example glass_metal=0.30,ceramic_glazed_lacquer=0.30.",
+    )
+    parser.add_argument(
+        "--source-priority",
+        type=str,
+        default="",
+        help="Comma-separated source priority used as a tie-breaker, for example smithsonian,sketchfab.",
+    )
+    parser.add_argument(
         "--github-save-repo-format",
         choices=("files", "zip", "tar", "tar.gz"),
         default="files",
@@ -123,6 +141,33 @@ def material_class_from_row(row: pd.Series) -> tuple[str, str]:
     return material_class, "cached_metadata_keyword"
 
 
+def parse_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def parse_ratio_csv(value: str | None) -> dict[str, float]:
+    if not value:
+        return {}
+    ratios: dict[str, float] = {}
+    for item in str(value).split(","):
+        if not item.strip() or "=" not in item:
+            continue
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        try:
+            ratio = float(raw)
+        except ValueError:
+            continue
+        if ratio > 0.0:
+            ratios[key] = ratio
+    total = sum(ratios.values())
+    if total > 0.0:
+        ratios = {key: value / total for key, value in ratios.items()}
+    return ratios
+
+
 def load_filtered_rows(objaverse_root: Path, sources: list[str], file_types: set[str]) -> pd.DataFrame:
     frames = []
     for source in sources:
@@ -138,19 +183,81 @@ def load_filtered_rows(objaverse_root: Path, sources: list[str], file_types: set
     return pd.concat(frames, axis=0, ignore_index=True)
 
 
-def select_rows(frame: pd.DataFrame, target: int) -> pd.DataFrame:
+def select_rows(
+    frame: pd.DataFrame,
+    target: int,
+    *,
+    priority_material_families: list[str],
+    target_material_family_ratios: dict[str, float],
+    source_priority: list[str],
+) -> pd.DataFrame:
     if frame.empty:
         return frame
     rows = []
     for index, row in frame.iterrows():
         material_class, material_reason = material_class_from_row(row)
         rows.append((material_class, str(row["source"]), str(row["fileIdentifier"]), material_reason, index))
-    rows.sort(key=lambda item: (item[0] == "unknown_pending_second_pass", item[0], item[1], item[2]))
-    selected_indices = [item[4] for item in rows[:target]]
+    material_rank = {
+        material_family: rank
+        for rank, material_family in enumerate(priority_material_families)
+    }
+    source_rank = {source_name: rank for rank, source_name in enumerate(source_priority)}
+    rows.sort(
+        key=lambda item: (
+            item[0] == "unknown_pending_second_pass",
+            material_rank.get(item[0], len(material_rank)),
+            item[0],
+            source_rank.get(item[1], len(source_rank)),
+            item[1],
+            item[2],
+        )
+    )
+
+    if target_material_family_ratios:
+        grouped: dict[str, list[tuple[str, str, str, str, int]]] = {}
+        for row in rows:
+            grouped.setdefault(row[0], []).append(row)
+        raw_quotas = {
+            material_family: ratio * int(target)
+            for material_family, ratio in target_material_family_ratios.items()
+        }
+        quotas = {material_family: int(raw) for material_family, raw in raw_quotas.items()}
+        remainder = max(0, int(target) - sum(quotas.values()))
+        fractional = sorted(
+            raw_quotas.items(),
+            key=lambda pair: (
+                pair[1] - int(pair[1]),
+                -material_rank.get(pair[0], 999),
+            ),
+            reverse=True,
+        )
+        for material_family, _raw in fractional[:remainder]:
+            quotas[material_family] += 1
+        selected_indices = []
+        used_indices: set[int] = set()
+        for material_family in sorted(
+            target_material_family_ratios,
+            key=lambda family: material_rank.get(family, 999),
+        ):
+            take = min(quotas.get(material_family, 0), len(grouped.get(material_family, [])))
+            for item in grouped.get(material_family, [])[:take]:
+                selected_indices.append(item[4])
+                used_indices.add(item[4])
+        if len(selected_indices) < target:
+            for item in rows:
+                if item[4] in used_indices:
+                    continue
+                selected_indices.append(item[4])
+                used_indices.add(item[4])
+                if len(selected_indices) >= target:
+                    break
+    else:
+        selected_indices = [item[4] for item in rows[:target]]
+
     selected = frame.loc[selected_indices].copy()
     material_by_identifier = {
-        str(frame.loc[index, "fileIdentifier"]): (material_class, material_reason)
-        for material_class, _source, _identifier, material_reason, index in rows[:target]
+        str(frame.loc[index, "fileIdentifier"]): material_class_from_row(frame.loc[index])
+        for index in selected_indices
     }
     selected["highlight_material_class"] = [
         material_by_identifier[str(identifier)][0] for identifier in selected["fileIdentifier"]
@@ -223,7 +330,15 @@ def main() -> None:
     sources = [source.strip().lower() for source in args.sources.split(",") if source.strip()]
     file_types = {file_type.strip().lower() for file_type in args.file_types.split(",") if file_type.strip()}
     args.output_root.mkdir(parents=True, exist_ok=True)
-    selected = select_rows(load_filtered_rows(args.objaverse_root, sources, file_types), args.target)
+    priority_material_families = parse_csv(args.priority_material_families)
+    target_material_family_ratios = parse_ratio_csv(args.target_material_family_ratios)
+    selected = select_rows(
+        load_filtered_rows(args.objaverse_root, sources, file_types),
+        args.target,
+        priority_material_families=priority_material_families,
+        target_material_family_ratios=target_material_family_ratios,
+        source_priority=parse_csv(args.source_priority),
+    )
     selected_parquet = args.output_root / "objaverse_cached_selected.parquet"
     selected.to_parquet(selected_parquet)
 
@@ -232,6 +347,11 @@ def main() -> None:
         "sources": sources,
         "target": args.target,
         "selected_count": int(len(selected)),
+        "selection_policy": {
+            "priority_material_families": priority_material_families,
+            "target_material_family_ratios": target_material_family_ratios,
+            "source_priority": parse_csv(args.source_priority),
+        },
         "file_types": sorted(file_types),
         "source_counts": selected["source"].value_counts(dropna=False).to_dict() if not selected.empty else {},
         "license_counts": selected["license"].value_counts(dropna=False).to_dict() if not selected.empty else {},
@@ -288,6 +408,11 @@ def main() -> None:
         "generated_at_utc": utc_now(),
         "sources": sources,
         "target": args.target,
+        "selection_policy": {
+            "priority_material_families": priority_material_families,
+            "target_material_family_ratios": target_material_family_ratios,
+            "source_priority": parse_csv(args.source_priority),
+        },
         "selected_count": len(rows),
         "download_requested": args.download,
         "download_error": download_error,

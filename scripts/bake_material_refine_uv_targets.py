@@ -97,6 +97,7 @@ def save_gray_png(path: Path, values: np.ndarray) -> None:
 def confidence_summary(values: np.ndarray) -> dict[str, float]:
     nonzero = values > 1e-6
     high_conf = values >= 0.75
+    active_mean = float(values[nonzero].mean()) if bool(nonzero.any()) else 0.0
     return {
         "mean": float(values.mean()),
         "std": float(values.std()),
@@ -105,6 +106,7 @@ def confidence_summary(values: np.ndarray) -> dict[str, float]:
         "max": float(values.max()),
         "nonzero_rate": float(nonzero.mean()),
         "high_conf_rate": float(high_conf.mean()),
+        "active_mean": active_mean,
     }
 
 

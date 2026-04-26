@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from collections import Counter, defaultdict
@@ -63,6 +64,14 @@ MATERIAL_SPECIFIC_METRIC_NAMES = [
     "prior_residual_safety",
     "confidence_calibrated_error",
     "material_family_breakdown",
+]
+MODEL_CFG_OVERRIDE_KEYS = [
+    "enable_material_evidence_calibration",
+    "material_evidence_channels",
+    "material_evidence_strength",
+    "enable_evidence_update_budget",
+    "evidence_update_budget_strength",
+    "evidence_update_budget_floor",
 ]
 
 
@@ -1413,6 +1422,15 @@ def write_metric_disagreement_report(
     return json_path, html_path
 
 
+def build_model_cfg_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Merge audited eval-only model toggles into checkpoint configs."""
+    overrides: dict[str, Any] = {}
+    for key in MODEL_CFG_OVERRIDE_KEYS:
+        if hasattr(args, key):
+            overrides[key] = getattr(args, key)
+    return overrides
+
+
 def write_diagnostic_cases(
     output_dir: Path,
     rows: list[dict[str, Any]],
@@ -1513,6 +1531,8 @@ def main() -> None:
         json.dumps(make_json_serializable(vars(args)), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    if args.manifest.exists():
+        shutil.copy2(args.manifest, output_dir / "manifest_snapshot.json")
     if not args.checkpoint.exists():
         resolved_checkpoint = args.checkpoint.resolve(strict=False)
         raise SystemExit(
@@ -1529,6 +1549,7 @@ def main() -> None:
         args.checkpoint,
         device=device,
         cuda_device_index=args.cuda_device_index,
+        model_cfg_overrides=build_model_cfg_overrides(args),
     )
     dataset = build_dataset(args, pipeline.atlas_size, pipeline.buffer_resolution)
     loader = DataLoader(

@@ -45,13 +45,16 @@ class MaterialRefinementPipeline:
         *,
         device: str | None = None,
         cuda_device_index: int | None = None,
+        model_cfg_overrides: dict[str, Any] | None = None,
     ) -> "MaterialRefinementPipeline":
         checkpoint = torch.load(
             checkpoint_path,
             map_location="cpu",
             weights_only=False,
         )
-        cfg = checkpoint.get("model_cfg", {})
+        cfg = dict(checkpoint.get("model_cfg", {}))
+        if model_cfg_overrides:
+            cfg.update(model_cfg_overrides)
         model = MaterialRefiner(cfg)
         model.load_state_dict(checkpoint["model"], strict=True)
         runtime_device = _infer_device(cuda_device_index=cuda_device_index, fallback=device)

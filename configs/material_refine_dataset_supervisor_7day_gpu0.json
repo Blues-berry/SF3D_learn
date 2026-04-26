@@ -2,9 +2,16 @@
   "supervisor_version": "sf3d_material_refine_dataset_supervisor_7day_v1",
   "notes": [
     "Data-only supervisor: keeps download, render/preprocess, merge, audit, and validation loops alive for seven days.",
-    "GPU1 is intentionally kept free; all supervised render/preprocess sessions must target GPU0.",
-    "No training command is launched from this supervisor."
+    "GPU1 may be fully used by data-only render/preprocess sessions when this accelerates dataset readiness.",
+    "No training command is launched from this supervisor.",
+    "Storage policy: future heavy render/preprocess roots are supervised under /4T; active repo-output runs are not moved."
   ],
+  "storage_policy": {
+    "large_render_output_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
+    "large_aux_download_root": "/4T/CXY/sf3d_material_refine_aux_downloads",
+    "repo_output_role": "lightweight manifests, reports, audits, and compatibility indexes only",
+    "do_not_move_active_runs": true
+  },
   "duration_days": 7,
   "poll_seconds": 300,
   "session_name": "sf3d_material_refine_dataset_7day_supervisor",
@@ -26,15 +33,16 @@
   },
   "gpu_policy": {
     "render_gpu": 0,
-    "keep_gpu_indices_empty": [
-      1
-    ],
+    "keep_gpu_indices_empty": [],
+    "allow_gpu1_data_processes": true,
+    "max_gpu1_data_memory_mb": 32607,
     "warn_if_data_process_on_gpu1": true
   },
   "downloads": {
     "required_sessions": [
       "sf3d_factory_polyhaven_hdri",
       "sf3d_factory_objaverse_cached_increment",
+      "sf3d_factory_objaverse_cached_scarce_increment",
       "sf3d_factory_objaverse_github_lfs_increment",
       "sf3d_factory_objaverse_strict_full_retry",
       "sf3d_factory_polyhaven_material_bank"
@@ -42,6 +50,7 @@
   },
   "production_roots": {
     "patterns": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*",
       "output/material_refine_dataset_factory/longrun_gpu0_*"
     ],
     "latest_only": true,
@@ -54,12 +63,105 @@
       {
         "name": "scarce_material_topup",
         "patterns": [
-          "output/material_refine_dataset_factory/scarce_material_gpu0_*"
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_2*",
+          "output/material_refine_dataset_factory/scarce_material_gpu0_2*"
         ],
         "latest_only": true,
         "required_prefixes": [
           "sf3d_scarce_material_refine_shard",
           "sf3d_scarce_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_fast_unlock_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_fast_unlock_*",
+          "output/material_refine_dataset_factory/scarce_material_gpu0_fast_unlock_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_fast_unlock_material_refine_shard",
+          "sf3d_scarce_fast_unlock_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_limited_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_limited_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_full_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_full_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_extra_topup",
+        "enabled": false,
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_extra_material_refine_shard",
+          "sf3d_scarce_gpu1_extra_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_safe_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_safe_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_ceramic_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_[0-9]*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_ceramic_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_ceramic_retry_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_retry_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_ceramic_retry_material_refine_merged_monitor"
+        ],
+        "merge_output_name": "canonical_manifest_supervisor_merged.json"
+      },
+      {
+        "name": "scarce_gpu1_glossy_topup",
+        "patterns": [
+          "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*"
+        ],
+        "latest_only": true,
+        "required_prefixes": [
+          "sf3d_scarce_gpu1_glossy_material_refine_merged_monitor"
         ],
         "merge_output_name": "canonical_manifest_supervisor_merged.json"
       },

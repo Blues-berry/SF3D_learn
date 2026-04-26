@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob as globlib
 import json
 import os
 import shlex
@@ -16,6 +17,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "material_refine_dataset_factory_gpu0.json"
 DEFAULT_STATE = REPO_ROOT / "output" / "material_refine_dataset_factory" / "factory_state.json"
 PYTHON_BIN = Path("/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python")
+
+
+def repo_path(value: str | Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def path_for_env(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def glob_paths(pattern: str) -> list[Path]:
+    if not pattern:
+        return []
+    if Path(pattern).is_absolute():
+        return sorted(Path(match) for match in globlib.glob(pattern, recursive=True))
+    return sorted(REPO_ROOT.glob(pattern))
 
 
 def parse_args() -> argparse.Namespace:
@@ -270,7 +291,7 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
                 **start_retry_session(
                     session=session,
                     command=[str(item) for item in source["command"]],
-                    output_root=REPO_ROOT / str(source["output_root"]),
+                    output_root=repo_path(source["output_root"]),
                     retry_seconds=int(source.get("retry_seconds", 900)),
                     timeout_seconds=int(source.get("timeout_seconds", 0)),
                     proxy_probe_url=source.get("proxy_probe_url") or config.get("download_network", {}).get("default_probe_url"),
@@ -310,7 +331,7 @@ def start_downloads(config: dict[str, Any], *, dry_run: bool) -> list[dict[str, 
 def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
     longrun = config["longrun"]
     cleanup_orphan_monitor(config, dry_run=dry_run)
-    output_root = REPO_ROOT / "output" / "material_refine_dataset_factory" / (
+    output_root = longrun_output_base(config) / (
         "longrun_gpu0_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     )
     env = os.environ.copy()
@@ -343,7 +364,7 @@ def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "REFRESH_PARTIAL_EVERY": str(longrun["refresh_partial_every"]),
             "START_MERGED_MONITOR": "1",
             "MERGED_MONITOR_POLL_SECONDS": str(longrun.get("merged_monitor_poll_seconds", 120)),
-            "OUTPUT_ROOT": str(output_root.relative_to(REPO_ROOT)),
+            "OUTPUT_ROOT": path_for_env(output_root),
             "HDRI_SELECTION_OFFSET": str(next_hdri_offset(config)),
         }
     )
@@ -376,26 +397,42 @@ def next_hdri_offset(config: dict[str, Any]) -> int:
     longrun = config["longrun"]
     start = int(longrun.get("hdri_selection_offset_start", 0))
     step = int(longrun.get("hdri_selection_offset_step", 200))
-    existing = sorted((REPO_ROOT / "output" / "material_refine_dataset_factory").glob("longrun_gpu0_*"))
+    roots = {
+        REPO_ROOT / "output" / "material_refine_dataset_factory",
+        longrun_output_base(config),
+    }
+    existing: list[Path] = []
+    for root in roots:
+        existing.extend(sorted(root.glob("longrun_gpu0_*")))
     return start + step * len(existing)
+
+
+def longrun_output_base(config: dict[str, Any]) -> Path:
+    longrun = config["longrun"]
+    raw = (
+        longrun.get("output_base_root")
+        or config.get("storage_policy", {}).get("large_render_output_root")
+        or "output/material_refine_dataset_factory"
+    )
+    return repo_path(raw)
 
 
 def resolve_input_manifests(config: dict[str, Any]) -> list[str]:
     longrun = config["longrun"]
     paths: list[Path] = []
     for value in longrun.get("input_manifests", []):
-        path = REPO_ROOT / str(value)
+        path = repo_path(value)
         if path.exists():
             paths.append(path)
     for pattern in longrun.get("input_manifest_globs", []):
-        paths.extend(sorted(REPO_ROOT.glob(str(pattern))))
+        paths.extend(glob_paths(str(pattern)))
     seen: set[str] = set()
     resolved: list[str] = []
     for path in paths:
         key = str(path.resolve())
         if key not in seen:
             seen.add(key)
-            resolved.append(str(path.relative_to(REPO_ROOT)))
+            resolved.append(path_for_env(path))
     return resolved
 
 
@@ -405,8 +442,8 @@ def canonicalize_download_manifests(config: dict[str, Any], *, dry_run: bool) ->
         if not bool(item.get("enabled", True)):
             actions.append({"name": item.get("name"), "action": "disabled"})
             continue
-        input_json = REPO_ROOT / str(item["input_json"])
-        output_root = REPO_ROOT / str(item["output_root"])
+        input_json = repo_path(item["input_json"])
+        output_root = repo_path(item["output_root"])
         output_json = output_root / "material_refine_manifest_objaverse_increment.json"
         if not input_json.exists():
             actions.append({"name": item.get("name"), "action": "missing_input", "input_json": str(input_json)})
@@ -443,13 +480,13 @@ def resolve_promotion_input_manifests(config: dict[str, Any]) -> list[Path]:
     promotion = config.get("promotion", {})
     paths: list[Path] = []
     for value in promotion.get("input_manifests", []):
-        path = REPO_ROOT / str(value)
+        path = repo_path(value)
         if path.exists():
             paths.append(path)
     for pattern in promotion.get("input_manifest_globs", []):
-        paths.extend(sorted(REPO_ROOT.glob(str(pattern))))
+        paths.extend(glob_paths(str(pattern)))
 
-    output_manifest = REPO_ROOT / str(
+    output_manifest = repo_path(
         promotion.get(
             "output_manifest",
             "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
@@ -485,19 +522,19 @@ def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "action": "no_input_manifests",
             "min_input_records": min_records,
         }
-    output_manifest = REPO_ROOT / str(
+    output_manifest = repo_path(
         promotion.get(
             "output_manifest",
             "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
         )
     )
-    report_json = REPO_ROOT / str(
+    report_json = repo_path(
         promotion.get("report_json", output_manifest.with_suffix(".promotion_report.json"))
     )
-    report_md = REPO_ROOT / str(
+    report_md = repo_path(
         promotion.get("report_md", output_manifest.with_suffix(".promotion_report.md"))
     )
-    report_html = REPO_ROOT / str(
+    report_html = repo_path(
         promotion.get("report_html", output_manifest.with_suffix(".promotion_report.html"))
     )
     newest_input_mtime = max(path.stat().st_mtime for path in manifests)
@@ -506,6 +543,16 @@ def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "action": "up_to_date",
             "output_manifest": str(output_manifest),
             "input_manifests": [str(path) for path in manifests],
+        }
+    min_input_age_seconds = float(promotion.get("min_input_mtime_age_seconds", 0.0))
+    newest_input_age_seconds = max(0.0, time.time() - newest_input_mtime)
+    if min_input_age_seconds > 0.0 and newest_input_age_seconds < min_input_age_seconds:
+        return {
+            "action": "input_manifest_still_updating",
+            "output_manifest": str(output_manifest),
+            "input_manifests": [str(path) for path in manifests],
+            "newest_input_age_seconds": round(newest_input_age_seconds, 1),
+            "min_input_mtime_age_seconds": min_input_age_seconds,
         }
 
     command = [
@@ -560,6 +607,187 @@ def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
     }
 
 
+def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    stage1_v3 = config.get("stage1_v3", {})
+    if not bool(stage1_v3.get("enabled", False)):
+        return {"action": "disabled"}
+    input_manifest = repo_path(
+        stage1_v3.get(
+            "input_manifest",
+            config.get("promotion", {}).get(
+                "output_manifest",
+                "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+            ),
+        )
+    )
+    if not input_manifest.exists():
+        return {"action": "missing_input_manifest", "input_manifest": str(input_manifest)}
+    min_records = int(stage1_v3.get("min_input_records", 128))
+    record_count = manifest_record_count(input_manifest)
+    if record_count < min_records:
+        return {
+            "action": "input_manifest_below_min_records",
+            "input_manifest": str(input_manifest),
+            "records": record_count,
+            "min_records": min_records,
+        }
+
+    output_root = repo_path(
+        stage1_v3.get("output_root", "output/material_refine_paper/stage1_v3_dataset_latest")
+    )
+    report_json = output_root / "stage1_v3_dataset_audit.json"
+    if report_json.exists() and report_json.stat().st_mtime >= input_manifest.stat().st_mtime:
+        return {
+            "action": "up_to_date",
+            "input_manifest": str(input_manifest),
+            "output_root": str(output_root),
+            "report_json": str(report_json),
+        }
+
+    command = [
+        str(PYTHON_BIN),
+        "scripts/build_material_refine_stage1_v3_subsets.py",
+        "--manifest",
+        str(input_manifest),
+        "--output-root",
+        str(output_root),
+        "--target-records",
+        str(stage1_v3.get("target_records", 900)),
+        "--min-paper-eligible",
+        str(stage1_v3.get("min_paper_eligible", 800)),
+        "--min-material-family-records",
+        str(stage1_v3.get("min_material_family_records", 64)),
+        "--max-material-family-ratio",
+        str(stage1_v3.get("max_material_family_ratio", 0.40)),
+        "--min-no-prior-records",
+        str(stage1_v3.get("min_no_prior_records", 100)),
+        "--min-secondary-source-records",
+        str(stage1_v3.get("min_secondary_source_records", 100)),
+        "--min-confidence-mean",
+        str(stage1_v3.get("min_confidence_mean", 0.70)),
+        "--target-confidence-mean",
+        str(stage1_v3.get("target_confidence_mean", 0.75)),
+        "--min-confidence-nonzero-rate",
+        str(stage1_v3.get("min_confidence_nonzero_rate", 0.50)),
+        "--min-target-coverage",
+        str(stage1_v3.get("min_target_coverage", 0.50)),
+        "--identity-like-threshold",
+        str(stage1_v3.get("identity_like_threshold", 0.999)),
+        "--min-valid-view-count",
+        str(stage1_v3.get("min_valid_view_count", 1)),
+        "--max-diagnostic-records",
+        str(stage1_v3.get("max_diagnostic_records", 1024)),
+        "--max-ood-records",
+        str(stage1_v3.get("max_ood_records", 512)),
+        "--diagnostic-min-per-material-family",
+        str(stage1_v3.get("diagnostic_min_per_material_family", 32)),
+        "--ood-min-per-material-family",
+        str(stage1_v3.get("ood_min_per_material_family", 24)),
+        "--paper-license-buckets",
+        str(stage1_v3.get("paper_license_buckets", config.get("promotion", {}).get("allowed_license_buckets", ""))),
+        "--material-quotas",
+        str(stage1_v3.get("material_quotas", "")),
+        "--main-train-source-names",
+        str(stage1_v3.get("main_train_source_names", "ABO_locked_core,3D-FUTURE_highlight_local_8k")),
+        "--train-ratio",
+        str(stage1_v3.get("train_ratio", 0.70)),
+        "--val-ratio",
+        str(stage1_v3.get("val_ratio", 0.12)),
+        "--iid-test-ratio",
+        str(stage1_v3.get("iid_test_ratio", 0.10)),
+        "--material-holdout-ratio",
+        str(stage1_v3.get("material_holdout_ratio", 0.08)),
+    ]
+    if bool(stage1_v3.get("fill_deficits", False)):
+        command.append("--fill-deficits")
+    else:
+        command.append("--no-fill-deficits")
+    if dry_run:
+        return {
+            "action": "dry_run_stage1_v3_build",
+            "input_manifest": str(input_manifest),
+            "output_root": str(output_root),
+            "command": command,
+        }
+    result = run_capture(command)
+    return {
+        "action": "stage1_v3_built" if result.returncode == 0 else "stage1_v3_failed",
+        "input_manifest": str(input_manifest),
+        "output_root": str(output_root),
+        "report_json": str(report_json),
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-80:],
+    }
+
+
+def analyze_hdri_usage(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    hdri_usage = config.get("hdri_usage", {})
+    if not bool(hdri_usage.get("enabled", False)):
+        return {"action": "disabled"}
+    hdri_bank = repo_path(
+        hdri_usage.get("hdri_bank", "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri_bank.json")
+    )
+    if not hdri_bank.exists():
+        return {"action": "missing_hdri_bank", "hdri_bank": str(hdri_bank)}
+    output_root = repo_path(
+        hdri_usage.get("output_root", "output/material_refine_paper/hdri_usage_latest")
+    )
+    output_json = output_root / "hdri_usage_report.json"
+    output_md = output_root / "hdri_usage_report.md"
+    output_html = output_root / "hdri_usage_report.html"
+    manifest_paths: list[Path] = []
+    for value in hdri_usage.get("manifests", []):
+        path = repo_path(value)
+        if path.exists():
+            manifest_paths.append(path)
+    for pattern in hdri_usage.get("manifest_globs", []):
+        manifest_paths.extend(glob_paths(str(pattern)))
+    seen: set[str] = set()
+    manifests: list[Path] = []
+    for path in manifest_paths:
+        key = str(path.resolve())
+        if key in seen or not path.exists() or not path.is_file():
+            continue
+        seen.add(key)
+        manifests.append(path)
+    if not manifests:
+        return {"action": "no_manifests"}
+    newest_input_mtime = max([hdri_bank.stat().st_mtime, *(path.stat().st_mtime for path in manifests)])
+    if output_json.exists() and output_json.stat().st_mtime >= newest_input_mtime:
+        return {
+            "action": "up_to_date",
+            "output_json": str(output_json),
+            "manifests": [str(path) for path in manifests],
+        }
+    command = [
+        str(PYTHON_BIN),
+        "scripts/analyze_material_refine_hdri_usage.py",
+        "--hdri-bank",
+        str(hdri_bank),
+        "--output-json",
+        str(output_json),
+        "--output-md",
+        str(output_md),
+        "--output-html",
+        str(output_html),
+        "--min-bank-records",
+        str(hdri_usage.get("min_bank_records", 900)),
+        "--min-used-hdri-assets",
+        str(hdri_usage.get("min_used_hdri_assets", 256)),
+    ]
+    for manifest in manifests:
+        command.extend(["--manifest", str(manifest)])
+    if dry_run:
+        return {"action": "dry_run_hdri_usage", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "hdri_usage_analyzed" if result.returncode == 0 else "hdri_usage_failed",
+        "output_json": str(output_json),
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-60:],
+    }
+
+
 def manifest_record_count(path: Path) -> int:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -572,7 +800,7 @@ def manifest_record_count(path: Path) -> int:
 def newest_manifest_candidate(config: dict[str, Any]) -> Path | None:
     min_records = int(config.get("quality", {}).get("min_manifest_records_for_audit", 1))
     promotion = config.get("promotion", {})
-    promotion_output = REPO_ROOT / str(promotion.get("output_manifest", ""))
+    promotion_output = repo_path(str(promotion.get("output_manifest", "")))
     if bool(promotion.get("prefer_for_audit", True)) and promotion_output.exists():
         if manifest_record_count(promotion_output) >= min_records:
             return promotion_output
@@ -588,7 +816,7 @@ def newest_manifest_candidate(config: dict[str, Any]) -> Path | None:
     for pattern in patterns:
         if not pattern:
             continue
-        paths.extend(REPO_ROOT.glob(pattern))
+        paths.extend(glob_paths(pattern))
     paths = [
         path
         for path in paths
@@ -607,7 +835,7 @@ def audit_newest(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "reason": "no_factory_manifest_with_min_records",
             "min_records": int(config.get("quality", {}).get("min_manifest_records_for_audit", 1)),
         }
-    out_root = REPO_ROOT / str(config["quality"].get("quality_output_root", "output/material_refine_dataset_factory/quality"))
+    out_root = repo_path(config["quality"].get("quality_output_root", "output/material_refine_dataset_factory/quality"))
     out_dir = out_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     command = [
         str(PYTHON_BIN),
@@ -663,6 +891,8 @@ def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]
         state["actions"].append({"downloads": start_downloads(config, dry_run=args.dry_run)})
         state["actions"].append({"canonicalize_downloads": canonicalize_download_manifests(config, dry_run=args.dry_run)})
         state["actions"].append({"promotion": promote_targets(config, dry_run=args.dry_run)})
+        state["actions"].append({"stage1_v3": build_stage1_v3_subsets(config, dry_run=args.dry_run)})
+        state["actions"].append({"hdri_usage": analyze_hdri_usage(config, dry_run=args.dry_run)})
     if args.start_render:
         launch, reason = should_launch_render(config, force=args.force_render)
         if launch:

@@ -2,12 +2,21 @@
   "factory_version": "sf3d_material_refine_dataset_factory_v1",
   "notes": [
     "Continuous dataset expansion plan for SF3D material-refine data only; no training is launched here.",
-    "GPU policy keeps GPU1 free and schedules render/preprocess work on GPU0.",
-    "Pool-A paper promotion remains gated by license/import/target-quality audits; auxiliary and benchmark pools are explicitly marked."
+    "GPU policy allows data-only render/preprocess work to fully use GPU1 when needed; no training is launched here.",
+    "Pool-A paper promotion remains gated by license/import/target-quality audits; auxiliary and benchmark pools are explicitly marked.",
+    "Storage policy: future heavy render/preprocess outputs go to /4T; repo output keeps lightweight reports/manifests."
   ],
+  "storage_policy": {
+    "large_render_output_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
+    "large_aux_download_root": "/4T/CXY/sf3d_material_refine_aux_downloads",
+    "repo_output_role": "lightweight manifests, reports, audits, and compatibility indexes only",
+    "do_not_move_active_runs": true
+  },
   "gpu_policy": {
     "render_gpu_list": "0",
-    "keep_gpu_indices_empty": ["1"],
+    "keep_gpu_indices_empty": [],
+    "allow_gpu1_data_processes": true,
+    "max_gpu1_data_memory_mb": 32607,
     "max_gpu0_used_mb_for_new_launch": 4096,
     "poll_seconds": 300
   },
@@ -108,14 +117,15 @@
     }
   ],
   "material_quota": {
-    "metal_dominant": 0.30,
-    "ceramic_glazed_lacquer": 0.20,
-    "glass_metal": 0.15,
-    "mixed_thin_boundary": 0.20,
-    "glossy_non_metal": 0.15
+    "metal_dominant": 0.15,
+    "ceramic_glazed_lacquer": 0.25,
+    "glass_metal": 0.25,
+    "mixed_thin_boundary": 0.25,
+    "glossy_non_metal": 0.10
   },
   "longrun": {
     "session_prefix": "sf3d_longrun_material_refine",
+    "output_base_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
     "input_manifests": [
       "output/highlight_pool_a_8k/material_refine_manifest_pool_a_8k.json",
       "output/highlight_pool_a_8k/objaverse_cached_increment/objaverse_cached_increment_manifest.json",
@@ -123,12 +133,13 @@
     ],
     "input_manifest_globs": [
       "output/material_refine_aux_downloads/objaverse_cached_factory_canonical/material_refine_manifest_objaverse_increment.json",
+      "output/material_refine_aux_downloads/objaverse_cached_scarce_factory_canonical/material_refine_manifest_objaverse_increment.json",
       "output/material_refine_aux_downloads/objaverse_strict_factory_canonical/material_refine_manifest_objaverse_increment.json",
       "output/material_refine_aux_downloads/objaverse_strict*/canonical/material_refine_manifest_objaverse_increment.json"
     ],
     "paper_main_sources": "ABO_locked_core",
     "auxiliary_sources": "",
-    "priority_material_families": "metal_dominant,glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal",
+    "priority_material_families": "glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal,metal_dominant",
     "paper_frontload_records": 256,
     "prefer_paper_main_first": false,
     "interleave_selection_keys": "material_family,source_name,has_material_prior",
@@ -199,6 +210,42 @@
         "6000",
         "--processes",
         "12",
+        "--download"
+      ]
+    },
+    {
+      "name": "objaverse_cached_scarce_material_increment",
+      "enabled": true,
+      "session": "sf3d_factory_objaverse_cached_scarce_increment",
+      "output_root": "output/material_refine_aux_downloads/objaverse_cached_scarce_factory",
+      "retry_seconds": 900,
+      "timeout_seconds": 5400,
+      "stall_seconds": 7200,
+      "progress_paths": [
+        "output/material_refine_aux_downloads/objaverse_cached_scarce_factory/objaverse_cached_increment_manifest.json",
+        "output/material_refine_aux_downloads/objaverse_cached_scarce_factory/objaverse_cached_selected.parquet",
+        "output/highlight_pool_a_8k/aux_sources/hf-objaverse-v1"
+      ],
+      "proxy_probe_url": "https://huggingface.co/",
+      "command": [
+        "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
+        "scripts/stage_objaverse_cached_increment.py",
+        "--objaverse-root",
+        "output/highlight_pool_a_8k/aux_sources/objaverse_xl",
+        "--output-root",
+        "output/material_refine_aux_downloads/objaverse_cached_scarce_factory",
+        "--sources",
+        "sketchfab,smithsonian",
+        "--target",
+        "4000",
+        "--processes",
+        "12",
+        "--priority-material-families",
+        "glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,glossy_non_metal,metal_dominant",
+        "--target-material-family-ratios",
+        "glass_metal=0.30,mixed_thin_boundary=0.25,ceramic_glazed_lacquer=0.30,glossy_non_metal=0.10,metal_dominant=0.05",
+        "--source-priority",
+        "smithsonian,sketchfab",
         "--download"
       ]
     },
@@ -296,6 +343,12 @@
       "output_root": "output/material_refine_aux_downloads/objaverse_cached_factory_canonical"
     },
     {
+      "name": "objaverse_cached_scarce_factory_to_canonical",
+      "enabled": true,
+      "input_json": "output/material_refine_aux_downloads/objaverse_cached_scarce_factory/objaverse_cached_increment_manifest.json",
+      "output_root": "output/material_refine_aux_downloads/objaverse_cached_scarce_factory_canonical"
+    },
+    {
       "name": "objaverse_github_lfs_factory_to_canonical",
       "enabled": true,
       "input_json": "output/material_refine_aux_downloads/objaverse_github_lfs_factory/objaverse_cached_increment_manifest.json",
@@ -309,10 +362,26 @@
     }
   ],
   "promotion": {
-    "enabled": true,
+    "enabled": false,
     "prefer_for_audit": true,
     "min_input_records": 8,
     "input_manifest_globs": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_monitor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_monitor_merged.json",
       "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
       "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
       "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
@@ -326,6 +395,7 @@
     "report_json": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.json",
     "report_md": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.md",
     "report_html": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.html",
+    "min_input_mtime_age_seconds": 600,
     "allowed_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
     "promotable_source_names": "ABO_locked_core,3D-FUTURE_highlight_local_8k,Objaverse-XL_strict_filtered_increment",
     "promote_auxiliary_to_paper_main": true,
@@ -336,6 +406,63 @@
     "max_target_prior_identity": 0.95,
     "min_valid_view_count": 1,
     "min_strict_complete_view_rate": 0.80
+  },
+  "stage1_v3": {
+    "enabled": true,
+    "input_manifest": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+    "output_root": "output/material_refine_paper/stage1_v3_dataset_latest",
+    "min_input_records": 128,
+    "target_records": 900,
+    "min_paper_eligible": 800,
+    "min_material_family_records": 64,
+    "max_material_family_ratio": 0.40,
+    "min_no_prior_records": 100,
+    "min_secondary_source_records": 100,
+    "min_confidence_mean": 0.70,
+    "target_confidence_mean": 0.75,
+    "min_confidence_nonzero_rate": 0.50,
+    "min_target_coverage": 0.50,
+    "identity_like_threshold": 0.999,
+    "min_valid_view_count": 1,
+    "max_diagnostic_records": 1024,
+    "max_ood_records": 512,
+    "diagnostic_min_per_material_family": 32,
+    "ood_min_per_material_family": 24,
+    "paper_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
+    "material_quotas": "metal_dominant:0.30,ceramic_glazed_lacquer:0.20,glass_metal:0.15,mixed_thin_boundary:0.20,glossy_non_metal:0.15",
+    "main_train_source_names": "ABO_locked_core,3D-FUTURE_highlight_local_8k",
+    "train_ratio": 0.70,
+    "val_ratio": 0.12,
+    "iid_test_ratio": 0.10,
+    "material_holdout_ratio": 0.08,
+    "fill_deficits": false
+  },
+  "hdri_usage": {
+    "enabled": true,
+    "hdri_bank": "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri_bank.json",
+    "output_root": "output/material_refine_paper/hdri_usage_latest",
+    "min_bank_records": 900,
+    "min_used_hdri_assets": 256,
+    "manifests": [
+      "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_strict_paper_candidates.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_balanced_paper_manifest.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_diagnostic_manifest.json",
+      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_ood_eval_manifest.json"
+    ],
+    "manifest_globs": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_limited_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_full_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_extra_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_safe_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_ceramic_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/scarce_material_gpu1_glossy_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/scarce_material_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/paper_unlock_gpu0_*/canonical_manifest_supervisor_merged.json"
+    ]
   },
   "quality": {
     "min_paper_eligible": 128,

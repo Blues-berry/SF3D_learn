@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob as globlib
 import json
 import os
 import re
@@ -17,6 +18,19 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "material_refine_dataset_supervisor_7day_gpu0.json"
+
+
+def repo_path(value: str | Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def glob_paths(pattern: str) -> list[Path]:
+    if not pattern:
+        return []
+    if Path(pattern).is_absolute():
+        return sorted(Path(match) for match in globlib.glob(pattern, recursive=True))
+    return sorted(REPO_ROOT.glob(pattern))
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,21 +192,53 @@ def process_command(pid: int) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def data_processes_on_gpu1() -> list[dict[str, Any]]:
-    offenders: list[dict[str, Any]] = []
+def data_processes_on_gpu(gpu_index: int) -> list[dict[str, Any]]:
+    processes: list[dict[str, Any]] = []
     for row in gpu_process_rows():
-        if row.get("gpu") != 1:
+        if row.get("gpu") != gpu_index:
             continue
         cmd = process_command(int(row["pid"]))
         if any(token in cmd for token in ("stable-fast-3d", "prepare_material_refine_dataset", "abo_material_passes_blender")):
-            offenders.append(dict(row, full_command=cmd))
-    return offenders
+            processes.append(dict(row, full_command=cmd))
+    return processes
+
+
+def data_processes_on_gpu1() -> list[dict[str, Any]]:
+    return data_processes_on_gpu(1)
+
+
+def gpu1_data_policy_offenders(config: dict[str, Any], gpu_snapshot: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    policy = config.get("gpu_policy", {})
+    gpu1_processes = data_processes_on_gpu1()
+    if not gpu1_processes:
+        return []
+    allow_limited = bool(policy.get("allow_gpu1_data_processes", False))
+    if not allow_limited:
+        return [
+            {
+                "reason": "gpu1_data_processes_not_allowed",
+                "processes": gpu1_processes,
+            }
+        ]
+    limit_mb = int(policy.get("max_gpu1_data_memory_mb", 0) or 0)
+    gpu1_rows = [row for row in gpu_snapshot if int(row.get("index", -1)) == 1]
+    used_mb = int(gpu1_rows[0].get("memory_used_mb", 0)) if gpu1_rows else 0
+    if limit_mb > 0 and used_mb > limit_mb:
+        return [
+            {
+                "reason": "gpu1_memory_above_limit",
+                "memory_used_mb": used_mb,
+                "limit_mb": limit_mb,
+                "processes": gpu1_processes,
+            }
+        ]
+    return []
 
 
 def discover_latest_roots(patterns: list[str], *, latest_only: bool) -> list[Path]:
     roots: list[Path] = []
     for pattern in patterns:
-        roots.extend(path for path in REPO_ROOT.glob(pattern) if path.is_dir())
+        roots.extend(path for path in glob_paths(pattern) if path.is_dir())
     roots = sorted(set(roots), key=lambda path: path.stat().st_mtime)
     if latest_only and roots:
         return [roots[-1]]
@@ -200,7 +246,7 @@ def discover_latest_roots(patterns: list[str], *, latest_only: bool) -> list[Pat
 
 
 def discover_latest_root(pattern: str) -> Path | None:
-    roots = sorted((path for path in REPO_ROOT.glob(pattern) if path.is_dir()), key=lambda path: path.stat().st_mtime)
+    roots = sorted((path for path in glob_paths(pattern) if path.is_dir()), key=lambda path: path.stat().st_mtime)
     return roots[-1] if roots else None
 
 
@@ -527,14 +573,14 @@ def ensure_factory(config: dict[str, Any], *, sessions: set[str], python_bin: Pa
     session = str(factory["session"])
     if session_exists(session, sessions):
         return {"session": session, "action": "already_running"}
-    run_script = REPO_ROOT / str(factory["run_script"])
-    log_path = REPO_ROOT / str(factory["log"])
-    state_json = REPO_ROOT / str(factory["state_json"])
+    run_script = repo_path(factory["run_script"])
+    log_path = repo_path(factory["log"])
+    state_json = repo_path(factory["state_json"])
     command_items: list[str | Path] = [
         python_bin,
         "scripts/run_material_refine_dataset_factory.py",
         "--config",
-        REPO_ROOT / str(factory["config"]),
+        repo_path(factory["config"]),
         *[str(flag) for flag in factory.get("loop_flags", [])],
         "--state-json",
         state_json,
@@ -557,7 +603,7 @@ def ensure_factory(config: dict[str, Any], *, sessions: set[str], python_bin: Pa
 
 def read_factory_config(config: dict[str, Any]) -> dict[str, Any]:
     factory = config.get("factory", {})
-    path = REPO_ROOT / str(factory.get("config", ""))
+    path = repo_path(factory.get("config", ""))
     if not path.exists():
         return {}
     try:
@@ -648,7 +694,7 @@ def newest_progress_mtime(paths: list[Path]) -> float:
 
 def restart_download_session(source: dict[str, Any], *, reason: str, sessions: set[str], dry_run: bool) -> dict[str, Any]:
     session = str(source.get("session") or "")
-    output_root = REPO_ROOT / str(source.get("output_root") or "")
+    output_root = repo_path(source.get("output_root") or "")
     run_script = output_root / "logs" / f"{session}.run.sh"
     log_path = output_root / "logs" / f"{session}.log"
     actions: list[dict[str, Any]] = []
@@ -678,7 +724,7 @@ def ensure_download_health(config: dict[str, Any], *, sessions: set[str], dry_ru
         if not bool(source.get("enabled", True)):
             continue
         session = str(source.get("session") or "")
-        output_root = REPO_ROOT / str(source.get("output_root") or "")
+        output_root = repo_path(source.get("output_root") or "")
         log_path = output_root / "logs" / f"{session}.log"
         process_rows = source_process_rows(source)
         stopped = [row for row in process_rows if "T" in str(row.get("stat") or "")]
@@ -711,7 +757,7 @@ def ensure_download_health(config: dict[str, Any], *, sessions: set[str], dry_ru
         if stall_seconds <= 0 or not session or session not in sessions:
             actions.append({"session": session, "action": "healthy_or_unwatched"})
             continue
-        progress_paths = [REPO_ROOT / str(path) for path in source.get("progress_paths", [])]
+        progress_paths = [repo_path(path) for path in source.get("progress_paths", [])]
         newest = max(
             newest_progress_mtime(progress_paths),
             log_path.stat().st_mtime if log_path.exists() else 0.0,
@@ -887,16 +933,16 @@ def scan_recent_errors(config: dict[str, Any], output_root: Path) -> dict[str, A
     log_roots.append(output_root)
     factory = config.get("factory", {})
     if factory.get("log"):
-        log_roots.append(REPO_ROOT / str(factory["log"]))
+        log_roots.append(repo_path(factory["log"]))
     if factory.get("config"):
-        factory_config_path = REPO_ROOT / str(factory["config"])
+        factory_config_path = repo_path(factory["config"])
         if factory_config_path.exists():
             try:
                 factory_config = json.loads(factory_config_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 factory_config = {}
             for item in factory_config.get("downloads", []):
-                output_dir = REPO_ROOT / str(item.get("output_root", ""))
+                output_dir = repo_path(item.get("output_root", ""))
                 session = str(item.get("session") or "")
                 if session:
                     log_roots.append(output_dir / "logs" / f"{session}.log")
@@ -1007,7 +1053,7 @@ def supervise_once(
     deadline: datetime,
     dry_run: bool,
 ) -> dict[str, Any]:
-    output_root = REPO_ROOT / str(config.get("output_root", "output/material_refine_dataset_factory/supervisor_7day"))
+    output_root = repo_path(config.get("output_root", "output/material_refine_dataset_factory/supervisor_7day"))
     python_bin = Path(str(config.get("python_bin", "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python")))
     sessions = set(tmux_sessions())
     actions: dict[str, Any] = {}
@@ -1094,6 +1140,7 @@ def supervise_once(
             )
     actions["quality"] = quality_actions
     recent_errors = scan_recent_errors(config, output_root)
+    gpu_snapshot = gpu_rows()
 
     status = {
         "updated_at_utc": utc_now(),
@@ -1102,8 +1149,9 @@ def supervise_once(
         "seconds_remaining": max(0, int((deadline - utc_now_dt()).total_seconds())),
         "dry_run": dry_run,
         "config": str((REPO_ROOT / str(DEFAULT_CONFIG)).resolve()),
-        "gpu": gpu_rows(),
-        "gpu1_data_process_offenders": data_processes_on_gpu1()
+        "gpu": gpu_snapshot,
+        "gpu1_data_processes": data_processes_on_gpu1(),
+        "gpu1_data_process_offenders": gpu1_data_policy_offenders(config, gpu_snapshot)
         if bool(config.get("gpu_policy", {}).get("warn_if_data_process_on_gpu1", True))
         else [],
         "tmux_sessions": tmux_sessions(),

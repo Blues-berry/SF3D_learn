@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-mode", choices=["auto", "online", "offline", "disabled"], default=None)
     parser.add_argument("--dry-run", type=parse_bool, default=False)
     parser.add_argument("--continue-on-error", type=parse_bool, default=False)
+    parser.add_argument("--stream-logs", type=parse_bool, default=True)
     return parser.parse_args()
 
 
@@ -131,26 +133,47 @@ def run_variant(
     log_path = logs_dir / f"{variant_name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = time.time()
-    with log_path.open("w", encoding="utf-8") as handle:
-        process = subprocess.run(
-            cmd,
-            cwd=REPO_ROOT,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    if args.stream_logs:
+        with log_path.open("w", encoding="utf-8") as handle:
+            process = subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                handle.write(line)
+                handle.flush()
+                print(f"[{variant_name}] {line}", end="", flush=True)
+            returncode = process.wait()
+    else:
+        with log_path.open("w", encoding="utf-8") as handle:
+            process = subprocess.run(
+                cmd,
+                cwd=REPO_ROOT,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                env=env,
+            )
+        returncode = process.returncode
     result.update(
         {
-            "returncode": process.returncode,
+            "returncode": int(returncode),
             "log_path": str(log_path),
             "elapsed_seconds": time.time() - started_at,
             "best_checkpoint": str(output_dir / "best.pt"),
             "latest_checkpoint": str(output_dir / "latest.pt"),
         }
     )
-    if process.returncode != 0 and not args.continue_on_error:
-        raise RuntimeError(f"round9_ablation_failed:{variant_name}:returncode={process.returncode}:log={log_path}")
+    if returncode != 0 and not args.continue_on_error:
+        raise RuntimeError(f"round9_ablation_failed:{variant_name}:returncode={returncode}:log={log_path}")
     return result
 
 

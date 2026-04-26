@@ -229,15 +229,24 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--enable-boundary-safety-module", type=parse_bool, default=False)
     parser.add_argument("--boundary-safety-strength", type=float, default=0.35)
     parser.add_argument("--boundary-residual-suppression-strength", type=float, default=0.0)
+    parser.add_argument("--view-uncertainty-residual-suppression-strength", type=float, default=0.0)
+    parser.add_argument("--bleed-risk-residual-suppression-strength", type=float, default=0.0)
     parser.add_argument("--enable-material-topology-reasoning", type=parse_bool, default=False)
     parser.add_argument("--topology-feature-channels", type=int, default=16)
     parser.add_argument("--topology-patch-size", type=int, default=16)
     parser.add_argument("--topology-layers", type=int, default=2)
     parser.add_argument("--topology-heads", type=int, default=2)
+    parser.add_argument("--topology-residual-suppression-strength", type=float, default=0.0)
     parser.add_argument("--enable-confidence-gated-trunk", type=parse_bool, default=False)
     parser.add_argument("--uncertainty-gate-strength", type=float, default=0.25)
     parser.add_argument("--enable-inverse-material-check", type=parse_bool, default=False)
     parser.add_argument("--inverse-check-strength", type=float, default=0.25)
+    parser.add_argument("--enable-material-evidence-calibration", type=parse_bool, default=False)
+    parser.add_argument("--material-evidence-channels", type=int, default=16)
+    parser.add_argument("--material-evidence-strength", type=float, default=0.75)
+    parser.add_argument("--enable-evidence-update-budget", type=parse_bool, default=False)
+    parser.add_argument("--evidence-update-budget-strength", type=float, default=0.70)
+    parser.add_argument("--evidence-update-budget-floor", type=float, default=0.04)
     parser.add_argument("--cuda-device-index", type=int, default=1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--amp-dtype", choices=["bfloat16", "float16"], default="bfloat16")
@@ -332,6 +341,11 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--save-preview-contact-sheet", type=parse_bool, default=False)
     parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
+    parser.add_argument("--validation-selection-metric", choices=["uv_total", "uv_render_guarded"], default="uv_render_guarded")
+    parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
+    parser.add_argument("--selection-psnr-penalty", type=float, default=0.25)
+    parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--init-from-checkpoint",
@@ -490,6 +504,16 @@ def parse_args() -> argparse.Namespace:
     args.topology_heads = max(int(args.topology_heads), 1)
     args.uncertainty_gate_strength = max(0.0, min(1.0, float(args.uncertainty_gate_strength)))
     args.inverse_check_strength = max(0.0, min(1.0, float(args.inverse_check_strength)))
+    args.material_evidence_channels = max(int(args.material_evidence_channels), 8)
+    args.material_evidence_strength = max(0.0, min(1.0, float(args.material_evidence_strength)))
+    args.evidence_update_budget_strength = max(
+        0.0,
+        min(1.0, float(args.evidence_update_budget_strength)),
+    )
+    args.evidence_update_budget_floor = max(
+        0.0,
+        min(0.5, float(args.evidence_update_budget_floor)),
+    )
     args.save_every = max(int(args.save_every), 1)
     args.prior_dropout_prob = max(0.0, min(1.0, float(args.prior_dropout_prob)))
     if args.prior_dropout_start_prob is not None:
@@ -822,6 +846,58 @@ def compute_losses(
     residual_delta_abs = (
         residual_delta.abs().mean() if residual_delta is not None else refined.new_zeros(())
     )
+    view_uncertainty_gate = outputs.get("view_uncertainty_residual_gate_uv")
+    bleed_risk_gate = outputs.get("bleed_risk_residual_gate_uv")
+    topology_residual_gate = outputs.get("topology_residual_gate_uv")
+    render_support_gate = outputs.get("render_support_gate")
+    inverse_material_gate = outputs.get("inverse_material_gate_uv")
+    residual_channel_gate = outputs.get("residual_channel_gate_uv")
+    roughness_safety_gate = outputs.get("roughness_safety_gate_uv")
+    metallic_safety_gate = outputs.get("metallic_safety_gate_uv")
+    metallic_evidence = outputs.get("metallic_evidence_uv")
+    metallic_cap_strength = outputs.get("metallic_cap_strength_uv")
+    evidence_update_budget = outputs.get("evidence_update_budget_uv")
+    evidence_update_support = outputs.get("evidence_update_support_uv")
+    view_uncertainty_gate_mean = (
+        view_uncertainty_gate.mean() if view_uncertainty_gate is not None else refined.new_ones(())
+    )
+    bleed_risk_gate_mean = (
+        bleed_risk_gate.mean() if bleed_risk_gate is not None else refined.new_ones(())
+    )
+    topology_residual_gate_mean = (
+        topology_residual_gate.mean() if topology_residual_gate is not None else refined.new_ones(())
+    )
+    render_support_gate_mean = (
+        render_support_gate.mean() if render_support_gate is not None else refined.new_ones(())
+    )
+    inverse_material_gate_mean = (
+        inverse_material_gate.mean() if inverse_material_gate is not None else refined.new_ones(())
+    )
+    residual_channel_gate_mean = (
+        residual_channel_gate.mean() if residual_channel_gate is not None else refined.new_ones(())
+    )
+    roughness_safety_gate_mean = (
+        roughness_safety_gate.mean() if roughness_safety_gate is not None else refined.new_ones(())
+    )
+    metallic_safety_gate_mean = (
+        metallic_safety_gate.mean() if metallic_safety_gate is not None else refined.new_ones(())
+    )
+    metallic_evidence_mean = (
+        metallic_evidence.mean() if metallic_evidence is not None else refined.new_zeros(())
+    )
+    metallic_cap_strength_mean = (
+        metallic_cap_strength.mean() if metallic_cap_strength is not None else refined.new_zeros(())
+    )
+    evidence_update_budget_mean = (
+        evidence_update_budget.mean()
+        if evidence_update_budget is not None
+        else refined.new_ones(())
+    )
+    evidence_update_support_mean = (
+        evidence_update_support.mean()
+        if evidence_update_support is not None
+        else refined.new_ones(())
+    )
 
     if (
         args.view_consistency_mode != "disabled"
@@ -867,6 +943,18 @@ def compute_losses(
         "residual_safety": residual_safety.detach(),
         "residual_gate_mean": residual_gate_mean.detach(),
         "residual_delta_abs": residual_delta_abs.detach(),
+        "view_uncertainty_gate_mean": view_uncertainty_gate_mean.detach(),
+        "bleed_risk_gate_mean": bleed_risk_gate_mean.detach(),
+        "topology_residual_gate_mean": topology_residual_gate_mean.detach(),
+        "render_support_gate_mean": render_support_gate_mean.detach(),
+        "inverse_material_gate_mean": inverse_material_gate_mean.detach(),
+        "residual_channel_gate_mean": residual_channel_gate_mean.detach(),
+        "roughness_safety_gate_mean": roughness_safety_gate_mean.detach(),
+        "metallic_safety_gate_mean": metallic_safety_gate_mean.detach(),
+        "metallic_evidence_mean": metallic_evidence_mean.detach(),
+        "metallic_cap_strength_mean": metallic_cap_strength_mean.detach(),
+        "evidence_update_budget_mean": evidence_update_budget_mean.detach(),
+        "evidence_update_support_mean": evidence_update_support_mean.detach(),
     }
 
 
@@ -1159,15 +1247,30 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         "boundary_residual_suppression_strength": float(
             args.boundary_residual_suppression_strength
         ),
+        "view_uncertainty_residual_suppression_strength": float(
+            args.view_uncertainty_residual_suppression_strength
+        ),
+        "bleed_risk_residual_suppression_strength": float(
+            args.bleed_risk_residual_suppression_strength
+        ),
         "enable_material_topology_reasoning": bool(args.enable_material_topology_reasoning),
         "topology_feature_channels": int(args.topology_feature_channels),
         "topology_patch_size": int(args.topology_patch_size),
         "topology_layers": int(args.topology_layers),
         "topology_heads": int(args.topology_heads),
+        "topology_residual_suppression_strength": float(
+            args.topology_residual_suppression_strength
+        ),
         "enable_confidence_gated_trunk": bool(args.enable_confidence_gated_trunk),
         "uncertainty_gate_strength": float(args.uncertainty_gate_strength),
         "enable_inverse_material_check": bool(args.enable_inverse_material_check),
         "inverse_check_strength": float(args.inverse_check_strength),
+        "enable_material_evidence_calibration": bool(args.enable_material_evidence_calibration),
+        "material_evidence_channels": int(args.material_evidence_channels),
+        "material_evidence_strength": float(args.material_evidence_strength),
+        "enable_evidence_update_budget": bool(args.enable_evidence_update_budget),
+        "evidence_update_budget_strength": float(args.evidence_update_budget_strength),
+        "evidence_update_budget_floor": float(args.evidence_update_budget_floor),
     }
 
 
@@ -2009,7 +2112,16 @@ def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any
             "boundary_residual_suppression_strength": float(
                 args.boundary_residual_suppression_strength
             ),
+            "view_uncertainty_residual_suppression_strength": float(
+                args.view_uncertainty_residual_suppression_strength
+            ),
+            "bleed_risk_residual_suppression_strength": float(
+                args.bleed_risk_residual_suppression_strength
+            ),
             "enable_material_topology_reasoning": bool(args.enable_material_topology_reasoning),
+            "topology_residual_suppression_strength": float(
+                args.topology_residual_suppression_strength
+            ),
             "enable_confidence_gated_trunk": bool(args.enable_confidence_gated_trunk),
             "enable_inverse_material_check": bool(args.enable_inverse_material_check),
         },
@@ -2090,6 +2202,14 @@ def print_train_interval(payload: dict[str, Any], device: str) -> None:
         f"metal_cls={format_metric(payload.get('train/metallic_classification'))} "
         f"mat_ctx={format_metric(payload.get('train/material_context'))} "
         f"res_safe={format_metric(payload.get('train/residual_safety'))} "
+        f"gate={format_metric(payload.get('train/residual_gate_mean'))} "
+        f"view_gate={format_metric(payload.get('train/view_uncertainty_gate_mean'))} "
+        f"bleed_gate={format_metric(payload.get('train/bleed_risk_gate_mean'))} "
+        f"topo_gate={format_metric(payload.get('train/topology_residual_gate_mean'))} "
+        f"metal_gate={format_metric(payload.get('train/metallic_safety_gate_mean'))} "
+        f"metal_ev={format_metric(payload.get('train/metallic_evidence_mean'))} "
+        f"metal_cap={format_metric(payload.get('train/metallic_cap_strength_mean'))} "
+        f"ev_budget={format_metric(payload.get('train/evidence_update_budget_mean'))} "
         f"grad={format_metric(grad)} "
         f"view_sup_rate={format_metric(view_rate, 4) if view_rate is not None else 'n/a'} "
         f"samples_s={format_metric(payload.get('train/samples_per_second'), 3)} "
@@ -2201,6 +2321,7 @@ def print_epoch_summary(
 ) -> None:
     val_payload = epoch_payload.get("val") or {}
     val_mae = (val_payload.get("uv_mae") or {}).get("total")
+    selection_metric = (val_payload.get("selection_metric") or {}).get("selection_metric")
     train_payload = epoch_payload.get("train") or {}
     checkpoint_label = str(checkpoint_path) if checkpoint_path is not None else "not_saved"
     print(
@@ -2208,8 +2329,9 @@ def print_epoch_summary(
         f"{epoch_payload.get('epoch')}/{args.epochs} step={epoch_payload.get('optimizer_step')} "
         f"train_total={format_metric(train_payload.get('total'))} "
         f"val_uv_total={format_metric(val_mae)} "
+        f"val_select={format_metric(selection_metric)} "
         f"epoch_time={format_duration(train_payload.get('epoch_seconds'))} "
-        f"best={format_metric(best_val_metric)} best_epoch={best_epoch} "
+        f"best_select={format_metric(best_val_metric)} best_epoch={best_epoch} "
         f"improved={epoch_improved} checkpoint={checkpoint_label}"
     )
 
@@ -2839,6 +2961,18 @@ def evaluate(
         "residual_safety": 0.0,
         "residual_gate_mean": 0.0,
         "residual_delta_abs": 0.0,
+        "view_uncertainty_gate_mean": 0.0,
+        "bleed_risk_gate_mean": 0.0,
+        "topology_residual_gate_mean": 0.0,
+        "render_support_gate_mean": 0.0,
+        "inverse_material_gate_mean": 0.0,
+        "residual_channel_gate_mean": 0.0,
+        "roughness_safety_gate_mean": 0.0,
+        "metallic_safety_gate_mean": 0.0,
+        "metallic_evidence_mean": 0.0,
+        "metallic_cap_strength_mean": 0.0,
+        "evidence_update_budget_mean": 0.0,
+        "evidence_update_support_mean": 0.0,
     }
     uv_mae = {"roughness": 0.0, "metallic": 0.0, "total": 0.0, "count": 0.0}
     baseline_uv_mae = {"roughness": 0.0, "metallic": 0.0, "total": 0.0}
@@ -3063,6 +3197,40 @@ def save_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
         json.dumps(make_json_serializable(payload), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def compute_validation_selection_metric(
+    val_payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[float, dict[str, float]]:
+    uv_total = float((val_payload.get("uv_mae") or {}).get("total", 0.0) or 0.0)
+    if args.validation_selection_metric == "uv_total":
+        return uv_total, {"uv_total": uv_total, "selection_metric": uv_total}
+
+    render_proxy = val_payload.get("render_proxy_validation") or {}
+    residual_diag = val_payload.get("residual_gate_diagnostics") or {}
+    view_penalty = 0.0
+    psnr_penalty = 0.0
+    if bool(render_proxy.get("available")):
+        view_penalty = max(0.0, -float(render_proxy.get("view_rm_mae_delta", 0.0) or 0.0))
+        psnr_penalty = max(0.0, -float(render_proxy.get("proxy_rm_psnr_delta", 0.0) or 0.0))
+    regression_penalty = max(
+        0.0,
+        float(residual_diag.get("regression_rate", 0.0) or 0.0),
+    )
+    selection_metric = (
+        uv_total
+        + float(args.selection_view_rm_penalty) * view_penalty
+        + float(args.selection_psnr_penalty) * psnr_penalty
+        + float(args.selection_residual_regression_penalty) * regression_penalty
+    )
+    return selection_metric, {
+        "uv_total": uv_total,
+        "view_penalty": view_penalty,
+        "psnr_penalty": psnr_penalty,
+        "regression_penalty": regression_penalty,
+        "selection_metric": selection_metric,
+    }
 
 
 def load_compatible_model_state(
@@ -3291,9 +3459,13 @@ def run_validation_cycle(
         epoch=epoch,
         validation_label=validation_label,
     )
+    monitored_metric, selection_components = compute_validation_selection_metric(val_payload, args)
+    val_payload["selection_metric"] = {
+        "mode": str(args.validation_selection_metric),
+        **selection_components,
+    }
     save_json(output_dir / "validation" / f"{validation_label}.json", val_payload)
 
-    monitored_metric = float(val_payload["uv_mae"]["total"])
     if scheduler is not None and optimizer_step > args.warmup_steps:
         scheduler.step(monitored_metric)
 
@@ -3315,6 +3487,8 @@ def run_validation_cycle(
         f"roughness={format_metric(val_payload['uv_mae']['roughness'])} "
         f"metallic={format_metric(val_payload['uv_mae']['metallic'])} "
         f"proxy_view_delta={format_metric((val_payload.get('render_proxy_validation') or {}).get('view_rm_mae_delta'))} "
+        f"select={format_metric(monitored_metric)} "
+        f"select_mode={args.validation_selection_metric} "
         f"res_change={format_metric((val_payload.get('residual_gate_diagnostics') or {}).get('changed_pixel_rate'), 4)} "
         f"res_reg={format_metric((val_payload.get('residual_gate_diagnostics') or {}).get('regression_rate'), 4)} "
         f"best={format_metric(best_val_metric)} best_epoch={best_epoch} improved={improved}"
@@ -3351,8 +3525,10 @@ def run_validation_cycle(
             "epoch": epoch,
             "optimizer_step": optimizer_step,
             "lr": learning_rate,
-            "best/val_uv_total_mae": best_val_metric,
+            "best/selection_metric": best_val_metric,
             "best/epoch": best_epoch,
+            "best/selection_mode": str(args.validation_selection_metric),
+            "val/selection_metric": monitored_metric,
             "val/uv_total_mae": val_payload["uv_mae"]["total"],
             "val/uv_roughness_mae": val_payload["uv_mae"]["roughness"],
             "val/uv_metallic_mae": val_payload["uv_mae"]["metallic"],
@@ -3367,6 +3543,8 @@ def run_validation_cycle(
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
             "val/view_consistency_enabled": bool(val_payload.get("view_consistency_enabled", False)),
         }
+        if args.validation_selection_metric == "uv_total":
+            log_payload["best/val_uv_total_mae"] = best_val_metric
         render_proxy = val_payload.get("render_proxy_validation") or {}
         if bool(render_proxy.get("enabled")):
             log_payload.update(
@@ -3379,6 +3557,8 @@ def run_validation_cycle(
                     "val/render_proxy/rm_psnr_delta": render_proxy.get("proxy_rm_psnr_delta"),
                 }
             )
+        for key, value in selection_components.items():
+            log_payload[f"val/selection/{key}"] = value
         residual_diag = val_payload.get("residual_gate_diagnostics") or {}
         log_payload.update(
             {
@@ -3696,6 +3876,8 @@ def main() -> None:
         epoch_start_time = time.perf_counter()
         interval_start_time = epoch_start_time
         last_grad_norm: float | None = None
+        epoch_had_validation = False
+        epoch_validation_improved = False
 
         for batch_index, batch in enumerate(train_loader, start=1):
             global_batch_step += 1
@@ -3873,6 +4055,7 @@ def main() -> None:
                 validation_label = f"step_{optimizer_step:06d}"
 
             if validation_label is not None:
+                epoch_had_validation = True
                 clear_progress_bar(progress_bar)
                 (
                     step_val_payload,
@@ -3897,7 +4080,9 @@ def main() -> None:
                     validation_label=validation_label,
                 )
                 refresh_progress_bar(progress_bar)
-                stale_epochs = 0 if step_improved else stale_epochs + 1
+                epoch_validation_improved = epoch_validation_improved or step_improved
+                if args.early_stopping_scope == "validation_event":
+                    stale_epochs = 0 if step_improved else stale_epochs + 1
 
             should_save_step_checkpoint = (
                 args.checkpointing_steps > 0
@@ -3923,6 +4108,9 @@ def main() -> None:
                         "val_uv_total_mae": None
                         if step_val_payload is None
                         else step_val_payload["uv_mae"]["total"],
+                        "val_selection_metric": None
+                        if step_val_payload is None
+                        else (step_val_payload.get("selection_metric") or {}).get("selection_metric"),
                     },
                     checkpoint_label=f"step_{optimizer_step:06d}",
                 )
@@ -3962,6 +4150,7 @@ def main() -> None:
             and args.validation_steps <= 0
             and epoch % args.eval_every == 0
         ):
+            epoch_had_validation = True
             (
                 val_payload,
                 best_val_metric,
@@ -3985,12 +4174,22 @@ def main() -> None:
                 validation_label=f"epoch_{epoch:03d}",
             )
             epoch_payload["val"] = val_payload
-            if epoch_improved:
-                stale_epochs = 0
-            else:
-                stale_epochs += 1
+            epoch_validation_improved = epoch_validation_improved or epoch_improved
+            if args.early_stopping_scope == "validation_event":
+                if epoch_improved:
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
         elif scheduler is not None and optimizer_step > args.warmup_steps:
             scheduler.step(train_metrics["total"])
+
+        if (
+            val_loader is not None
+            and epoch_had_validation
+            and args.early_stopping_scope == "epoch"
+        ):
+            stale_epochs = 0 if epoch_validation_improved else stale_epochs + 1
+            epoch_improved = epoch_validation_improved
 
         history.append(epoch_payload)
         save_json(history_path, history)
@@ -4003,10 +4202,17 @@ def main() -> None:
         checkpoint_metrics = {
             "train_total": train_metrics["total"],
             "val_uv_total_mae": None if val_payload is None else val_payload["uv_mae"]["total"],
+            "val_selection_metric": None
+            if val_payload is None
+            else (val_payload.get("selection_metric") or {}).get("selection_metric"),
         }
         checkpoint_path = None
         should_save_epoch = epoch % args.save_every == 0 and not args.save_only_best_checkpoint
-        should_save_best_epoch = epoch_improved and args.validation_steps <= 0
+        should_save_best_epoch = (
+            epoch_improved
+            and args.validation_steps <= 0
+            and args.validation_progress_milestones <= 0
+        )
         if should_save_epoch or should_save_best_epoch:
             checkpoint_path = save_checkpoint(
                 output_dir,

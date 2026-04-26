@@ -48,6 +48,8 @@ DEFAULT_MAX_TARGET_PRIOR_IDENTITY_RATE_FOR_PAPER = 0.30
 DEFAULT_MIN_NONTRIVIAL_TARGET_COUNT_FOR_PAPER = 128
 DEFAULT_MIN_TARGET_CONFIDENCE_MEAN_FOR_PAPER = 0.70
 DEFAULT_MIN_TARGET_CONFIDENCE_NONZERO_RATE_FOR_PAPER = 0.50
+DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_MEAN_FOR_PAPER = 0.88
+DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_COVERAGE_FOR_PAPER = 0.70
 NEAR_COPY_TARGET_PRIOR_IDENTITY_THRESHOLD = 0.95
 AUDIT_SCHEMA_VERSION = "material_refine_quality_v2"
 
@@ -126,6 +128,7 @@ def confidence_summary_from_path(path: Path | None) -> dict[str, float]:
     arr = np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
     nonzero = arr > 1e-6
     high_conf = arr >= 0.75
+    active_mean = float(arr[nonzero].mean()) if bool(nonzero.any()) else 0.0
     return {
         "mean": float(arr.mean()),
         "std": float(arr.std()),
@@ -134,6 +137,7 @@ def confidence_summary_from_path(path: Path | None) -> dict[str, float]:
         "max": float(arr.max()),
         "nonzero_rate": float(nonzero.mean()),
         "high_conf_rate": float(high_conf.mean()),
+        "active_mean": active_mean,
     }
 
 
@@ -166,6 +170,30 @@ def parse_confidence_summary(value: Any) -> dict[str, float]:
             return {}
         return parse_confidence_summary(parsed)
     return {}
+
+
+def confidence_active_mean(confidence_summary: dict[str, float]) -> float:
+    if "active_mean" in confidence_summary:
+        return float(confidence_summary.get("active_mean") or 0.0)
+    mean = float(confidence_summary.get("mean", 0.0) or 0.0)
+    nonzero_rate = float(confidence_summary.get("nonzero_rate", 0.0) or 0.0)
+    if nonzero_rate <= 1e-6:
+        return 0.0
+    return float(mean / nonzero_rate)
+
+
+def confidence_passes_paper_gate(confidence_summary: dict[str, float]) -> bool:
+    confidence_mean = float(confidence_summary.get("mean", 0.0) or 0.0)
+    nonzero_rate = float(confidence_summary.get("nonzero_rate", 0.0) or 0.0)
+    if (
+        confidence_mean >= DEFAULT_MIN_TARGET_CONFIDENCE_MEAN_FOR_PAPER
+        and nonzero_rate >= DEFAULT_MIN_TARGET_CONFIDENCE_NONZERO_RATE_FOR_PAPER
+    ):
+        return True
+    return (
+        confidence_active_mean(confidence_summary) >= DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_MEAN_FOR_PAPER
+        and nonzero_rate >= DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_COVERAGE_FOR_PAPER
+    )
 
 
 def load_view_field_sources(buffer_root: Path | None) -> dict[str, dict[str, str]]:
@@ -276,17 +304,11 @@ def infer_target_quality_tier(
     confidence_mean = float(confidence_summary.get("mean", 0.0))
     nonzero_rate = float(confidence_summary.get("nonzero_rate", 0.0))
     if target_source_type == "gt_render_baked":
-        if (
-            confidence_mean >= DEFAULT_MIN_TARGET_CONFIDENCE_MEAN_FOR_PAPER
-            and nonzero_rate >= DEFAULT_MIN_TARGET_CONFIDENCE_NONZERO_RATE_FOR_PAPER
-        ):
+        if confidence_passes_paper_gate(confidence_summary):
             return "paper_strong"
         return "research_only"
     if target_source_type in {"pseudo_from_multiview", "pseudo_from_material_bank"}:
-        if (
-            confidence_mean >= DEFAULT_MIN_TARGET_CONFIDENCE_MEAN_FOR_PAPER
-            and nonzero_rate >= DEFAULT_MIN_TARGET_CONFIDENCE_NONZERO_RATE_FOR_PAPER
-        ):
+        if confidence_passes_paper_gate(confidence_summary):
             return "paper_pseudo"
         if confidence_mean > 0.0 and nonzero_rate > 0.0:
             return "research_only"

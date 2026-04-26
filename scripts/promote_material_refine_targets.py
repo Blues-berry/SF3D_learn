@@ -15,7 +15,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sf3d.material_refine.manifest_quality import audit_record, summarize_audit_rows
+from sf3d.material_refine.manifest_quality import (
+    DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_COVERAGE_FOR_PAPER,
+    DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_MEAN_FOR_PAPER,
+    audit_record,
+    confidence_active_mean,
+    summarize_audit_rows,
+)
 
 
 PROMOTION_VERSION = "material_refine_target_promotion_v1"
@@ -181,12 +187,24 @@ def promotion_blockers(
         blockers.append(f"blocked_target_source:{target_source_type}")
     if target_quality_tier not in PAPER_TIERS:
         blockers.append(f"non_paper_target_tier:{target_quality_tier}")
-    if float(row.get("target_confidence_mean") or 0.0) < float(min_confidence_mean):
-        blockers.append(f"low_confidence_mean:{float(row.get('target_confidence_mean') or 0.0):.3f}")
-    if float(row.get("target_confidence_nonzero_rate") or 0.0) < float(min_confidence_nonzero_rate):
-        blockers.append(
-            f"low_confidence_nonzero_rate:{float(row.get('target_confidence_nonzero_rate') or 0.0):.3f}"
-        )
+    confidence_summary = row.get("target_confidence_summary") if isinstance(row.get("target_confidence_summary"), dict) else {}
+    confidence_mean = float(row.get("target_confidence_mean") or confidence_summary.get("mean", 0.0) or 0.0)
+    nonzero_rate = float(
+        row.get("target_confidence_nonzero_rate") or confidence_summary.get("nonzero_rate", 0.0) or 0.0
+    )
+    active_mean = confidence_active_mean(confidence_summary)
+    confidence_mean_pass = confidence_mean >= float(min_confidence_mean) and nonzero_rate >= float(min_confidence_nonzero_rate)
+    active_confidence_pass = (
+        active_mean >= DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_MEAN_FOR_PAPER
+        and nonzero_rate >= DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_COVERAGE_FOR_PAPER
+    )
+    if not (confidence_mean_pass or active_confidence_pass):
+        if confidence_mean < float(min_confidence_mean):
+            blockers.append(f"low_confidence_mean:{confidence_mean:.3f}:active_mean={active_mean:.3f}")
+        if nonzero_rate < float(min_confidence_nonzero_rate):
+            blockers.append(f"low_confidence_nonzero_rate:{nonzero_rate:.3f}")
+        elif nonzero_rate < DEFAULT_MIN_TARGET_CONFIDENCE_ACTIVE_COVERAGE_FOR_PAPER:
+            blockers.append(f"active_confidence_coverage_low:{nonzero_rate:.3f}")
     if float(row.get("target_coverage") or 0.0) < float(min_target_coverage):
         blockers.append(f"low_target_coverage:{float(row.get('target_coverage') or 0.0):.3f}")
     target_prior_identity = row.get("target_prior_identity")

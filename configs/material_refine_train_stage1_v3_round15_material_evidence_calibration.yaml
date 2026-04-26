@@ -1,0 +1,23 @@
+# Round15 method override: material-evidence calibrated R module.
+#
+# Use with:
+#   --config configs/material_refine_train_stage1_v3_round14_backbone_topology_render.yaml
+#   --config configs/material_refine_train_stage1_v3_round15_material_evidence_calibration.yaml
+#
+# This keeps the Round14 data/training protocol fixed and only swaps in the
+# new architecture guard that targets no-prior metallic false positives and
+# UV-vs-render disagreement.
+
+enable_material_evidence_calibration: true
+material_evidence_channels: 16
+material_evidence_strength: 0.75
+
+# Do not allow best-checkpoint selection to skip the render proxy guard.
+render_proxy_validation_milestone_interval: 1
+
+init_from_checkpoint: output/material_refine_paper/stage1_v3_round14_backbone_topology_render/best.pt
+freeze_val_manifest_to: stage1_v3_round15_material_evidence_calibration_frozen_val_manifest.json
+output_dir: output/material_refine_paper/stage1_v3_round15_material_evidence_calibration
+tracker_run_name: material-refine-stage1-v3-round15-material-evidence-calibration
+tracker_tags: material-refine,stage1-v3,round15,material-evidence-calibration,channelwise-residual-safety,no-paper-claim
+seed: 20260424

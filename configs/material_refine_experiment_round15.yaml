@@ -1,0 +1,47 @@
+# Project-level experiment spec for Round15.
+#
+# Preferred future entry:
+#   python scripts/run_material_refine_experiment.py \
+#     --spec configs/material_refine_experiment_round15.yaml \
+#     --launch-tmux
+
+experiment_name: stage1_v3_round15_material_evidence_calibration
+tmux_session: sf3d_round15_material_evidence
+python_bin: /home/ubuntu/ssd_work/conda_envs/sf3d/bin/python
+run_root: output/material_refine_paper/stage1_v3_round15_material_evidence_calibration
+
+env:
+  PYTHONUNBUFFERED: "1"
+  WANDB__SERVICE_WAIT: "120"
+  OMP_NUM_THREADS: "8"
+  MKL_NUM_THREADS: "8"
+
+train:
+  enabled: true
+  configs:
+    - configs/material_refine_train_stage1_v3_round14_backbone_topology_render.yaml
+    - configs/material_refine_train_stage1_v3_round15_material_evidence_calibration.yaml
+  log_name: train.log
+
+eval:
+  enabled: true
+  run_after_train: true
+  configs:
+    - configs/material_refine_eval_stage1_v3_round15_balanced_test.yaml
+    - configs/material_refine_eval_stage1_v3_round15_locked346_regression.yaml
+    - configs/material_refine_eval_stage1_v3_round15_ood.yaml
+
+preflight:
+  required_imports:
+    - torch
+    - wandb
+    - tqdm
+    - rich
+    - psutil
+    - orjson
+    - lpips
+    - torchmetrics
+  require_cuda: true
+  require_train_manifest: true
+  require_val_manifest: true
+  require_eval_manifests: true
