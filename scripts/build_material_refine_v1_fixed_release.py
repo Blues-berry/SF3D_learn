@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import statistics
 from collections import Counter
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-p95-threshold", type=float, default=0.08)
     parser.add_argument("--paper-max-target-prior-identity", type=float, default=0.30)
     parser.add_argument("--min-trainable-records", type=int, default=128)
+    parser.add_argument("--problem-case-limit", type=int, default=20)
     return parser.parse_args()
 
 
@@ -134,6 +136,12 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def pass_rate(records: list[dict[str, Any]], key: str) -> float | None:
+    if not records:
+        return None
+    return sum(bool_field(record, key) for record in records) / len(records)
+
+
 def audit_record(record: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any], list[str], list[str]]:
     item = dict(record)
     if not item.get("default_split"):
@@ -212,6 +220,163 @@ def audit_record(record: dict[str, Any], args: argparse.Namespace) -> tuple[dict
     return item, train_blockers, paper_blockers
 
 
+def classify_problem_case(record: dict[str, Any], args: argparse.Namespace) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if not bool_field(record, "target_as_pred_pass"):
+        reasons.append("target_as_pred_fail")
+    if not bool_field(record, "prior_as_pred_pass"):
+        reasons.append("prior_as_pred_fail")
+
+    missing_keys = [
+        key
+        for key in (
+            "canonical_buffer_root",
+            "uv_target_roughness_path",
+            "uv_target_metallic_path",
+            "uv_target_confidence_path",
+        )
+        if not path_exists(record, key)
+    ]
+    if missing_keys:
+        reasons.append("missing_file")
+
+    mean = numeric(record, "target_view_alignment_mean")
+    p95 = numeric(record, "target_view_alignment_p95")
+    identity = numeric(record, "target_prior_identity")
+    if mean is None or mean >= float(args.paper_mean_threshold):
+        reasons.append("alignment_mean_fail")
+    if p95 is None or p95 >= float(args.paper_p95_threshold):
+        reasons.append("alignment_p95_fail")
+    if identity is None or identity > float(args.paper_max_target_prior_identity):
+        reasons.append("target_prior_identity_too_high")
+
+    if not reasons:
+        reasons.append("other")
+    priority = (
+        "target_as_pred_fail",
+        "alignment_mean_fail",
+        "alignment_p95_fail",
+        "target_prior_identity_too_high",
+        "missing_file",
+        "other",
+    )
+    primary = next((reason for reason in priority if reason in reasons), "other")
+    return primary, reasons
+
+
+def problem_severity(record: dict[str, Any], args: argparse.Namespace) -> tuple[float, float, float, float]:
+    target_fail = 1.0 if not bool_field(record, "target_as_pred_pass") else 0.0
+    mean = numeric(record, "target_view_alignment_mean")
+    p95 = numeric(record, "target_view_alignment_p95")
+    identity = numeric(record, "target_prior_identity")
+    mean_excess = 0.0 if mean is None else max(0.0, mean - float(args.paper_mean_threshold))
+    p95_excess = 0.0 if p95 is None else max(0.0, p95 - float(args.paper_p95_threshold))
+    identity_excess = 0.0 if identity is None else max(0.0, identity - float(args.paper_max_target_prior_identity))
+    return (target_fail, mean_excess, p95_excess, identity_excess)
+
+
+def problem_case_rows(records: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    candidates: list[tuple[tuple[float, float, float, float], dict[str, Any]]] = []
+    for record in records:
+        primary, reasons = classify_problem_case(record, args)
+        if primary == "other":
+            continue
+        item = dict(record)
+        item["_problem_primary_reason"] = primary
+        item["_problem_reasons"] = reasons
+        candidates.append((problem_severity(item, args), item))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    rows: list[dict[str, Any]] = []
+    for _severity, record in candidates[: int(args.problem_case_limit)]:
+        rows.append(
+            {
+                "object_id": object_id(record),
+                "source_name": str(record.get("source_name") or ""),
+                "default_split": str(record.get("default_split") or ""),
+                "paper_split": str(record.get("paper_split") or ""),
+                "primary_reason": str(record["_problem_primary_reason"]),
+                "reasons": ";".join(str(reason) for reason in record["_problem_reasons"]),
+                "target_as_pred_pass": bool_field(record, "target_as_pred_pass"),
+                "prior_as_pred_pass": bool_field(record, "prior_as_pred_pass"),
+                "target_view_alignment_mean": numeric(record, "target_view_alignment_mean"),
+                "target_view_alignment_p95": numeric(record, "target_view_alignment_p95"),
+                "target_prior_identity": numeric(record, "target_prior_identity"),
+                "target_quality_tier": str(record.get("target_quality_tier") or ""),
+                "dataset_role": str(record.get("dataset_role") or ""),
+                "canonical_bundle_root": str(record.get("canonical_bundle_root") or ""),
+            }
+        )
+    return rows
+
+
+def write_problem_cases(root: Path, rows: list[dict[str, Any]], *, total_candidates: int) -> None:
+    csv_path = root / "stage1_v1_fixed_problem_cases.csv"
+    md_path = root / "stage1_v1_fixed_problem_cases.md"
+    fieldnames = [
+        "object_id",
+        "source_name",
+        "default_split",
+        "paper_split",
+        "primary_reason",
+        "reasons",
+        "target_as_pred_pass",
+        "prior_as_pred_pass",
+        "target_view_alignment_mean",
+        "target_view_alignment_p95",
+        "target_prior_identity",
+        "target_quality_tier",
+        "dataset_role",
+        "canonical_bundle_root",
+    ]
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    primary_counts = Counter(str(row["primary_reason"]) for row in rows)
+    all_reason_counts: Counter[str] = Counter()
+    required_reasons = (
+        "target_as_pred_fail",
+        "alignment_mean_fail",
+        "alignment_p95_fail",
+        "target_prior_identity_too_high",
+        "missing_file",
+        "other",
+    )
+    for row in rows:
+        for reason in str(row.get("reasons") or "").split(";"):
+            if reason:
+                all_reason_counts[reason] += 1
+    ordered_primary_counts = {reason: primary_counts.get(reason, 0) for reason in required_reasons}
+    ordered_all_reason_counts = {reason: all_reason_counts.get(reason, 0) for reason in required_reasons}
+    lines = [
+        "# stage1_v1_fixed Problem Cases",
+        "",
+        f"- generated_at_utc: `{utc_now()}`",
+        f"- sampled_problem_cases: `{len(rows)}`",
+        f"- total_non_paper_or_problem_candidates: `{total_candidates}`",
+        f"- primary_reason_counts: `{json.dumps(ordered_primary_counts, ensure_ascii=False)}`",
+        f"- all_reason_counts: `{json.dumps(ordered_all_reason_counts, ensure_ascii=False)}`",
+        "",
+        "| object_id | reason | align_mean | align_p95 | target_prior_identity | split |",
+        "|---|---|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {object_id} | {primary_reason} | {mean} | {p95} | {identity} | {split} |".format(
+                object_id=row["object_id"],
+                primary_reason=row["primary_reason"],
+                mean="" if row["target_view_alignment_mean"] is None else f"{row['target_view_alignment_mean']:.6f}",
+                p95="" if row["target_view_alignment_p95"] is None else f"{row['target_view_alignment_p95']:.6f}",
+                identity="" if row["target_prior_identity"] is None else f"{row['target_prior_identity']:.6f}",
+                split=row["default_split"],
+            )
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_manifest(path: Path, *, name: str, records: list[dict[str, Any]], source_manifest: Path) -> None:
     payload = {
         "manifest_version": "canonical_asset_record_v1_stage1_v1_fixed_release",
@@ -255,6 +420,8 @@ def write_sampler_config(path: Path, trainable: list[dict[str, Any]]) -> None:
 def write_decision(
     path: Path,
     *,
+    total_records: int,
+    all_records: list[dict[str, Any]],
     trainable: list[dict[str, Any]],
     paper: list[dict[str, Any]],
     diagnostic: list[dict[str, Any]],
@@ -267,17 +434,21 @@ def write_decision(
     enough_records = len(trainable) >= int(args.min_trainable_records)
     approve_train = bool(enough_records and split_nonempty)
     material_family_count = len([key for key, value in train_summary["material_family"].items() if value > 0])
+    all_summary = summarize(all_records)
     lines = [
         "# stage1_v1_fixed Decision",
         "",
-        f"- v1_fixed_trainable_records = `{len(trainable)}`",
-        f"- v1_fixed_paper_candidate_records = `{len(paper)}`",
+        f"- total_records = `{total_records}`",
+        f"- trainable_records = `{len(trainable)}`",
+        f"- paper_candidate_records = `{len(paper)}`",
         f"- diagnostic_records = `{len(diagnostic)}`",
         f"- rejects_records = `{len(rejects)}`",
         f"- train/val/test counts = `{json.dumps(split_counts, ensure_ascii=False)}`",
-        f"- target_view_alignment_mean = `{json.dumps(train_summary['target_view_alignment_mean'], ensure_ascii=False)}`",
-        f"- target_view_alignment_p95 = `{json.dumps(train_summary['target_view_alignment_p95'], ensure_ascii=False)}`",
-        f"- target_prior_identity = `{json.dumps(train_summary['target_prior_identity'], ensure_ascii=False)}`",
+        f"- target_as_pred_pass_rate = `{pass_rate(all_records, 'target_as_pred_pass')}`",
+        f"- prior_as_pred_pass_rate = `{pass_rate(all_records, 'prior_as_pred_pass')}`",
+        f"- target_view_alignment = `{json.dumps(all_summary['target_view_alignment_mean'], ensure_ascii=False)}`",
+        f"- target_view_alignment_p95_values = `{json.dumps(all_summary['target_view_alignment_p95'], ensure_ascii=False)}`",
+        f"- target_prior_identity = `{json.dumps(all_summary['target_prior_identity'], ensure_ascii=False)}`",
         f"- material_family distribution = `{json.dumps(train_summary['material_family'], ensure_ascii=False)}`",
         f"- source distribution = `{json.dumps(train_summary['source_name'], ensure_ascii=False)}`",
         f"- with_prior / without_prior counts = `{json.dumps(train_summary['has_material_prior'], ensure_ascii=False)}`",
@@ -305,6 +476,7 @@ def main() -> None:
     paper: list[dict[str, Any]] = []
     diagnostic: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
+    audited_records: list[dict[str, Any]] = []
     gate_counter: Counter[str] = Counter()
     seen: set[str] = set()
     for record in records:
@@ -313,6 +485,7 @@ def main() -> None:
             continue
         seen.add(key)
         item, train_blockers, paper_blockers = audit_record(record, args)
+        audited_records.append(item)
         for blocker in train_blockers:
             gate_counter[blocker.split(":", 1)[0]] += 1
         if not train_blockers:
@@ -357,15 +530,28 @@ def main() -> None:
         {
             "generated_at_utc": utc_now(),
             "input_manifest": str(args.input_manifest.resolve()),
+            "total_records": len(audited_records),
+            "target_as_pred_pass_rate": pass_rate(audited_records, "target_as_pred_pass"),
+            "prior_as_pred_pass_rate": pass_rate(audited_records, "prior_as_pred_pass"),
             "gate_blocker_counts": dict(gate_counter),
+            "all_records_summary": summarize(audited_records),
             "trainable_summary": summarize(trainable),
             "paper_candidate_summary": summarize(paper),
             "diagnostic_summary": summarize(diagnostic),
             "rejects_summary": summarize(rejects),
         },
     )
+    problem_candidates = [record for record in audited_records if record not in paper]
+    problem_rows = problem_case_rows(problem_candidates, args)
+    write_problem_cases(
+        REPO_ROOT / "output/material_refine_v1_fixed",
+        problem_rows,
+        total_candidates=len(problem_candidates),
+    )
     write_decision(
         REPO_ROOT / "output/material_refine_v1_fixed/stage1_v1_fixed_decision.md",
+        total_records=len(audited_records),
+        all_records=audited_records,
         trainable=trainable,
         paper=paper,
         diagnostic=diagnostic,
