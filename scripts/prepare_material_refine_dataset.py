@@ -18,7 +18,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
-from bake_material_refine_uv_targets import bake_uv_targets
+from bake_material_refine_uv_targets import (
+    bake_uv_targets,
+    load_gray_image as load_gray_map,
+    load_uv_map as load_view_uv_map,
+)
 from PIL import Image
 from refresh_material_refine_partial_manifest import (
     PREPARED_RECORD_FILENAME,
@@ -145,6 +149,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-device-index", type=str, default="0")
     parser.add_argument("--parallel-workers", type=int, default=1)
     parser.add_argument("--skip-render", action="store_true")
+    parser.add_argument(
+        "--rebake-version",
+        choices=("legacy", "rebake_v2", "v1_fixed_rebake"),
+        default="legacy",
+        help="When rebaking, write strict target/view contract fields and do not mark legacy targets paper-ready.",
+    )
+    parser.add_argument(
+        "--disable-render-cache",
+        action="store_true",
+        help="Force fresh view buffers instead of reusing cached render roots.",
+    )
+    parser.add_argument(
+        "--disallow-prior-copy-fallback",
+        action="store_true",
+        help="Do not use prior-copy fallback for target baking; failed targets remain non-promotable.",
+    )
+    parser.add_argument("--target-view-alignment-mean-threshold", type=float, default=0.03)
+    parser.add_argument("--target-view-alignment-p95-threshold", type=float, default=0.08)
     parser.add_argument("--max-records", type=int, default=None)
     parser.add_argument("--partial-manifest", type=Path, default=None)
     parser.add_argument("--refresh-partial-every", type=int, default=25)
@@ -756,6 +778,225 @@ def render_views(
     subprocess.run(cmd, check=True, env=env)
 
 
+def _field_source_payload(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _view_field_sources(field_sources_payload: dict, view_name: str) -> dict[str, str]:
+    views = field_sources_payload.get("views")
+    if not isinstance(views, dict):
+        return {}
+    view_payload = views.get(view_name)
+    if not isinstance(view_payload, dict):
+        return {}
+    fields = view_payload.get("fields")
+    if not isinstance(fields, dict):
+        return {}
+    return {str(key): str(value) for key, value in fields.items()}
+
+
+def _alignment_stats(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "p95": None, "max": None}
+    array = np.asarray(values, dtype=np.float32)
+    return {
+        "mean": float(array.mean()),
+        "p95": float(np.quantile(array, 0.95)),
+        "max": float(array.max()),
+    }
+
+
+def _valid_uv_mask(
+    *,
+    uv: np.ndarray,
+    mask: np.ndarray,
+    visibility: np.ndarray,
+) -> np.ndarray:
+    return (
+        np.isfinite(uv[..., 0])
+        & np.isfinite(uv[..., 1])
+        & (mask > 0.5)
+        & (visibility > 0.5)
+        & (uv[..., 0] >= 0.0)
+        & (uv[..., 0] <= 1.0)
+        & (uv[..., 1] >= 0.0)
+        & (uv[..., 1] <= 1.0)
+    )
+
+
+def compute_rebake_v2_contract(
+    *,
+    bundle_dir: Path,
+    buffer_root: Path,
+    views: list[dict],
+    uv_prior_roughness_path: Path,
+    uv_prior_metallic_path: Path,
+    uv_target_roughness_path: Path,
+    uv_target_metallic_path: Path,
+    view_buffer_field_sources_path: Path,
+    atlas_resolution: int,
+    render_resolution: int,
+    mean_threshold: float,
+    p95_threshold: float,
+    rebake_version: str = "rebake_v2",
+    target_view_contract_version: str = "v2",
+) -> dict[str, object]:
+    target_roughness = load_gray_map(uv_target_roughness_path, atlas_resolution)
+    target_metallic = load_gray_map(uv_target_metallic_path, atlas_resolution)
+    prior_roughness = load_gray_map(uv_prior_roughness_path, atlas_resolution)
+    prior_metallic = load_gray_map(uv_prior_metallic_path, atlas_resolution)
+    contract_path = bundle_dir / "_rebake_v2_contract.json"
+    blockers: list[str] = []
+    if target_roughness is None:
+        blockers.append("missing_uv_target_roughness")
+    if target_metallic is None:
+        blockers.append("missing_uv_target_metallic")
+    if prior_roughness is None:
+        blockers.append("missing_uv_prior_roughness")
+    if prior_metallic is None:
+        blockers.append("missing_uv_prior_metallic")
+
+    field_sources_payload = _field_source_payload(view_buffer_field_sources_path)
+    target_errors: list[float] = []
+    prior_sampled_pixels = 0
+    prior_invalid_pixels = 0
+    valid_view_count = 0
+    strict_view_count = 0
+    per_view: dict[str, dict[str, object]] = {}
+    required_fields = ("uv", "visibility", "mask", "roughness", "metallic")
+    placeholder_sources = {"synthetic_placeholder", "missing", "placeholder"}
+
+    if not blockers:
+        assert target_roughness is not None
+        assert target_metallic is not None
+        assert prior_roughness is not None
+        assert prior_metallic is not None
+        for view in views:
+            view_name = str(view.get("name") or "")
+            view_dir = buffer_root / view_name
+            sources = _view_field_sources(field_sources_payload, view_name)
+            placeholder_fields = [
+                field
+                for field in required_fields
+                if sources.get(field, "missing") in placeholder_sources
+            ]
+            if placeholder_fields:
+                per_view[view_name] = {
+                    "ready": False,
+                    "reason": "placeholder_view_fields",
+                    "placeholder_fields": placeholder_fields,
+                }
+                continue
+
+            uv_path = view_dir / "uv.png"
+            uv = load_view_uv_map(uv_path, render_resolution)
+            mask = load_gray_map(view_dir / "mask.png", render_resolution)
+            visibility = load_gray_map(view_dir / "visibility.png", render_resolution)
+            view_roughness = load_gray_map(view_dir / "roughness.png", render_resolution)
+            view_metallic = load_gray_map(view_dir / "metallic.png", render_resolution)
+            if any(value is None for value in (uv, mask, visibility, view_roughness, view_metallic)):
+                per_view[view_name] = {"ready": False, "reason": "missing_view_arrays"}
+                continue
+            assert uv is not None
+            assert mask is not None
+            assert visibility is not None
+            assert view_roughness is not None
+            assert view_metallic is not None
+            valid = _valid_uv_mask(uv=uv, mask=mask, visibility=visibility)
+            valid_rate = float(valid.mean())
+            if not bool(valid.any()):
+                per_view[view_name] = {"ready": False, "reason": "empty_valid_uv_mask", "valid_rate": valid_rate}
+                continue
+
+            u = np.clip(
+                np.rint(uv[..., 0][valid] * (atlas_resolution - 1)).astype(np.int32),
+                0,
+                atlas_resolution - 1,
+            )
+            v = np.clip(
+                np.rint((1.0 - uv[..., 1][valid]) * (atlas_resolution - 1)).astype(np.int32),
+                0,
+                atlas_resolution - 1,
+            )
+            sampled_target_roughness = target_roughness[v, u]
+            sampled_target_metallic = target_metallic[v, u]
+            sampled_prior_roughness = prior_roughness[v, u]
+            sampled_prior_metallic = prior_metallic[v, u]
+            prior_finite = np.isfinite(sampled_prior_roughness) & np.isfinite(sampled_prior_metallic)
+            prior_sampled_pixels += int(prior_finite.size)
+            prior_invalid_pixels += int((~prior_finite).sum())
+            target_error = 0.5 * (
+                np.abs(sampled_target_roughness - view_roughness[valid])
+                + np.abs(sampled_target_metallic - view_metallic[valid])
+            )
+            target_errors.extend(float(value) for value in target_error.tolist())
+            valid_view_count += 1
+            strict_view_count += int(
+                all(sources.get(field, "missing") not in placeholder_sources for field in required_fields)
+            )
+            per_view[view_name] = {
+                "ready": True,
+                "valid_rate": valid_rate,
+                "target_alignment_mean": float(target_error.mean()),
+                "target_alignment_p95": float(np.quantile(target_error, 0.95)),
+            }
+
+    target_stats = _alignment_stats(target_errors)
+    prior_sampling_valid_rate = (
+        float((prior_sampled_pixels - prior_invalid_pixels) / max(prior_sampled_pixels, 1))
+        if prior_sampled_pixels > 0
+        else 0.0
+    )
+    target_mean = target_stats["mean"]
+    target_p95 = target_stats["p95"]
+    prior_as_pred_pass = bool(valid_view_count > 0 and prior_sampling_valid_rate >= 0.999)
+    target_as_pred_pass = bool(
+        valid_view_count > 0
+        and target_mean is not None
+        and target_p95 is not None
+        and float(target_mean) < float(mean_threshold)
+        and float(target_p95) < float(p95_threshold)
+    )
+    if valid_view_count <= 0:
+        blockers.append("no_valid_rebake_v2_views")
+    if target_mean is None:
+        blockers.append("missing_target_view_alignment_mean")
+    elif float(target_mean) >= float(mean_threshold):
+        blockers.append(f"target_view_alignment_mean_high:{float(target_mean):.5f}")
+    if target_p95 is None:
+        blockers.append("missing_target_view_alignment_p95")
+    elif float(target_p95) >= float(p95_threshold):
+        blockers.append(f"target_view_alignment_p95_high:{float(target_p95):.5f}")
+
+    payload = {
+        "target_view_contract_version": target_view_contract_version,
+        "rebake_version": rebake_version,
+        "stored_view_target_valid_for_paper": bool(prior_as_pred_pass and target_as_pred_pass),
+        "prior_as_pred_pass": prior_as_pred_pass,
+        "target_as_pred_pass": target_as_pred_pass,
+        "target_view_alignment_mean": target_mean,
+        "target_view_alignment_p95": target_p95,
+        "target_view_alignment_max": target_stats["max"],
+        "prior_sampling_valid_rate": prior_sampling_valid_rate,
+        "prior_sampling_invalid_pixels": int(prior_invalid_pixels),
+        "view_supervision_ready": bool(valid_view_count > 0),
+        "effective_view_supervision_rate": float(valid_view_count / max(len(views), 1)),
+        "strict_complete_view_rate": float(strict_view_count / max(len(views), 1)),
+        "valid_view_count": int(valid_view_count),
+        "rebake_v2_contract_blockers": blockers,
+        "rebake_v2_contract_debug_path": str(contract_path.resolve()),
+        "per_view": per_view,
+    }
+    contract_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {key: value for key, value in payload.items() if key != "per_view"}
+
+
 def prepare_record(
     record: dict,
     *,
@@ -770,6 +1011,11 @@ def prepare_record(
     skip_render: bool,
     views: list[dict],
     view_light_protocol: str,
+    rebake_version: str,
+    disable_render_cache: bool,
+    disallow_prior_copy_fallback: bool,
+    target_view_alignment_mean_threshold: float,
+    target_view_alignment_p95_threshold: float,
 ) -> dict:
     source_model_path = Path(record["source_model_path"]).resolve()
     texture_root = first_existing_path(record.get("source_texture_root", ""))
@@ -816,7 +1062,12 @@ def prepare_record(
         size=atlas_resolution,
     )
 
-    cached_render_root = resolve_cached_render_root(record, source_model_path, abo_render_cache, views)
+    is_contract_rebake = rebake_version in {"rebake_v2", "v1_fixed_rebake"}
+    cached_render_root = (
+        None
+        if disable_render_cache or is_contract_rebake
+        else resolve_cached_render_root(record, source_model_path, abo_render_cache, views)
+    )
     if render_bundle_complete(buffer_root, views):
         render_mode = "existing_bundle"
         print(f"[prepare reuse] existing bundle buffers for {record['object_id']}")
@@ -856,8 +1107,28 @@ def prepare_record(
         default_roughness=roughness_seed,
         default_metallic=metallic_seed,
         synthesize_nontrivial_prior=should_synthesize_nontrivial_prior(record),
-        allow_prior_copy_fallback=True,
+        allow_prior_copy_fallback=not disallow_prior_copy_fallback,
     )
+
+    rebake_v2_payload: dict[str, object] = {}
+    if is_contract_rebake:
+        contract_version = "v1_fixed" if rebake_version == "v1_fixed_rebake" else "v2"
+        rebake_v2_payload = compute_rebake_v2_contract(
+            bundle_dir=bundle_dir,
+            buffer_root=buffer_root,
+            views=views,
+            uv_prior_roughness_path=Path(uv_target_payload["uv_prior_roughness_path"]),
+            uv_prior_metallic_path=Path(uv_target_payload["uv_prior_metallic_path"]),
+            uv_target_roughness_path=Path(uv_target_payload["uv_target_roughness_path"]),
+            uv_target_metallic_path=Path(uv_target_payload["uv_target_metallic_path"]),
+            view_buffer_field_sources_path=Path(view_buffer_payload["view_buffer_field_sources_path"]),
+            atlas_resolution=atlas_resolution,
+            render_resolution=render_resolution,
+            mean_threshold=target_view_alignment_mean_threshold,
+            p95_threshold=target_view_alignment_p95_threshold,
+            rebake_version=rebake_version,
+            target_view_contract_version=contract_version,
+        )
 
     missing = find_missing_paths(bundle_dir)
     if missing:
@@ -903,6 +1174,13 @@ def prepare_record(
             "paper_split": str(record.get("paper_split") or record.get("default_split", "train")),
         }
     )
+    if rebake_v2_payload:
+        prepared.update(rebake_v2_payload)
+        prepared["candidate_pool_only"] = True
+        prepared["paper_stage_eligible_rebake_v2"] = False
+        prepared["target_quality_tier"] = str(prepared.get("target_quality_tier") or "smoke_only")
+        prepared["old_view_reuse"] = False
+        prepared["old_uv_target_reuse"] = False
     prepared = enrich_record_with_quality_fields(prepared)
     write_prepared_record_file(bundle_dir, prepared)
     return prepared
@@ -986,6 +1264,12 @@ def main() -> None:
             skip_render=args.skip_render,
             views=views,
             view_light_protocol=args.view_light_protocol,
+            rebake_version=args.rebake_version,
+            disable_render_cache=args.disable_render_cache,
+            disallow_prior_copy_fallback=args.disallow_prior_copy_fallback
+            or args.rebake_version in {"rebake_v2", "v1_fixed_rebake"},
+            target_view_alignment_mean_threshold=args.target_view_alignment_mean_threshold,
+            target_view_alignment_p95_threshold=args.target_view_alignment_p95_threshold,
         )
         return index, prepared
 

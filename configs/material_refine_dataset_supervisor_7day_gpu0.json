@@ -6,6 +6,7 @@
     "No training command is launched from this supervisor.",
     "Storage policy: future heavy render/preprocess roots are supervised under /4T; active repo-output runs are not moved.",
     "2026-04-26 policy: do not resume legacy 3D-FUTURE / 3D furniture roots; future dataset expansion is driven by factory no-3DFUTURE inputs plus Objaverse/ABO/benchmark/material/HDRI sources."
+    ,"2026-04-27 migration hold: legacy target/view contract supervisor is disabled; use material_refine_dataset_factory_gpu0_rebake_v2.json only."
   ],
   "storage_policy": {
     "large_render_output_root": "/4T/CXY/sf3d_material_refine_dataset_factory",
@@ -19,7 +20,7 @@
   "output_root": "output/material_refine_dataset_factory/supervisor_7day",
   "python_bin": "/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python",
   "factory": {
-    "enabled": true,
+    "enabled": false,
     "session": "sf3d_material_refine_dataset_factory_gpu0",
     "config": "configs/material_refine_dataset_factory_gpu0.json",
     "state_json": "output/material_refine_dataset_factory/factory_state.json",
@@ -40,9 +41,7 @@
     "warn_if_data_process_on_gpu1": true
   },
   "downloads": {
-    "required_sessions": [
-      "sf3d_factory_polyhaven_material_bank"
-    ]
+    "required_sessions": []
   },
   "production_roots": {
     "patterns": [],

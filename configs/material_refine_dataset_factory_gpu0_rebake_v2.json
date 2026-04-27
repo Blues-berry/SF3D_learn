@@ -1,0 +1,112 @@
+{
+  "mode": "rebake_v2",
+  "factory_version": "sf3d_material_refine_dataset_factory_rebake_v2_gpu0",
+  "notes": [
+    "Data-only rebake_v2 contract mode; no R training is launched.",
+    "GPU0 only. GPU1 must remain idle.",
+    "Legacy stored view targets and legacy UV targets are not valid promotion evidence.",
+    "PolyHaven HDRI/material banks remain auxiliary lighting/material resources, not object main-pool records."
+  ],
+  "rebake_v2_contract": {
+    "mode": "rebake_v2",
+    "exclude_sources": ["3D-FUTURE", "3D_FUTURE", "3dfuture"],
+    "gpu_ids": [0],
+    "preserve_gpu1": true,
+    "raw_asset_delete": false,
+    "old_view_reuse": false,
+    "old_uv_target_reuse": false,
+    "require_target_view_identity": true,
+    "require_prior_as_pred_pass": true,
+    "require_target_as_pred_pass": true,
+    "target_view_alignment_mean_threshold": 0.03,
+    "target_view_alignment_p95_threshold": 0.08,
+    "max_target_prior_identity": 0.30,
+    "output_root": "output/material_refine_rebake_v2/"
+  },
+  "storage_policy": {
+    "large_render_output_root": "/4T/CXY/material_refine_rebake_v2_no3dfuture_longrun",
+    "repo_output_root": "output/material_refine_rebake_v2/no3dfuture_longrun_latest",
+    "raw_asset_delete": false
+  },
+  "gpu_policy": {
+    "render_gpu_list": "0",
+    "keep_gpu_indices_empty": [1],
+    "allow_gpu1_data_processes": false,
+    "max_gpu0_used_mb_for_new_launch": 4096,
+    "poll_seconds": 43200
+  },
+  "material_quota": {
+    "metal_dominant": 0.30,
+    "ceramic_glazed_lacquer": 0.20,
+    "glass_metal": 0.15,
+    "mixed_thin_boundary": 0.20,
+    "glossy_non_metal": 0.15
+  },
+  "pilot": {
+    "enabled": true,
+    "run_prepare": true,
+    "required_pass_file": "output/material_refine_rebake_v2/pilot_64_no3dfuture/pilot_64_decision.json",
+    "candidate_manifests": [
+      "output/material_refine_rebake_v2/no3dfuture_v4_candidate_only_manifest.json"
+    ],
+    "output_root": "output/material_refine_rebake_v2/pilot_64_no3dfuture",
+    "prepare_output_root": "/4T/CXY/material_refine_rebake_v2_no3dfuture_longrun/pilot_64_no3dfuture",
+    "gpu_id": "0",
+    "atlas_resolution": 1024,
+    "render_resolution": 320,
+    "cycles_samples": 8,
+    "view_light_protocol": "production_32",
+    "min_hdri_count": 900,
+    "max_hdri_lights": 4,
+    "parallel_workers": 1
+  },
+  "rebake_v2_audit": {
+    "enabled": true,
+    "input_manifests": [
+      "output/material_refine_rebake_v2/no3dfuture_longrun_latest/merged_manifest_rebake_v2.json"
+    ],
+    "fallback_input_manifests": [
+      "output/material_refine_rebake_v2/no3dfuture_v4_candidate_only_manifest.json"
+    ],
+    "output_root": "output/material_refine_rebake_v2/no3dfuture_longrun_latest",
+    "mean_threshold": 0.03,
+    "p95_threshold": 0.08,
+    "max_target_prior_identity": 0.30,
+    "min_balanced_records": 256
+  },
+  "longrun": {
+    "enabled_after_pilot_pass": true,
+    "session_prefix": "sf3d_rebake_v2_no3dfuture",
+    "output_base_root": "/4T/CXY/material_refine_rebake_v2_no3dfuture_longrun",
+    "repo_latest_root": "output/material_refine_rebake_v2/no3dfuture_longrun_latest",
+    "input_manifests": [
+      "output/material_refine_rebake_v2/no3dfuture_v4_candidate_only_manifest.json"
+    ],
+    "paper_main_sources": "",
+    "auxiliary_sources": "",
+    "priority_material_families": "glass_metal,mixed_thin_boundary,ceramic_glazed_lacquer,metal_dominant,glossy_non_metal",
+    "target_material_family_ratios": "glass_metal=0.25,mixed_thin_boundary=0.25,ceramic_glazed_lacquer=0.25,metal_dominant=0.15,glossy_non_metal=0.10",
+    "prefer_paper_main_first": false,
+    "interleave_selection_keys": "material_family,source_name,has_material_prior",
+    "paper_frontload_records": 0,
+    "max_records": 9700,
+    "shards": 12,
+    "gpu_list": "0",
+    "workers_per_gpu": 1,
+    "view_light_protocol": "production_32",
+    "min_hdri_count": 900,
+    "max_hdri_lights": 4,
+    "atlas_resolution": 1024,
+    "render_resolution": 320,
+    "cycles_samples": 8,
+    "refresh_partial_every": 3,
+    "merged_monitor_poll_seconds": 120
+  },
+  "loop_policy": {
+    "merge_every_seconds": 43200,
+    "promotion_every_seconds": 43200,
+    "quota_audit_every_seconds": 43200,
+    "reject_quarantine_every_seconds": 43200,
+    "daily_status": true
+  }
+}

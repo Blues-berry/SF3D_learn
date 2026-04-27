@@ -18,6 +18,11 @@ HDRI_SELECTION_OFFSET="${HDRI_SELECTION_OFFSET:-0}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
 REFRESH_PARTIAL_EVERY="${REFRESH_PARTIAL_EVERY:-5}"
 GPU_LIST="${GPU_LIST:-0,1}"
+REBAKE_VERSION="${REBAKE_VERSION:-legacy}"
+DISABLE_RENDER_CACHE="${DISABLE_RENDER_CACHE:-0}"
+DISALLOW_PRIOR_COPY_FALLBACK="${DISALLOW_PRIOR_COPY_FALLBACK:-0}"
+TARGET_VIEW_ALIGNMENT_MEAN_THRESHOLD="${TARGET_VIEW_ALIGNMENT_MEAN_THRESHOLD:-0.03}"
+TARGET_VIEW_ALIGNMENT_P95_THRESHOLD="${TARGET_VIEW_ALIGNMENT_P95_THRESHOLD:-0.08}"
 LONGRUN_INPUT_MANIFESTS="${LONGRUN_INPUT_MANIFESTS:-output/material_refine_pipeline_20260418T091559Z/material_refine_manifest_v1.json,output/highlight_pool_a_8k/objaverse_github_lfs_increment_manifest/material_refine_manifest_objaverse_increment.json}"
 PAPER_MAIN_SOURCES="${PAPER_MAIN_SOURCES:-ABO_locked_core}"
 AUXILIARY_SOURCES="${AUXILIARY_SOURCES:-}"
@@ -64,6 +69,19 @@ if [[ -n "${INTERLEAVE_SELECTION_KEYS}" ]]; then
 fi
 "${build_cmd[@]}" | tee "${OUTPUT_ROOT}/logs/build_longrun_manifest.log"
 
+prepare_extra_args=(
+  --rebake-version "${REBAKE_VERSION}"
+  --target-view-alignment-mean-threshold "${TARGET_VIEW_ALIGNMENT_MEAN_THRESHOLD}"
+  --target-view-alignment-p95-threshold "${TARGET_VIEW_ALIGNMENT_P95_THRESHOLD}"
+)
+if [[ "${DISABLE_RENDER_CACHE}" == "1" || "${DISABLE_RENDER_CACHE}" == "true" ]]; then
+  prepare_extra_args+=(--disable-render-cache)
+fi
+if [[ "${DISALLOW_PRIOR_COPY_FALLBACK}" == "1" || "${DISALLOW_PRIOR_COPY_FALLBACK}" == "true" ]]; then
+  prepare_extra_args+=(--disallow-prior-copy-fallback)
+fi
+printf '%q ' "${prepare_extra_args[@]}" > "${OUTPUT_ROOT}/logs/prepare_extra_args.txt"
+
 IFS=',' read -r -a GPUS <<< "${GPU_LIST}"
 for shard_idx in $(seq 0 $((SHARDS - 1))); do
   gpu="${GPUS[$((shard_idx % ${#GPUS[@]}))]}"
@@ -91,6 +109,7 @@ cd "${REPO_ROOT}"
   --cuda-device-index "${gpu}" \\
   --parallel-workers "${WORKERS_PER_GPU}" \\
   --refresh-partial-every "${REFRESH_PARTIAL_EVERY}" \\
+  \$(cat "${OUTPUT_ROOT}/logs/prepare_extra_args.txt") \\
   > "${OUTPUT_ROOT}/logs/${session}.log" 2>&1
 SCRIPT
   chmod +x "${run_script}"

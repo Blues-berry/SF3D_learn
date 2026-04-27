@@ -418,9 +418,14 @@ def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         {
             "SESSION_PREFIX": str(longrun.get("session_prefix", "sf3d_longrun_material_refine")),
             "LONGRUN_INPUT_MANIFESTS": ",".join(str(path) for path in input_manifests),
-            "PAPER_MAIN_SOURCES": str(longrun["paper_main_sources"]),
+            "PAPER_MAIN_SOURCES": str(longrun.get("paper_main_sources", "")),
             "AUXILIARY_SOURCES": str(longrun.get("auxiliary_sources", "")),
-            "PRIORITY_MATERIAL_FAMILIES": str(longrun["priority_material_families"]),
+            "PRIORITY_MATERIAL_FAMILIES": str(
+                longrun.get(
+                    "priority_material_families",
+                    "metal_dominant,ceramic_glazed_lacquer,glass_metal,mixed_thin_boundary,glossy_non_metal",
+                )
+            ),
             "TARGET_MATERIAL_FAMILY_RATIOS": ",".join(
                 f"{key}={value}" for key, value in config.get("material_quota", {}).items()
             ),
@@ -437,13 +442,28 @@ def launch_longrun(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "ATLAS_RESOLUTION": str(longrun["atlas_resolution"]),
             "RENDER_RESOLUTION": str(longrun["render_resolution"]),
             "CYCLES_SAMPLES": str(longrun["cycles_samples"]),
-            "REFRESH_PARTIAL_EVERY": str(longrun["refresh_partial_every"]),
+            "REFRESH_PARTIAL_EVERY": str(longrun.get("refresh_partial_every", 3)),
             "START_MERGED_MONITOR": "1",
             "MERGED_MONITOR_POLL_SECONDS": str(longrun.get("merged_monitor_poll_seconds", 120)),
             "OUTPUT_ROOT": path_for_env(output_root),
             "HDRI_SELECTION_OFFSET": str(next_hdri_offset(config)),
         }
     )
+    if str(config.get("mode") or "") == "rebake_v2":
+        contract = config.get("rebake_v2_contract", {})
+        env.update(
+            {
+                "REBAKE_VERSION": "rebake_v2",
+                "DISABLE_RENDER_CACHE": "1",
+                "DISALLOW_PRIOR_COPY_FALLBACK": "1",
+                "TARGET_VIEW_ALIGNMENT_MEAN_THRESHOLD": str(
+                    contract.get("target_view_alignment_mean_threshold", 0.03)
+                ),
+                "TARGET_VIEW_ALIGNMENT_P95_THRESHOLD": str(
+                    contract.get("target_view_alignment_p95_threshold", 0.08)
+                ),
+            }
+        )
     command = ["bash", "scripts/launch_material_refine_longrun_dataset_tmux.sh"]
     if dry_run:
         return {"action": "dry_run_launch", "output_root": str(output_root), "env": {k: env[k] for k in env if k in {
@@ -1057,6 +1077,139 @@ def audit_newest(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
     }
 
 
+def pilot_passed(config: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    pilot = config.get("pilot", {})
+    path = repo_path(pilot.get("required_pass_file", "output/material_refine_rebake_v2/pilot_64_no3dfuture/pilot_64_decision.json"))
+    if not path.exists():
+        return False, {"path": str(path), "reason": "missing_pilot_decision"}
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, {"path": str(path), "reason": f"invalid_pilot_decision:{exc}"}
+    return bool(payload.get("pilot_64_rebake_v2_pass")), payload
+
+
+def build_rebake_v2_pilot(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    pilot = config.get("pilot", {})
+    if not bool(pilot.get("enabled", False)):
+        return {"action": "disabled"}
+    output_root = repo_path(pilot.get("output_root", "output/material_refine_rebake_v2/pilot_64_no3dfuture"))
+    decision = output_root / "pilot_64_decision.json"
+    if decision.exists():
+        return {"action": "up_to_date", "decision": str(decision)}
+    command = [
+        str(PYTHON_BIN),
+        "scripts/build_material_refine_rebake_v2_pilot.py",
+        "--output-root",
+        str(output_root),
+    ]
+    if bool(pilot.get("run_prepare", False)):
+        command.append("--run-prepare")
+    if pilot.get("prepare_output_root"):
+        command.extend(["--prepare-output-root", str(repo_path(pilot["prepare_output_root"]))])
+    if pilot.get("gpu_id") is not None:
+        command.extend(["--gpu-id", str(pilot.get("gpu_id"))])
+    for key, flag in (
+        ("atlas_resolution", "--atlas-resolution"),
+        ("render_resolution", "--render-resolution"),
+        ("cycles_samples", "--cycles-samples"),
+        ("view_light_protocol", "--view-light-protocol"),
+        ("min_hdri_count", "--min-hdri-count"),
+        ("max_hdri_lights", "--max-hdri-lights"),
+        ("parallel_workers", "--parallel-workers"),
+    ):
+        if key in pilot:
+            command.extend([flag, str(pilot[key])])
+    for value in pilot.get("candidate_manifests", []):
+        path = repo_path(value)
+        if path.exists():
+            command.extend(["--candidate-manifest", str(path)])
+    if "--candidate-manifest" not in command:
+        return {"action": "missing_candidate_manifests"}
+    if dry_run:
+        return {"action": "dry_run_build_rebake_v2_pilot", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "pilot_built" if result.returncode == 0 else "pilot_failed",
+        "decision": str(decision),
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-80:],
+    }
+
+
+def run_rebake_v2_audit(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    audit = config.get("rebake_v2_audit", {})
+    if not bool(audit.get("enabled", False)):
+        return {"action": "disabled"}
+    manifests: list[Path] = []
+    for value in audit.get("input_manifests", []):
+        path = repo_path(value)
+        if path.exists():
+            manifests.append(path)
+    if not manifests:
+        for value in audit.get("fallback_input_manifests", []):
+            path = repo_path(value)
+            if path.exists():
+                manifests.append(path)
+    if not manifests:
+        return {"action": "missing_input_manifests"}
+    output_root = repo_path(audit.get("output_root", "output/material_refine_rebake_v2/no3dfuture_longrun_latest"))
+    command = [
+        str(PYTHON_BIN),
+        "scripts/audit_material_refine_rebake_v2_contract.py",
+        "--output-root",
+        str(output_root),
+        "--mean-threshold",
+        str(audit.get("mean_threshold", 0.03)),
+        "--p95-threshold",
+        str(audit.get("p95_threshold", 0.08)),
+        "--max-target-prior-identity",
+        str(audit.get("max_target_prior_identity", 0.30)),
+        "--min-balanced-records",
+        str(audit.get("min_balanced_records", 256)),
+    ]
+    for manifest in manifests:
+        command.extend(["--manifest", str(manifest)])
+    if dry_run:
+        return {"action": "dry_run_rebake_v2_audit", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "rebake_v2_audited" if result.returncode == 0 else "rebake_v2_audit_failed",
+        "output_root": str(output_root),
+        "input_manifests": [str(path) for path in manifests],
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.splitlines()[-80:],
+    }
+
+
+def run_rebake_v2_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "updated_at_utc": utc_now(),
+        "mode": "rebake_v2",
+        "config": str(args.config.resolve()),
+        "gpu": gpu_rows(),
+        "tmux_sessions": tmux_ls(),
+        "actions": [],
+    }
+    if args.start_downloads:
+        state["actions"].append({"pilot": build_rebake_v2_pilot(config, dry_run=args.dry_run)})
+        state["actions"].append({"rebake_v2_audit": run_rebake_v2_audit(config, dry_run=args.dry_run)})
+    launch_allowed, pilot_payload = pilot_passed(config)
+    state["pilot_gate"] = pilot_payload
+    if args.start_render:
+        if not launch_allowed:
+            state["actions"].append({"render": {"action": "not_launched", "reason": "pilot_64_rebake_v2_not_passed"}})
+        else:
+            launch, reason = should_launch_render(config, force=args.force_render)
+            if launch:
+                state["actions"].append({"render": launch_longrun(config, dry_run=args.dry_run)})
+            else:
+                state["actions"].append({"render": {"action": "not_launched", "reason": reason}})
+    if args.audit and not args.start_downloads:
+        state["actions"].append({"rebake_v2_audit": run_rebake_v2_audit(config, dry_run=args.dry_run)})
+    return state
+
+
 def should_launch_render(config: dict[str, Any], *, force: bool) -> tuple[bool, str]:
     active = active_longrun_shard_sessions(config)
     if active:
@@ -1074,6 +1227,8 @@ def should_launch_render(config: dict[str, Any], *, force: bool) -> tuple[bool, 
 
 
 def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    if str(config.get("mode") or "") == "rebake_v2":
+        return run_rebake_v2_once(args, config)
     state: dict[str, Any] = {
         "updated_at_utc": utc_now(),
         "config": str(args.config.resolve()),
