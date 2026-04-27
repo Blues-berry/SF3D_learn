@@ -67,6 +67,12 @@ MATERIAL_SPECIFIC_METRIC_NAMES = [
     "material_family_breakdown",
 ]
 MODEL_CFG_OVERRIDE_KEYS = [
+    "enable_prior_source_embedding",
+    "enable_no_prior_bootstrap",
+    "enable_boundary_safety",
+    "enable_change_gate",
+    "enable_material_aux_head",
+    "enable_render_proxy_loss",
     "enable_material_evidence_calibration",
     "material_evidence_channels",
     "material_evidence_strength",
@@ -82,6 +88,32 @@ PAPER_MAIN_VARIANT_LABELS = {
     "no_residual_refiner": "Ours w/o Residual",
 }
 PAPER_MAIN_METRIC_COLUMNS = ["uv_rm_mae", "view_rm_mae", "psnr", "ssim", "lpips"]
+
+
+def first_nonempty(*values: Any, default: str = "unknown") -> str:
+    for value in values:
+        if value not in (None, ""):
+            return str(value)
+    return str(default)
+
+
+def batch_item_value(
+    batch: dict[str, Any],
+    metadata: dict[str, Any],
+    key: str,
+    item_idx: int,
+    default: Any = "unknown",
+) -> Any:
+    value = batch.get(key)
+    if isinstance(value, (list, tuple)) and item_idx < len(value):
+        item = value[item_idx]
+        if item not in (None, ""):
+            return item
+    if isinstance(metadata, dict):
+        item = metadata.get(key)
+        if item not in (None, ""):
+            return item
+    return default
 
 
 def paper_main_metric_row(
@@ -110,19 +142,18 @@ def build_paper_main_table_entries(eval_variant: str, metrics_main: dict[str, An
     if eval_variant == "ours_full":
         rows.append(
             paper_main_metric_row(
-                method="SF3D Original",
+                method="Original Generator Asset",
                 side="baseline",
                 metrics_main=metrics_main,
-                metric_basis="canonicalized_sf3d_prior_proxy",
+                metric_basis="original_asset_proxy_if_available",
                 note=(
-                    "Raw SF3D GLB/render is the required visual baseline; "
-                    "metric values use the canonicalized SF3D prior proxy until raw-original render metrics are exported."
+                    "R-only metric values use the input prior proxy unless a raw original generator render is exported."
                 ),
             )
         )
     rows.append(
         paper_main_metric_row(
-            method="SF3D Canonical Prior",
+            method="Input Prior",
             side="baseline",
             metrics_main=metrics_main,
             metric_basis="canonical_uv_prior",
@@ -244,6 +275,12 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default="ours_full",
     )
     parser.add_argument("--prior-smoothing-kernel", type=int, default=9)
+    parser.add_argument("--enable-prior-source-embedding", type=parse_optional_bool, default=None)
+    parser.add_argument("--enable-no-prior-bootstrap", type=parse_optional_bool, default=None)
+    parser.add_argument("--enable-boundary-safety", type=parse_optional_bool, default=None)
+    parser.add_argument("--enable-change-gate", type=parse_optional_bool, default=None)
+    parser.add_argument("--enable-material-aux-head", type=parse_optional_bool, default=None)
+    parser.add_argument("--enable-render-proxy-loss", type=parse_optional_bool, default=None)
     parser.add_argument(
         "--render-metric-mode",
         choices=["proxy_uv_shading", "disabled"],
@@ -365,6 +402,7 @@ def compact_eval_group_logs(
     group_axes = [
         ("material_family", "by_material_family"),
         ("prior_label", "by_prior_label"),
+        ("prior_source_type", "by_prior_source_type"),
     ]
     metric_names = [
         "count",
@@ -404,7 +442,9 @@ def compact_eval_console_summary(summary_payload: dict[str, Any]) -> dict[str, A
             "rows": summary_payload.get("rows"),
             "objects": summary_payload.get("objects"),
             "baseline_uv_total_mae": summary_payload.get("baseline_total_mae"),
+            "input_prior_uv_total_mae": summary_payload.get("input_prior_total_mae"),
             "refined_uv_total_mae": summary_payload.get("refined_total_mae"),
+            "gain_total": summary_payload.get("gain_total"),
             "avg_improvement_total": summary_payload.get("avg_improvement_total"),
             "view_total_mae": (main_metrics.get("view_rm_mae") or {}).get("total"),
             "proxy_render_psnr": main_metrics.get("proxy_render_psnr"),
@@ -575,6 +615,41 @@ def optional_delta(
     if baseline is None or refined is None:
         return None
     return float(refined - baseline if higher_is_better else baseline - refined)
+
+
+def pair_direction_rates(
+    baseline_values: list[Any],
+    refined_values: list[Any],
+) -> dict[str, float | int | None]:
+    improved = 0
+    regressed = 0
+    tied = 0
+    count = 0
+    for baseline_value, refined_value in zip(baseline_values, refined_values, strict=False):
+        baseline = finite_or_none(baseline_value)
+        refined = finite_or_none(refined_value)
+        if baseline is None or refined is None:
+            continue
+        count += 1
+        if refined < baseline:
+            improved += 1
+        elif refined > baseline:
+            regressed += 1
+        else:
+            tied += 1
+    if count <= 0:
+        return {
+            "improvement_rate": None,
+            "regression_rate": None,
+            "tie_rate": None,
+            "count": 0,
+        }
+    return {
+        "improvement_rate": float(improved / count),
+        "regression_rate": float(regressed / count),
+        "tie_rate": float(tied / count),
+        "count": int(count),
+    }
 
 
 def metric_pair(
@@ -1141,7 +1216,9 @@ def summarize_group_rows(rows: list[dict[str, Any]], key_name: str) -> dict[str,
     )
     scalar_keys = [
         "baseline_total_mae",
+        "input_prior_total_mae",
         "refined_total_mae",
+        "gain_total",
         "improvement_total",
         "baseline_psnr",
         "refined_psnr",
@@ -1158,6 +1235,11 @@ def summarize_group_rows(rows: list[dict[str, Any]], key_name: str) -> dict[str,
         "prior_residual_safety_score",
         "prior_residual_regression_rate",
         "prior_residual_unnecessary_change_rate",
+        "prior_reliability_mean",
+        "change_gate_mean",
+        "mean_abs_delta",
+        "boundary_delta_mean",
+        "bootstrap_enabled",
     ]
     for row in rows:
         key = str(row.get(key_name, "unknown"))
@@ -1207,7 +1289,9 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "refined_roughness_mae",
         "refined_metallic_mae",
         "baseline_total_mae",
+        "input_prior_total_mae",
         "refined_total_mae",
+        "gain_total",
         "improvement_total",
         "baseline_psnr",
         "refined_psnr",
@@ -1224,6 +1308,11 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "prior_residual_safety_score",
         "prior_residual_regression_rate",
         "prior_residual_unnecessary_change_rate",
+        "prior_reliability_mean",
+        "change_gate_mean",
+        "mean_abs_delta",
+        "boundary_delta_mean",
+        "bootstrap_enabled",
         "gt_metallic_mean",
         "baseline_pred_metallic_mean",
         "refined_pred_metallic_mean",
@@ -1234,10 +1323,16 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "source_name",
         "category_bucket",
         "prior_label",
+        "prior_source_type",
+        "prior_generation_mode",
+        "prior_mode",
+        "has_material_prior",
         "supervision_tier",
         "supervision_role",
         "license_bucket",
         "target_source_type",
+        "target_prior_identity",
+        "target_is_prior_copy",
         "target_quality_tier",
         "paper_split",
         "material_family",
@@ -1511,7 +1606,9 @@ def build_model_cfg_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     for key in MODEL_CFG_OVERRIDE_KEYS:
         if hasattr(args, key):
-            overrides[key] = getattr(args, key)
+            value = getattr(args, key)
+            if value is not None:
+                overrides[key] = value
     return overrides
 
 
@@ -1708,8 +1805,19 @@ def main() -> None:
         } if variant_outputs is not default_outputs else default_outputs
         batch_seconds = time.perf_counter() - start_time
         summary["batch_seconds"].append(float(batch_seconds))
-        baseline = default_outputs["baseline"]
+        baseline = default_outputs.get("input_prior", default_outputs["baseline"])
         refined = outputs["refined"]
+        diagnostics = outputs.get("diagnostics") or {}
+        prior_init_outputs = outputs.get("prior_init_outputs") or {}
+        rm_init = outputs.get("rm_init", outputs.get("initial", baseline))
+        delta_rm = outputs.get("delta_rm", outputs.get("residual_delta", refined - baseline))
+        change_gate = outputs.get("change_gate", outputs.get("residual_gate"))
+        prior_reliability = outputs.get("prior_reliability")
+        bootstrap_rm = (
+            prior_init_outputs.get("bootstrap_rm_uv")
+            if isinstance(prior_init_outputs, dict)
+            else None
+        )
         if args.eval_variant == "scalar_broadcast":
             prior_scalar_roughness = batch["uv_prior_roughness"].flatten(2).mean(dim=2, keepdim=True).view(-1, 1, 1, 1)
             prior_scalar_metallic = batch["uv_prior_metallic"].flatten(2).mean(dim=2, keepdim=True).view(-1, 1, 1, 1)
@@ -1731,6 +1839,26 @@ def main() -> None:
         confidence = batch["uv_target_confidence"]
 
         for item_idx, object_id in enumerate(batch["object_id"]):
+            def tensor_item_mean(value: Any) -> float | None:
+                if not isinstance(value, torch.Tensor):
+                    return None
+                tensor = value.detach().cpu()
+                if tensor.ndim == 0:
+                    return float(tensor.item())
+                if tensor.shape[0] <= item_idx:
+                    return None
+                return float(tensor[item_idx].float().mean().item())
+
+            def diag_item_value(key: str) -> float | None:
+                value = diagnostics.get(key) if isinstance(diagnostics, dict) else None
+                if isinstance(value, torch.Tensor):
+                    tensor = value.detach().cpu().flatten()
+                    if tensor.numel() > item_idx:
+                        return float(tensor[item_idx].item())
+                    if tensor.numel() == 1:
+                        return float(tensor.item())
+                return finite_or_none(value)
+
             global_object_index = processed_records + item_idx
             write_artifacts = args.max_artifact_objects <= 0 or global_object_index < args.max_artifact_objects
             object_dir = output_dir / "artifacts" / object_id
@@ -1744,7 +1872,37 @@ def main() -> None:
                     refined_metallic=refined[item_idx, 1],
                     confidence=confidence[item_idx],
                 )
+                tensor_to_pil(rm_init[item_idx, 0:1], grayscale=True).save(object_dir / "rm_init_roughness.png")
+                tensor_to_pil(rm_init[item_idx, 1:2], grayscale=True).save(object_dir / "rm_init_metallic.png")
+                tensor_to_pil(delta_rm[item_idx].abs().mean(dim=0, keepdim=True).clamp(0.0, 1.0), grayscale=True).save(object_dir / "delta_abs.png")
+                atlas_paths["rm_init_roughness"] = object_dir / "rm_init_roughness.png"
+                atlas_paths["rm_init_metallic"] = object_dir / "rm_init_metallic.png"
+                atlas_paths["delta_abs"] = object_dir / "delta_abs.png"
+                if isinstance(change_gate, torch.Tensor):
+                    gate = change_gate[item_idx].detach().cpu()
+                    if gate.ndim == 3 and gate.shape[0] > 1:
+                        gate = gate.mean(dim=0, keepdim=True)
+                    tensor_to_pil(gate[:1], grayscale=True).save(object_dir / "change_gate.png")
+                    atlas_paths["change_gate"] = object_dir / "change_gate.png"
+                if isinstance(prior_reliability, torch.Tensor):
+                    reliability = prior_reliability[item_idx].detach().cpu()
+                    if reliability.ndim == 3 and reliability.shape[0] > 1:
+                        reliability = reliability.mean(dim=0, keepdim=True)
+                    tensor_to_pil(reliability[:1], grayscale=True).save(object_dir / "prior_reliability.png")
+                    atlas_paths["prior_reliability"] = object_dir / "prior_reliability.png"
+                if isinstance(bootstrap_rm, torch.Tensor):
+                    bootstrap = bootstrap_rm.detach().cpu()
+                    if bootstrap.shape[0] > item_idx and bootstrap.shape[1] >= 2:
+                        tensor_to_pil(bootstrap[item_idx, 0:1], grayscale=True).save(object_dir / "bootstrap_roughness.png")
+                        tensor_to_pil(bootstrap[item_idx, 1:2], grayscale=True).save(object_dir / "bootstrap_metallic.png")
+                        atlas_paths["bootstrap_roughness"] = object_dir / "bootstrap_roughness.png"
+                        atlas_paths["bootstrap_metallic"] = object_dir / "bootstrap_metallic.png"
             target_item = target[item_idx]
+            prior_reliability_mean = tensor_item_mean(prior_reliability)
+            change_gate_mean = tensor_item_mean(change_gate)
+            mean_abs_delta = diag_item_value("mean_abs_delta")
+            boundary_delta_mean = diag_item_value("boundary_delta_mean")
+            bootstrap_enabled = diag_item_value("bootstrap_enabled")
             if write_artifacts:
                 target_roughness_path = object_dir / "target_roughness.png"
                 target_metallic_path = object_dir / "target_metallic.png"
@@ -1789,11 +1947,27 @@ def main() -> None:
             generator_id = str(batch["generator_id"][item_idx])
             source_name = str(batch["source_name"][item_idx])
             category_bucket = str(batch["category_bucket"][item_idx])
-            prior_label = "with_prior" if bool(batch["has_material_prior"][item_idx]) else "without_prior"
+            has_material_prior = bool(batch["has_material_prior"][item_idx])
+            prior_label = "with_prior" if has_material_prior else "without_prior"
+            prior_mode = str(batch["prior_mode"][item_idx])
+            prior_generation_mode = first_nonempty(
+                batch_item_value(batch, metadata, "prior_generation_mode", item_idx, ""),
+                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
+                prior_mode,
+            )
+            prior_source_type = first_nonempty(
+                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
+                prior_generation_mode,
+                prior_mode,
+            )
             supervision_tier = str(batch["supervision_tier"][item_idx])
             supervision_role = str(batch["supervision_role"][item_idx])
             license_bucket = str(batch["license_bucket"][item_idx])
             target_source_type = str(batch["target_source_type"][item_idx])
+            target_is_prior_copy = parse_bool(
+                batch_item_value(batch, metadata, "target_is_prior_copy", item_idx, False)
+            )
+            target_prior_identity = float(batch["target_prior_identity"][item_idx].item())
             target_quality_tier = str(batch["target_quality_tier"][item_idx])
             paper_split = str(batch["paper_split"][item_idx])
             material_family = str(batch["material_family"][item_idx])
@@ -1832,6 +2006,9 @@ def main() -> None:
 
             view_targets = batch["view_targets"]
             view_uvs = batch["view_uvs"]
+            input_prior_total_uv = baseline_uv_roughness_mae + baseline_uv_metallic_mae
+            refined_total_uv = refined_uv_roughness_mae + refined_uv_metallic_mae
+            gain_total_uv = input_prior_total_uv - refined_total_uv
             if view_targets is None or view_uvs is None or not has_effective_view_supervision:
                 rows.append(
                     {
@@ -1840,10 +2017,16 @@ def main() -> None:
                         "source_name": source_name,
                         "category_bucket": category_bucket,
                         "prior_label": prior_label,
+                        "prior_source_type": prior_source_type,
+                        "prior_generation_mode": prior_generation_mode,
+                        "prior_mode": prior_mode,
+                        "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
                         "license_bucket": license_bucket,
                         "target_source_type": target_source_type,
+                        "target_prior_identity": target_prior_identity,
+                        "target_is_prior_copy": target_is_prior_copy,
                         "target_quality_tier": target_quality_tier,
                         "paper_split": paper_split,
                         "material_family": material_family,
@@ -1856,7 +2039,9 @@ def main() -> None:
                         "refined_roughness_mae": refined_uv_roughness_mae,
                         "refined_metallic_mae": refined_uv_metallic_mae,
                         "baseline_total_mae": baseline_uv_roughness_mae + baseline_uv_metallic_mae,
+                        "input_prior_total_mae": input_prior_total_uv,
                         "refined_total_mae": refined_uv_roughness_mae + refined_uv_metallic_mae,
+                        "gain_total": gain_total_uv,
                         "improvement_total": (baseline_uv_roughness_mae + baseline_uv_metallic_mae)
                         - (refined_uv_roughness_mae + refined_uv_metallic_mae),
                         "baseline_tags": [],
@@ -1880,6 +2065,11 @@ def main() -> None:
                         "prior_residual_unnecessary_change_rate": residual_safety["unnecessary_change_rate"],
                         "prior_residual_regression_rate": residual_safety["regression_rate"],
                         "prior_residual_changed_pixel_rate": residual_safety["changed_pixel_rate"],
+                        "prior_reliability_mean": prior_reliability_mean,
+                        "change_gate_mean": change_gate_mean,
+                        "mean_abs_delta": mean_abs_delta,
+                        "boundary_delta_mean": boundary_delta_mean,
+                        "bootstrap_enabled": bootstrap_enabled,
                         "gt_metallic_mean": uv_gt_metal_mean,
                         "baseline_pred_metallic_mean": uv_baseline_metal_mean,
                         "refined_pred_metallic_mean": uv_refined_metal_mean,
@@ -1951,6 +2141,9 @@ def main() -> None:
                 baseline_metal_mae = float(np.abs(baseline_view[1][mask_np] - gt_metal[mask_np]).mean())
                 refined_rough_mae = float(np.abs(refined_view[0][mask_np] - gt_rough[mask_np]).mean())
                 refined_metal_mae = float(np.abs(refined_view[1][mask_np] - gt_metal[mask_np]).mean())
+                input_prior_total_view = baseline_rough_mae + baseline_metal_mae
+                refined_total_view = refined_rough_mae + refined_metal_mae
+                gain_total_view = input_prior_total_view - refined_total_view
                 target_view = np.stack([gt_rough, gt_metal], axis=0)
                 baseline_boundary = compute_boundary_bleed_metrics(
                     baseline_view,
@@ -2045,10 +2238,16 @@ def main() -> None:
                         "source_name": source_name,
                         "category_bucket": category_bucket,
                         "prior_label": prior_label,
+                        "prior_source_type": prior_source_type,
+                        "prior_generation_mode": prior_generation_mode,
+                        "prior_mode": prior_mode,
+                        "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
                         "license_bucket": license_bucket,
                         "target_source_type": target_source_type,
+                        "target_prior_identity": target_prior_identity,
+                        "target_is_prior_copy": target_is_prior_copy,
                         "target_quality_tier": target_quality_tier,
                         "paper_split": paper_split,
                         "material_family": material_family,
@@ -2061,7 +2260,9 @@ def main() -> None:
                         "refined_roughness_mae": refined_rough_mae,
                         "refined_metallic_mae": refined_metal_mae,
                         "baseline_total_mae": baseline_rough_mae + baseline_metal_mae,
+                        "input_prior_total_mae": input_prior_total_view,
                         "refined_total_mae": refined_rough_mae + refined_metal_mae,
+                        "gain_total": gain_total_view,
                         "improvement_total": (baseline_rough_mae + baseline_metal_mae)
                         - (refined_rough_mae + refined_metal_mae),
                         "baseline_psnr": baseline_psnr,
@@ -2093,6 +2294,11 @@ def main() -> None:
                         "prior_residual_unnecessary_change_rate": residual_safety["unnecessary_change_rate"],
                         "prior_residual_regression_rate": residual_safety["regression_rate"],
                         "prior_residual_changed_pixel_rate": residual_safety["changed_pixel_rate"],
+                        "prior_reliability_mean": prior_reliability_mean,
+                        "change_gate_mean": change_gate_mean,
+                        "mean_abs_delta": mean_abs_delta,
+                        "boundary_delta_mean": boundary_delta_mean,
+                        "bootstrap_enabled": bootstrap_enabled,
                         "gt_roughness_mean": gt_rough_stats["mean"],
                         "gt_metallic_mean": gt_metal_stats["mean"],
                         "baseline_pred_roughness_mean": base_pred_rough_mean,
@@ -2195,6 +2401,18 @@ def main() -> None:
         object_refined_total_mae,
         higher_is_better=False,
     )
+    uv_direction_rates = pair_direction_rates(
+        summary["baseline_total_mae"],
+        summary["refined_total_mae"],
+    )
+    view_direction_rates = pair_direction_rates(
+        [row.get("baseline_total_mae") for row in rows],
+        [row.get("refined_total_mae") for row in rows],
+    )
+    object_direction_rates = pair_direction_rates(
+        [row.get("baseline_total_mae") for row in object_rows],
+        [row.get("refined_total_mae") for row in object_rows],
+    )
     uv_confusion_baseline = binary_confusion_metrics(
         summary["metal_labels"],
         summary["baseline_metal_scores"],
@@ -2254,6 +2472,8 @@ def main() -> None:
         "by_license_bucket": summarize_group_rows(rows, "license_bucket"),
         "by_category_bucket": summarize_group_rows(rows, "category_bucket"),
         "by_prior_label": summarize_group_rows(rows, "prior_label"),
+        "by_prior_source_type": summarize_group_rows(rows, "prior_source_type"),
+        "by_prior_mode": summarize_group_rows(rows, "prior_mode"),
         "by_supervision_tier": summarize_group_rows(rows, "supervision_tier"),
         "by_supervision_role": summarize_group_rows(rows, "supervision_role"),
         "by_target_quality_tier": summarize_group_rows(rows, "target_quality_tier"),
@@ -2419,8 +2639,23 @@ def main() -> None:
         "refined_roughness_mae": uv_refined_roughness_mae,
         "refined_metallic_mae": uv_refined_metallic_mae,
         "baseline_total_mae": uv_baseline_total_mae,
+        "input_prior_total_mae": uv_baseline_total_mae,
         "refined_total_mae": uv_refined_total_mae,
+        "gain_total": uv_improvement_total,
         "avg_improvement_total": uv_improvement_total,
+        "improvement_rate": uv_direction_rates["improvement_rate"],
+        "regression_rate": uv_direction_rates["regression_rate"],
+        "tie_rate": uv_direction_rates["tie_rate"],
+        "metric_basis_note": (
+            "Top-level improvement/regression rates are UV-object rates and share the same basis as "
+            "top-level input_prior_total_mae/refined_total_mae. View/object rates are reported under "
+            "view_level and object_level."
+        ),
+        "prior_reliability_mean": optional_mean([row.get("prior_reliability_mean") for row in rows]),
+        "change_gate_mean": optional_mean([row.get("change_gate_mean") for row in rows]),
+        "mean_abs_delta": optional_mean([row.get("mean_abs_delta") for row in rows]),
+        "boundary_delta_mean": optional_mean([row.get("boundary_delta_mean") for row in rows]),
+        "bootstrap_enabled_rate": optional_mean([row.get("bootstrap_enabled") for row in rows]),
         "metal_nonmetal": {
             "threshold": METAL_THRESHOLD,
             "baseline_f1": uv_confusion_baseline["f1"],
@@ -2448,11 +2683,18 @@ def main() -> None:
             "objects": len(object_rows),
             "metric_level": "object_mean_of_view_rows",
             "baseline_total_mae": object_baseline_total_mae,
+            "input_prior_total_mae": object_baseline_total_mae,
             "refined_total_mae": object_refined_total_mae,
+            "gain_total": object_improvement_total,
             "avg_improvement_total": object_improvement_total,
+            "improvement_rate": object_direction_rates["improvement_rate"],
+            "regression_rate": object_direction_rates["regression_rate"],
+            "tie_rate": object_direction_rates["tie_rate"],
             "by_source_name": summarize_group_rows(object_rows, "source_name"),
             "by_generator_id": summarize_group_rows(object_rows, "generator_id"),
             "by_prior_label": summarize_group_rows(object_rows, "prior_label"),
+            "by_prior_source_type": summarize_group_rows(object_rows, "prior_source_type"),
+            "by_prior_mode": summarize_group_rows(object_rows, "prior_mode"),
             "by_target_quality_tier": summarize_group_rows(object_rows, "target_quality_tier"),
             "by_material_family": summarize_group_rows(object_rows, "material_family"),
             "by_paper_split": summarize_group_rows(object_rows, "paper_split"),
@@ -2461,8 +2703,13 @@ def main() -> None:
             "metric_level": "view_rows",
             "rows": len(rows),
             "baseline_total_mae": view_baseline_total_mae,
+            "input_prior_total_mae": view_baseline_total_mae,
             "refined_total_mae": view_refined_total_mae,
+            "gain_total": view_improvement_total,
             "avg_improvement_total": view_improvement_total,
+            "improvement_rate": view_direction_rates["improvement_rate"],
+            "regression_rate": view_direction_rates["regression_rate"],
+            "tie_rate": view_direction_rates["tie_rate"],
         },
         "metrics_main": metrics_main,
         "metrics_material_specific": metrics_material_specific,
@@ -2498,8 +2745,8 @@ def main() -> None:
     )
     summary_payload["paper_main_table"] = {
         "method_order": [
-            "SF3D Original",
-            "SF3D Canonical Prior",
+            "Original Generator Asset",
+            "Input Prior",
             "Prior Smoothing",
             "Scalar Broadcast",
             "Ours w/o View",
@@ -2541,6 +2788,20 @@ def main() -> None:
                 "eval/main/mse": main_metrics["proxy_render_mse"]["refined"],
                 "eval/main/ssim": main_metrics["proxy_render_ssim"]["refined"],
                 "eval/main/lpips": main_metrics["proxy_render_lpips"]["refined"],
+                "eval/input_prior_total_mae": summary_payload["input_prior_total_mae"],
+                "eval/refined_total_mae": summary_payload["refined_total_mae"],
+                "eval/gain_total": summary_payload["gain_total"],
+                "eval/improvement_rate": summary_payload.get("improvement_rate"),
+                "eval/regression_rate": summary_payload.get("regression_rate"),
+                "eval/view_level/improvement_rate": summary_payload.get("view_level", {}).get("improvement_rate"),
+                "eval/view_level/regression_rate": summary_payload.get("view_level", {}).get("regression_rate"),
+                "eval/object_level/improvement_rate": summary_payload.get("object_level", {}).get("improvement_rate"),
+                "eval/object_level/regression_rate": summary_payload.get("object_level", {}).get("regression_rate"),
+                "eval/diagnostics/prior_reliability_mean": summary_payload.get("prior_reliability_mean"),
+                "eval/diagnostics/change_gate_mean": summary_payload.get("change_gate_mean"),
+                "eval/diagnostics/mean_abs_delta": summary_payload.get("mean_abs_delta"),
+                "eval/diagnostics/boundary_delta_mean": summary_payload.get("boundary_delta_mean"),
+                "eval/diagnostics/bootstrap_enabled_rate": summary_payload.get("bootstrap_enabled_rate"),
                 "eval/rm/uv_total_mae": main_metrics["uv_rm_mae"]["total"]["refined"],
                 "eval/rm/view_total_mae": main_metrics["view_rm_mae"]["total"]["refined"],
                 "eval/special/boundary_bleed_score": special_metrics["boundary_bleed_score"]["refined"],
@@ -2589,8 +2850,13 @@ def main() -> None:
                     "generator_id",
                     "source_name",
                     "prior_label",
+                    "prior_source_type",
+                    "prior_mode",
+                    "target_source_type",
                     "baseline_total_mae",
+                    "input_prior_total_mae",
                     "refined_total_mae",
+                    "gain_total",
                     "improvement_total",
                     "baseline_roughness",
                     "baseline_metallic",
@@ -2614,8 +2880,13 @@ def main() -> None:
                     row.get("generator_id", "unknown"),
                     row.get("source_name", "unknown"),
                     row.get("prior_label", "unknown"),
+                    row.get("prior_source_type", "unknown"),
+                    row.get("prior_mode", "unknown"),
+                    row.get("target_source_type", "unknown"),
                     row["baseline_total_mae"],
+                    row.get("input_prior_total_mae", row["baseline_total_mae"]),
                     row["refined_total_mae"],
+                    row.get("gain_total", row["improvement_total"]),
                     row["improvement_total"],
                     wandb.Image(paths["baseline_roughness"]) if paths.get("baseline_roughness") else None,
                     wandb.Image(paths["baseline_metallic"]) if paths.get("baseline_metallic") else None,

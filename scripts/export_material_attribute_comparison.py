@@ -91,6 +91,14 @@ def build_attribute_rows(metrics_rows: list[dict[str, Any]]) -> list[dict[str, A
             "generator_id": metric_row.get("generator_id", "unknown"),
             "source_name": metric_row.get("source_name", "unknown"),
             "prior_label": metric_row.get("prior_label", "unknown"),
+            "prior_source_type": metric_row.get("prior_source_type", "unknown"),
+            "prior_generation_mode": metric_row.get("prior_generation_mode", "unknown"),
+            "prior_mode": metric_row.get("prior_mode", "unknown"),
+            "has_material_prior": metric_row.get("has_material_prior"),
+            "target_source_type": metric_row.get("target_source_type", "unknown"),
+            "target_prior_identity": metric_row.get("target_prior_identity"),
+            "target_quality_tier": metric_row.get("target_quality_tier", "unknown"),
+            "material_family": metric_row.get("material_family", "unknown"),
             "supervision_tier": metric_row.get("supervision_tier", "unknown"),
             "baseline_roughness": map_stats(baseline_roughness, mask),
             "refined_roughness": map_stats(refined_roughness, mask),
@@ -104,10 +112,12 @@ def build_attribute_rows(metrics_rows: list[dict[str, Any]]) -> list[dict[str, A
         row.update(
             {
                 "baseline_roughness_mean": row["baseline_roughness"]["mean"],
+                "input_prior_roughness_mean": row["baseline_roughness"]["mean"],
                 "refined_roughness_mean": row["refined_roughness"]["mean"],
                 "roughness_delta_mean": row["roughness_delta"]["mean"],
                 "roughness_abs_delta_mean": row["roughness_abs_delta"]["mean"],
                 "baseline_metallic_mean": row["baseline_metallic"]["mean"],
+                "input_prior_metallic_mean": row["baseline_metallic"]["mean"],
                 "refined_metallic_mean": row["refined_metallic"]["mean"],
                 "metallic_delta_mean": row["metallic_delta"]["mean"],
                 "metallic_abs_delta_mean": row["metallic_abs_delta"]["mean"],
@@ -178,10 +188,10 @@ def save_html(summary: dict[str, Any], plot_path: Path, output_path: Path) -> No
         "<html><head><meta charset='utf-8'><title>Material Attribute Comparison</title>",
         "<style>body{font-family:Arial,sans-serif;background:#10151d;color:#edf2f7;margin:0;padding:24px}.wrap{max-width:1280px;margin:auto}.card{background:#18202b;border-radius:18px;padding:18px;margin:16px 0}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #334052;padding:8px;text-align:left}img{max-width:100%;border-radius:14px;background:white}</style>",
         "</head><body><div class='wrap'>",
-        "<h1>Material Attribute Comparison</h1>",
-        "<p>Baseline means the input prior roughness/metallic atlas used by the refiner. It may come from SF3D, an external asset prior, a scalar broadcast prior, or a fallback/no-prior default depending on prior_source_type.</p>",
+        "<h1>Input Prior vs Material Refiner Attribute Comparison</h1>",
+        "<p>Input Prior means the roughness/metallic atlas used by the refiner. It may come from SF3D, external assets, scalar broadcast, synthetic degraded prior, or fallback/no-prior default depending on prior_source_type.</p>",
         f"<div class='card'><img src='{html.escape(plot_path.name)}' alt='attribute comparison'></div>",
-        "<div class='card'><h2>By Source</h2><table><thead><tr><th>Group</th><th>Count</th><th>Baseline R</th><th>Refined R</th><th>|ΔR|</th><th>Baseline M</th><th>Refined M</th><th>|ΔM|</th></tr></thead><tbody>",
+        "<div class='card'><h2>By Source</h2><table><thead><tr><th>Group</th><th>Count</th><th>Input Prior R</th><th>Refined R</th><th>|ΔR|</th><th>Input Prior M</th><th>Refined M</th><th>|ΔM|</th></tr></thead><tbody>",
     ]
     for group, item in summary["by_source_name"].items():
         rows.append(
@@ -212,6 +222,10 @@ def main() -> None:
         "by_generator_id": grouped_summary(rows, "generator_id"),
         "by_source_name": grouped_summary(rows, "source_name"),
         "by_prior_label": grouped_summary(rows, "prior_label"),
+        "by_prior_source_type": grouped_summary(rows, "prior_source_type"),
+        "by_prior_mode": grouped_summary(rows, "prior_mode"),
+        "by_material_family": grouped_summary(rows, "material_family"),
+        "by_target_source_type": grouped_summary(rows, "target_source_type"),
         "by_supervision_tier": grouped_summary(rows, "supervision_tier"),
         "records": rows,
     }

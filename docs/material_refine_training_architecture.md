@@ -110,7 +110,7 @@ The launcher runs the whole gated round in order:
 - GPU0 memory wait through `nvidia-ml-py`
 - training
 - evaluation
-- SF3D baseline vs refined attribute comparison
+- input-prior baseline vs refined attribute comparison
 - validation inference comparison panels
 - manifest audit
 - round analysis
@@ -384,8 +384,8 @@ Evaluation logs:
 
 Validation panel logs:
 
-- original SF3D RGB views
-- SF3D baseline roughness/metallic atlas maps
+- original/canonical input RGB views
+- input-prior roughness/metallic atlas maps
 - refined roughness/metallic atlas maps
 - absolute delta maps
 - target confidence

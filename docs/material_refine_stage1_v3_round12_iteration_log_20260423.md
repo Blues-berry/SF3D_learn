@@ -150,7 +150,7 @@ W&B：
 
 早期判断：
 
-模型正在快速适应 v3 多源/no-prior 数据，但 progress 6 仍未打过 SF3D baseline。progress 5 的 proxy view delta 为负，说明 render proxy 也还没有恢复。当前继续训练到中段；如果 progress 10-15 仍无法接近 baseline，则下一轮不应继续加学习率，而应改成更强 residual gate / prior-bootstrap safety 版本。
+模型正在快速适应 v3 多源/no-prior 数据，但 progress 6 仍未打过当时的 input-prior baseline（主要来自 SF3D prior）。progress 5 的 proxy view delta 为负，说明 render proxy 也还没有恢复。当前继续训练到中段；如果 progress 10-15 仍无法接近 baseline，则下一轮不应继续加学习率，而应改成更强 residual gate / prior-bootstrap safety 版本。
 
 ## 验收逻辑
 

@@ -80,9 +80,9 @@ def prior_display_label(row: dict[str, Any], record: dict[str, Any] | None) -> s
     mapping = {
         "true_sf3d_rm_texture": "SF3D RM Texture",
         "sf3d_rm_texture": "SF3D RM Texture",
-        "true_sf3d_scalar_broadcast": "SF3D Scalar Broadcast",
-        "sf3d_scalar_broadcast": "SF3D Scalar Broadcast",
-        "sf3d_missing_rm_fallback": "SF3D No-RM Fallback",
+        "true_sf3d_scalar_broadcast": "SF3D Scalar Prior",
+        "sf3d_scalar_broadcast": "SF3D Scalar Prior",
+        "sf3d_missing_rm_fallback": "Fallback Prior",
         "external_asset_rm_texture": "External Asset Prior",
         "external_asset_scalar_broadcast": "External Scalar Prior",
         "synthetic_degraded_prior": "Synthetic Prior",
@@ -104,11 +104,15 @@ def prior_display_label(row: dict[str, Any], record: dict[str, Any] | None) -> s
 
 def baseline_metadata(row: dict[str, Any], record: dict[str, Any] | None) -> str:
     prior_source = get_value(row, record, "prior_source_type", get_value(row, record, "prior_generation_mode", "unknown"))
+    prior_generation = get_value(row, record, "prior_generation_mode", prior_source)
     target_source = get_value(row, record, "target_source_type", "unknown")
+    target_identity = get_value(row, record, "target_prior_identity", "unknown")
+    prior_label = prior_display_label(row, record)
     return (
-        f"baseline={prior_display_label(row, record)} | "
+        f"baseline_label={prior_label} | prior_label={prior_label} | "
         f"prior_mode={get_value(row, record, 'prior_mode', 'unknown')} | "
-        f"prior_source={prior_source} | target={target_source}"
+        f"prior_source_type={prior_source} | prior_generation_mode={prior_generation} | "
+        f"target_source_type={target_source} | target_prior_identity={target_identity}"
     )
 
 
@@ -224,7 +228,29 @@ def choose_object_rows(rows: list[dict[str, Any]], max_panels: int) -> list[dict
         current = by_object.get(object_id)
         if current is None or float(row.get("improvement_total", 0.0)) < float(current.get("improvement_total", 0.0)):
             by_object[object_id] = row
-    return sorted(by_object.values(), key=lambda row: (float(row.get("improvement_total", 0.0)), -float(row.get("refined_total_mae", 0.0))))[:max_panels]
+    representatives = list(by_object.values())
+    if max_panels <= 0:
+        return representatives
+
+    def gain(row: dict[str, Any]) -> float:
+        return float(row.get("gain_total", row.get("improvement_total", 0.0)) or 0.0)
+
+    quota = max(1, max_panels // 3)
+    improved = sorted([row for row in representatives if gain(row) > 0.0], key=gain, reverse=True)[:quota]
+    regressed = sorted([row for row in representatives if gain(row) < 0.0], key=gain)[:quota]
+    uncertain = sorted(representatives, key=lambda row: abs(gain(row)))[:quota]
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for bucket in (improved, regressed, uncertain, representatives):
+        for row in bucket:
+            object_id = str(row.get("object_id", ""))
+            if object_id in seen:
+                continue
+            selected.append(row)
+            seen.add(object_id)
+            if len(selected) >= max_panels:
+                return selected
+    return selected
 
 
 def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_path: Path, manifest_payload: dict[str, Any], size: int) -> Image.Image:
@@ -239,13 +265,26 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
 
     prior_label = prior_display_label(row, record)
     tiles.extend([
-        label_image(load_image(paths.get("baseline_roughness"), size=size, mode="L"), f"{prior_label} roughness"),
-        label_image(load_image(paths.get("baseline_metallic"), size=size, mode="L"), f"{prior_label} metallic"),
-        label_image(load_image(paths.get("refined_roughness"), size=size, mode="L"), "R refined roughness"),
-        label_image(load_image(paths.get("refined_metallic"), size=size, mode="L"), "R refined metallic"),
-        label_image(delta_image(paths.get("baseline_roughness"), paths.get("refined_roughness"), size=size), "|delta roughness|"),
-        label_image(delta_image(paths.get("baseline_metallic"), paths.get("refined_metallic"), size=size), "|delta metallic|"),
-        label_image(load_image(paths.get("confidence"), size=size, mode="L"), "target confidence"),
+        label_image(load_image(paths.get("baseline_roughness"), size=size, mode="L"), "Input Prior rough"),
+        label_image(load_image(paths.get("baseline_metallic"), size=size, mode="L"), "Input Prior metal"),
+        label_image(load_image(paths.get("confidence"), size=size, mode="L"), "Prior/target conf"),
+        label_image(load_image(paths.get("prior_reliability"), size=size, mode="L"), "Prior reliability"),
+        label_image(load_image(paths.get("change_gate"), size=size, mode="L"), "Change gate"),
+        label_image(load_image(paths.get("rm_init_roughness"), size=size, mode="L"), "RM init rough"),
+        label_image(load_image(paths.get("rm_init_metallic"), size=size, mode="L"), "RM init metal"),
+        label_image(load_image(paths.get("bootstrap_roughness"), size=size, mode="L"), "Bootstrap rough"),
+        label_image(load_image(paths.get("bootstrap_metallic"), size=size, mode="L"), "Bootstrap metal"),
+        label_image(load_image(paths.get("target_roughness"), size=size, mode="L"), "GT rough"),
+        label_image(load_image(paths.get("target_metallic"), size=size, mode="L"), "GT metal"),
+        label_image(load_image(paths.get("refined_roughness"), size=size, mode="L"), "Pred rough"),
+        label_image(load_image(paths.get("refined_metallic"), size=size, mode="L"), "Pred metal"),
+        label_image(load_image(paths.get("delta_abs"), size=size, mode="L"), "|Pred-Init| delta"),
+        label_image(delta_image(paths.get("baseline_roughness"), paths.get("target_roughness"), size=size), "|Prior-GT| rough"),
+        label_image(delta_image(paths.get("refined_roughness"), paths.get("target_roughness"), size=size), "|Pred-GT| rough"),
+        label_image(delta_image(paths.get("refined_roughness"), paths.get("baseline_roughness"), size=size), "|Pred-Prior| rough"),
+        label_image(delta_image(paths.get("baseline_metallic"), paths.get("target_metallic"), size=size), "|Prior-GT| metal"),
+        label_image(delta_image(paths.get("refined_metallic"), paths.get("target_metallic"), size=size), "|Pred-GT| metal"),
+        label_image(delta_image(paths.get("refined_metallic"), paths.get("baseline_metallic"), size=size), "|Pred-Prior| metal"),
     ])
 
     columns = 5
@@ -254,8 +293,19 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
     tile_width, tile_height = tiles[0].size
     canvas = Image.new("RGB", (columns * tile_width, header_height + rows * tile_height), (9, 13, 19))
     draw = ImageDraw.Draw(canvas)
-    title = f"{row.get('object_id')} | generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | {baseline_metadata(row, record)} | {row.get('view_name')}"
-    metrics = f"baseline_total={fmt_metric(row.get('baseline_total_mae'))}  refined_total={fmt_metric(row.get('refined_total_mae'))}  improvement={fmt_metric(row.get('improvement_total'))}"
+    title = (
+        f"{row.get('object_id')} | generator={row.get('generator_id', 'unknown')} | "
+        f"source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | "
+        f"{row.get('view_name')} | {prior_label}"
+    )
+    regression_flag = bool((finite_float(row.get("gain_total", row.get("improvement_total"))) or 0.0) < 0.0)
+    metrics = (
+        f"{baseline_metadata(row, record)} | "
+        f"input_prior_total={fmt_metric(row.get('input_prior_total_mae', row.get('baseline_total_mae')))}  "
+        f"refined_total={fmt_metric(row.get('refined_total_mae'))}  "
+        f"gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))}  "
+        f"regression_flag={regression_flag}"
+    )
     draw.text((14, 14), title, fill=(242, 247, 255))
     draw.text((14, 42), metrics, fill=(180, 205, 224))
     for idx, tile in enumerate(tiles):
@@ -270,7 +320,7 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
         cards.append("\n".join([
             "<section class='card'>",
             f"<h2>{row.get('object_id')}</h2>",
-            "<div class='meta'>" + f"generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | {baseline_metadata(row, record)} | improvement={fmt_metric(row.get('improvement_total'))}" + "</div>",
+            "<div class='meta'>" + f"generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | {baseline_metadata(row, record)} | gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))}" + "</div>",
             f"<img src='{panel_path.name}' alt='{row.get('object_id')} comparison panel'>",
             "</section>",
         ]))
@@ -280,7 +330,7 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
         "<html><head><meta charset='utf-8'><title>Material Validation Comparison Panels</title>",
         "<style>body{margin:0;background:#081019;color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1400px;margin:0 auto;padding:28px}.card{background:#111b27;border:1px solid #263648;border-radius:18px;padding:18px;margin:18px 0}.meta{color:#a9c4d8;margin:6px 0 14px}img{width:100%;border-radius:12px;background:#090d13}</style></head><body><main class='wrap'>",
         "<h1>Input Prior vs Material Refiner Validation Panels</h1>",
-        "<p>Each panel shows input/canonical RGB views, input prior RM atlas maps, refined RM atlas maps, deltas, and target confidence. The prior label is source-aware and should only say SF3D when the atlas is traceable to an SF3D output.</p>",
+        "<p>Each panel shows canonical RGB views, input prior RM maps, GT/target maps, predicted maps, and error maps. The prior label is source-aware and should only say SF3D when the atlas is traceable to an SF3D output.</p>",
         *cards,
         "</main></body></html>",
     ]), encoding="utf-8")
@@ -315,7 +365,9 @@ def main() -> None:
         },
         "metrics_mean": {
             "baseline_total_mae": mean_metric(selected_rows, "baseline_total_mae"),
+            "input_prior_total_mae": mean_metric(selected_rows, "input_prior_total_mae"),
             "refined_total_mae": mean_metric(selected_rows, "refined_total_mae"),
+            "gain_total": mean_metric(selected_rows, "gain_total"),
             "improvement_total": mean_metric(selected_rows, "improvement_total"),
         },
         "warnings": [f"missing_baseline_total_mae:{object_id}" for object_id in missing_baseline_rows],
@@ -341,22 +393,22 @@ def main() -> None:
         run.log({
             "validation_panels/count": len(panel_paths),
             "validation_panels/uploaded_panel_count": min(len(panel_paths), max(int(args.wandb_max_panel_images), 0)),
-            "validation_panels/baseline_total_mae_mean": summary["metrics_mean"]["baseline_total_mae"],
+            "validation_panels/input_prior_total_mae_mean": summary["metrics_mean"]["input_prior_total_mae"] or summary["metrics_mean"]["baseline_total_mae"],
             "validation_panels/refined_total_mae_mean": summary["metrics_mean"]["refined_total_mae"],
-            "validation_panels/improvement_total_mean": summary["metrics_mean"]["improvement_total"],
+            "validation_panels/gain_total_mean": summary["metrics_mean"]["gain_total"] or summary["metrics_mean"]["improvement_total"],
             "validation_panels/missing_baseline_total_mae_count": len(missing_baseline_rows),
         })
         if wandb is not None and int(args.wandb_max_panel_images) > 0:
             sample_panels = [
-                wandb.Image(str(panel_path), caption=f"{row.get('object_id')} | {prior_display_label(row, records.get(str(row.get('object_id'))))}={fmt_metric(row.get('baseline_total_mae'))} Pred={fmt_metric(row.get('refined_total_mae'))} gain={fmt_metric(row.get('improvement_total'))}")
+                wandb.Image(str(panel_path), caption=f"{row.get('object_id')} | Prior={fmt_metric(row.get('input_prior_total_mae', row.get('baseline_total_mae')))} Pred={fmt_metric(row.get('refined_total_mae'))} gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))} | {prior_display_label(row, records.get(str(row.get('object_id'))))}")
                 for row, panel_path in zip(selected_rows, panel_paths)
             ][: max(int(args.wandb_max_panel_images), 0)]
             run.log({"validation_panels/sample_panels": sample_panels})
         if wandb is not None and bool(args.wandb_log_panel_table):
-            table = wandb.Table(columns=["object_id", "generator_id", "source_name", "baseline_label", "prior_label", "baseline_total_mae", "refined_total_mae", "improvement_total", "panel"])
+            table = wandb.Table(columns=["object_id", "generator_id", "source_name", "prior_source_type", "target_source_type", "baseline_label", "prior_label", "baseline_total_mae", "input_prior_total_mae", "refined_total_mae", "gain_total", "panel"])
             for row, panel_path in zip(selected_rows, panel_paths):
                 record = records.get(str(row.get("object_id")))
-                table.add_data(row.get("object_id"), row.get("generator_id", "unknown"), row.get("source_name"), prior_display_label(row, record), row.get("prior_label"), row.get("baseline_total_mae"), row.get("refined_total_mae"), row.get("improvement_total"), wandb.Image(str(panel_path)))
+                table.add_data(row.get("object_id"), row.get("generator_id", "unknown"), row.get("source_name"), get_value(row, record, "prior_source_type", "unknown"), get_value(row, record, "target_source_type", "unknown"), prior_display_label(row, record), row.get("prior_label"), row.get("baseline_total_mae"), row.get("input_prior_total_mae", row.get("baseline_total_mae")), row.get("refined_total_mae"), row.get("gain_total", row.get("improvement_total")), wandb.Image(str(panel_path)))
             run.log({"validation_panels/table": table})
         if args.wandb_log_artifacts:
             artifact_paths = [summary_path, html_path]

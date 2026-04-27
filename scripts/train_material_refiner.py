@@ -209,6 +209,11 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--disable-view-fusion", type=parse_bool, default=False)
     parser.add_argument("--disable-prior-inputs", type=parse_bool, default=False)
     parser.add_argument("--disable-residual-head", type=parse_bool, default=False)
+    parser.add_argument("--disable-prior-source-embedding", type=parse_bool, default=False)
+    parser.add_argument("--disable-no-prior-bootstrap", type=parse_bool, default=False)
+    parser.add_argument("--disable-boundary-safety", type=parse_bool, default=False)
+    parser.add_argument("--disable-change-gate", type=parse_bool, default=False)
+    parser.add_argument("--disable-prior-safe-loss", type=parse_bool, default=False)
     parser.add_argument("--enable-residual-gate", type=parse_bool, default=False)
     parser.add_argument("--residual-gate-bias", type=float, default=-0.5)
     parser.add_argument("--min-residual-gate", type=float, default=0.05)
@@ -221,6 +226,12 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--material-delta-scale", type=float, default=0.06)
     parser.add_argument("--enable-render-consistency-gate", type=parse_bool, default=False)
     parser.add_argument("--render-gate-strength", type=float, default=0.25)
+    parser.add_argument("--enable-prior-source-embedding", type=parse_bool, default=True)
+    parser.add_argument("--enable-no-prior-bootstrap", type=parse_bool, default=True)
+    parser.add_argument("--enable-boundary-safety", type=parse_bool, default=True)
+    parser.add_argument("--enable-change-gate", type=parse_bool, default=True)
+    parser.add_argument("--enable-material-aux-head", type=parse_bool, default=False)
+    parser.add_argument("--enable-render-proxy-loss", type=parse_bool, default=False)
     parser.add_argument("--enable-dual-path-prior-init", type=parse_bool, default=False)
     parser.add_argument("--enable-domain-prior-calibration", type=parse_bool, default=False)
     parser.add_argument("--domain-feature-channels", type=int, default=8)
@@ -503,6 +514,29 @@ def parse_args() -> argparse.Namespace:
     args.prior_feature_channels = max(int(args.prior_feature_channels), 1)
     args.max_generator_embeddings = max(int(args.max_generator_embeddings), 2)
     args.max_source_embeddings = max(int(args.max_source_embeddings), 2)
+    if args.disable_prior_source_embedding:
+        args.enable_prior_source_embedding = False
+        args.enable_domain_prior_calibration = False
+    if args.disable_no_prior_bootstrap:
+        args.enable_no_prior_bootstrap = False
+        args.enable_dual_path_prior_init = False
+    if args.disable_boundary_safety:
+        args.enable_boundary_safety = False
+        args.enable_boundary_safety_module = False
+    if args.disable_change_gate:
+        args.enable_change_gate = False
+        args.enable_residual_gate = False
+    if args.enable_prior_source_embedding:
+        args.enable_domain_prior_calibration = True
+    if args.enable_no_prior_bootstrap:
+        args.enable_dual_path_prior_init = True
+    if args.enable_boundary_safety:
+        args.enable_boundary_safety_module = True
+    if args.enable_change_gate:
+        args.enable_residual_gate = True
+    if args.disable_prior_safe_loss:
+        args.prior_consistency_weight = 0.0
+        args.residual_safety_weight = 0.0
     args.max_residual_gate = max(0.0, min(1.0, float(args.max_residual_gate)))
     args.boundary_safety_strength = max(0.0, min(1.0, float(args.boundary_safety_strength)))
     args.boundary_residual_suppression_strength = max(
@@ -795,14 +829,20 @@ def compute_losses(
     confidence = batch["uv_target_confidence"].clamp(0.0, 1.0)
     refined = outputs["refined"]
     coarse = outputs["coarse"]
-    baseline = outputs["baseline"]
-    prior_confidence = batch["uv_prior_confidence"].clamp(0.0, 1.0)
+    baseline = outputs.get("input_prior", outputs["baseline"])
+    prior_confidence = batch.get("input_prior_confidence", batch["uv_prior_confidence"]).clamp(0.0, 1.0)
 
     refine_l1 = ((refined - target).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
     coarse_l1 = ((coarse - target).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
+    target_prior_delta = (target - baseline).abs().mean(dim=1, keepdim=True)
+    prior_safe_mask = (
+        confidence
+        * prior_confidence
+        * (target_prior_delta <= float(args.residual_safety_margin)).to(refined.dtype)
+    )
     prior_consistency = (
-        (refined - baseline).abs() * (1.0 - confidence) * prior_confidence
-    ).mean()
+        (refined - baseline).abs() * prior_safe_mask
+    ).sum() / prior_safe_mask.sum().clamp_min(1.0)
     smoothness = total_variation_loss(refined)
     edge_aware = (
         edge_aware_l1_loss(
@@ -851,8 +891,8 @@ def compute_losses(
         if args.residual_safety_weight > 0.0
         else refined.new_zeros(())
     )
-    residual_gate = outputs.get("residual_gate")
-    residual_delta = outputs.get("residual_delta")
+    residual_gate = outputs.get("change_gate", outputs.get("residual_gate"))
+    residual_delta = outputs.get("delta_rm", outputs.get("residual_delta"))
     residual_gate_mean = (
         residual_gate.mean() if residual_gate is not None else refined.new_zeros(())
     )
@@ -911,6 +951,27 @@ def compute_losses(
         if evidence_update_support is not None
         else refined.new_ones(())
     )
+    diagnostics = outputs.get("diagnostics") or {}
+
+    def diagnostic_mean(name: str, fallback: torch.Tensor) -> torch.Tensor:
+        value = diagnostics.get(name)
+        if isinstance(value, torch.Tensor):
+            return value.mean()
+        return fallback
+
+    change_gate_mean = diagnostic_mean("change_gate_mean", residual_gate_mean)
+    mean_abs_delta = diagnostic_mean("mean_abs_delta", residual_delta_abs)
+    prior_reliability_tensor = outputs.get("prior_reliability")
+    prior_reliability_mean = diagnostic_mean(
+        "prior_reliability_mean",
+        prior_reliability_tensor.mean()
+        if isinstance(prior_reliability_tensor, torch.Tensor)
+        else prior_confidence.mean(),
+    )
+    boundary_delta_mean = diagnostic_mean(
+        "boundary_delta_mean",
+        refined.new_zeros(()),
+    )
 
     if args.view_consistency_mode != "disabled" and batch.get("view_uvs") is not None:
         sampled_refined = sample_uv_maps_to_view(refined, batch["view_uvs"])
@@ -942,6 +1003,10 @@ def compute_losses(
     )
     return {
         "total": total,
+        "loss_uv": refine_l1.detach(),
+        "loss_prior_safe": (prior_consistency + residual_safety).detach(),
+        "loss_boundary": boundary_bleed.detach(),
+        "loss_gradient": (gradient_preservation + edge_aware).detach(),
         "refine_l1": refine_l1.detach(),
         "coarse_l1": coarse_l1.detach(),
         "prior_consistency": prior_consistency.detach(),
@@ -955,6 +1020,10 @@ def compute_losses(
         "residual_safety": residual_safety.detach(),
         "residual_gate_mean": residual_gate_mean.detach(),
         "residual_delta_abs": residual_delta_abs.detach(),
+        "change_gate_mean": change_gate_mean.detach(),
+        "mean_abs_delta": mean_abs_delta.detach(),
+        "prior_reliability_mean": prior_reliability_mean.detach(),
+        "boundary_delta_mean": boundary_delta_mean.detach(),
         "view_uncertainty_gate_mean": view_uncertainty_gate_mean.detach(),
         "bleed_risk_gate_mean": bleed_risk_gate_mean.detach(),
         "topology_residual_gate_mean": topology_residual_gate_mean.detach(),
@@ -1193,10 +1262,18 @@ def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "throughput/samples_per_second",
         "throughput/seconds_per_batch",
         "train/total",
+        "train/loss_uv",
+        "train/loss_prior_safe",
+        "train/loss_boundary",
+        "train/loss_gradient",
         "train/refine_l1",
         "train/boundary_bleed",
         "train/gradient_preservation",
         "train/residual_safety",
+        "train/change_gate_mean",
+        "train/mean_abs_delta",
+        "train/prior_reliability_mean",
+        "train/boundary_delta_mean",
         "train/effective_view_supervision_rate",
     }
     blocked_prefixes = ("progress/",)
@@ -1224,6 +1301,9 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "best/selection_metric",
         "best/epoch",
         "val/uv_total_mae",
+        "val/input_prior_total_mae",
+        "val/refined_total_mae",
+        "val/gain_total",
         "val/improvement_uv_total_mae",
         "val/improvement_rate",
         "val/regression_rate",
@@ -1242,6 +1322,8 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "val/special/prior_residual_safety",
         "val/object_level/avg_improvement_total",
         "eval/rm/uv_total_mae",
+        "eval/input_prior_total_mae",
+        "eval/gain_total",
         "eval/rm/view_total_mae",
         "eval/main/mse",
         "eval/main/psnr",
@@ -1372,6 +1454,12 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         "disable_view_fusion": bool(args.disable_view_fusion),
         "disable_prior_inputs": bool(args.disable_prior_inputs),
         "disable_residual_head": bool(args.disable_residual_head),
+        "enable_prior_source_embedding": bool(args.enable_prior_source_embedding),
+        "enable_no_prior_bootstrap": bool(args.enable_no_prior_bootstrap),
+        "enable_boundary_safety": bool(args.enable_boundary_safety),
+        "enable_change_gate": bool(args.enable_change_gate),
+        "enable_material_aux_head": bool(args.enable_material_aux_head),
+        "enable_render_proxy_loss": bool(args.enable_render_proxy_loss),
         "enable_residual_gate": bool(args.enable_residual_gate),
         "residual_gate_bias": float(args.residual_gate_bias),
         "min_residual_gate": float(args.min_residual_gate),
@@ -2375,7 +2463,9 @@ def print_train_interval(payload: dict[str, Any], device: str) -> None:
         f"eta_epoch={format_duration(payload.get('progress/eta_epoch_seconds'))} "
         f"eta_total={format_duration(payload.get('progress/eta_total_seconds'))} "
         f"global_batch={payload.get('global_batch_step')} lr={format_metric(payload.get('lr'), 8)} "
-        f"loss={format_metric(payload.get('train/total'))} refine={format_metric(payload.get('train/refine_l1'))} "
+        f"loss={format_metric(payload.get('train/total'))} uv={format_metric(payload.get('train/loss_uv'))} "
+        f"prior_safe={format_metric(payload.get('train/loss_prior_safe'))} "
+        f"refine={format_metric(payload.get('train/refine_l1'))} "
         f"coarse={format_metric(payload.get('train/coarse_l1'))} "
         f"edge={format_metric(payload.get('train/edge_aware'))} "
         f"bnd={format_metric(payload.get('train/boundary_bleed'))} "
@@ -2383,7 +2473,9 @@ def print_train_interval(payload: dict[str, Any], device: str) -> None:
         f"metal_cls={format_metric(payload.get('train/metallic_classification'))} "
         f"mat_ctx={format_metric(payload.get('train/material_context'))} "
         f"res_safe={format_metric(payload.get('train/residual_safety'))} "
-        f"gate={format_metric(payload.get('train/residual_gate_mean'))} "
+        f"gate={format_metric(payload.get('train/change_gate_mean', payload.get('train/residual_gate_mean')))} "
+        f"delta={format_metric(payload.get('train/mean_abs_delta'))} "
+        f"prior_rel={format_metric(payload.get('train/prior_reliability_mean'))} "
         f"view_gate={format_metric(payload.get('train/view_uncertainty_gate_mean'))} "
         f"bleed_gate={format_metric(payload.get('train/bleed_risk_gate_mean'))} "
         f"topo_gate={format_metric(payload.get('train/topology_residual_gate_mean'))} "
@@ -2449,8 +2541,9 @@ def update_epoch_progress_bar(
             [
                 f"loss={format_metric(payload.get('train/total'), 4)}",
                 f"lr={format_metric(payload.get('lr'), 7)}",
-                f"ref={format_metric(payload.get('train/refine_l1'), 4)}",
-                f"bnd={format_metric(payload.get('train/boundary_bleed'), 4)}",
+                f"uv={format_metric(payload.get('train/loss_uv'), 4)}",
+                f"bnd={format_metric(payload.get('train/loss_boundary'), 4)}",
+                f"gate={format_metric(payload.get('train/change_gate_mean'), 3)}",
                 f"mat={format_metric(payload.get('train/material_context'), 4)}",
                 f"gn={format_metric(payload.get('train/grad_norm'), 3)}",
                 f"v={format_metric(payload.get('train/effective_view_supervision_rate'), 2)}",
@@ -2560,7 +2653,7 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
     axes[0, 0].plot(epochs, train_total, marker="o", label="train total")
     axes[0, 0].plot(epochs, val_total, marker="o", label="val uv total")
     if not np.isnan(baseline_val_total).all():
-        axes[0, 0].plot(epochs, baseline_val_total, marker="o", label="SF3D baseline")
+        axes[0, 0].plot(epochs, baseline_val_total, marker="o", label="input prior")
     axes[0, 0].set_title("Total Loss / UV MAE")
     axes[0, 0].set_xlabel("epoch")
     axes[0, 0].legend()
@@ -2576,7 +2669,7 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
     if not np.isnan(improvement_val_total).all():
         axes[1, 0].plot(epochs, improvement_val_total, marker="o")
         axes[1, 0].axhline(0.0, color="black", linewidth=1, alpha=0.35)
-        axes[1, 0].set_title("Refined Improvement Over SF3D")
+        axes[1, 0].set_title("Refined Gain Over Input Prior")
         axes[1, 0].set_ylabel("baseline MAE - refined MAE")
     else:
         axes[1, 0].plot(epochs, samples_per_second, marker="o")
@@ -2623,7 +2716,7 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
                 f"<div>Last optimizer step: <code>{latest.get('optimizer_step')}</code></div>",
                 f"<div>Last train total: <code>{format_metric((latest.get('train') or {}).get('total'))}</code></div>",
                 f"<div>Last val total: <code>{format_metric(((latest.get('val') or {}).get('uv_mae') or {}).get('total'))}</code></div>",
-                f"<div>Last SF3D baseline total: <code>{format_metric(((latest.get('val') or {}).get('baseline_uv_mae') or {}).get('total'))}</code></div>",
+                f"<div>Last input prior total: <code>{format_metric(((latest.get('val') or {}).get('input_prior_uv_mae') or (latest.get('val') or {}).get('baseline_uv_mae') or {}).get('total'))}</code></div>",
                 f"<div>Last improvement: <code>{format_metric(((latest.get('val') or {}).get('improvement_uv_mae') or {}).get('total'))}</code></div>",
                 "</div></div></body></html>",
             ]
@@ -2948,8 +3041,8 @@ def save_validation_preview(
         (
             "Rough",
             [
-                compact_labeled_image(grayscale_rgb_image(baseline[0:1]), "SF3D", size=tile_size),
-                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[0:1], mask=confidence), "SF3D γ", size=tile_size),
+                compact_labeled_image(grayscale_rgb_image(baseline[0:1]), "Input Prior", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[0:1], mask=confidence), "Prior γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(target_roughness), "GT", size=tile_size),
                 compact_labeled_image(enhanced_grayscale_rgb_image(target_roughness, mask=confidence), "GT γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(refined[0:1]), "Pred", size=tile_size),
@@ -2960,8 +3053,8 @@ def save_validation_preview(
         (
             "Metal",
             [
-                compact_labeled_image(grayscale_rgb_image(baseline[1:2]), "SF3D", size=tile_size),
-                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[1:2], mask=confidence), "SF3D γ", size=tile_size),
+                compact_labeled_image(grayscale_rgb_image(baseline[1:2]), "Input Prior", size=tile_size),
+                compact_labeled_image(enhanced_grayscale_rgb_image(baseline[1:2], mask=confidence), "Prior γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(target_metallic), "GT", size=tile_size),
                 compact_labeled_image(enhanced_grayscale_rgb_image(target_metallic, mask=confidence), "GT γ", size=tile_size),
                 compact_labeled_image(grayscale_rgb_image(refined[1:2]), "Pred", size=tile_size),
@@ -2982,7 +3075,7 @@ def save_validation_preview(
     draw.text(
         (12, 38),
         (
-            f"SF3D/Prior {baseline_total:.4f} | Pred {refined_total:.4f} | "
+            f"Input Prior {baseline_total:.4f} | Pred {refined_total:.4f} | "
             f"gain {improvement:+.4f} | {prior_label} | {material_family} | {source_name}"
         ),
         font=detail_font,
@@ -3492,7 +3585,7 @@ def evaluate(
             )
             confidence = batch["uv_target_confidence"].clamp(0.0, 1.0)
             refined = outputs["refined"]
-            baseline = outputs["baseline"]
+            baseline = outputs.get("input_prior", outputs["baseline"])
             update_validation_special_metrics(
                 special_metric_store,
                 batch=batch,
@@ -3623,7 +3716,9 @@ def evaluate(
                             "material_family": material_family,
                             "prior_label": prior_name,
                             "baseline_total_mae": baseline_total,
+                            "input_prior_total_mae": baseline_total,
                             "refined_total_mae": refined_total,
+                            "gain_total": baseline_total - refined_total,
                             "improvement_total": baseline_total - refined_total,
                         }
                     )
@@ -3656,6 +3751,7 @@ def evaluate(
         "loss": mean_losses,
         "uv_mae": mean_uv_mae,
         "baseline_uv_mae": mean_baseline_uv_mae,
+        "input_prior_uv_mae": mean_baseline_uv_mae,
         "improvement_uv_mae": mean_improvement,
         "group_metrics": finalize_group_metrics(group_store),
         "baseline_group_metrics": finalize_group_metrics(baseline_group_store),
@@ -3996,7 +4092,7 @@ def run_validation_cycle(
         "[val] "
         f"label={validation_label} epoch={epoch} step={optimizer_step} "
         f"batches={val_payload.get('batches')} samples={val_payload['uv_mae'].get('count')} "
-        f"baseline={format_metric((val_payload.get('baseline_uv_mae') or {}).get('total'))} "
+        f"input_prior={format_metric((val_payload.get('input_prior_uv_mae') or val_payload.get('baseline_uv_mae') or {}).get('total'))} "
         f"uv_total={format_metric(val_payload['uv_mae']['total'])} "
         f"improve={format_metric((val_payload.get('improvement_uv_mae') or {}).get('total'))} "
         f"improve_rate={format_metric((val_payload.get('improvement_uv_mae') or {}).get('improvement_rate'), 4)} "
@@ -4030,9 +4126,9 @@ def run_validation_cycle(
                     item["path"],
                     caption=(
                         f"{item.get('object_id')} | "
-                        f"{item.get('baseline_total_mae', 0.0):.4f}"
+                        f"Prior={item.get('input_prior_total_mae', item.get('baseline_total_mae', 0.0)):.4f}"
                         f" -> {item.get('refined_total_mae', 0.0):.4f} "
-                        f"(gain={item.get('improvement_total', 0.0):+.4f})"
+                        f"(gain={item.get('gain_total', item.get('improvement_total', 0.0)):+.4f})"
                     ),
                 )
                 for item in preview_items[: args.wandb_val_preview_max]
@@ -4050,12 +4146,17 @@ def run_validation_cycle(
             "best/val_uv_total_mae": val_payload["uv_mae"]["total"],
             "val/uv_total_mae": val_payload["uv_mae"]["total"],
             "val/rm/uv_total_mae": val_payload["uv_mae"]["total"],
+            "val/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
+            "val/refined_total_mae": val_payload["uv_mae"]["total"],
+            "val/gain_total": improvement_payload.get("total"),
             "val/improvement_uv_total_mae": improvement_payload.get("total"),
             "val/improvement_rate": improvement_payload.get("improvement_rate"),
             "val/regression_rate": improvement_payload.get("regression_rate"),
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
             "val/object_level/avg_improvement_total": improvement_payload.get("total"),
             "eval/rm/uv_total_mae": val_payload["uv_mae"]["total"],
+            "eval/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
+            "eval/gain_total": improvement_payload.get("total"),
             "eval/improvement_rate": improvement_payload.get("improvement_rate"),
             "eval/regression_rate": improvement_payload.get("regression_rate"),
             "eval/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),

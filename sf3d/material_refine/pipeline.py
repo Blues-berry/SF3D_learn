@@ -81,6 +81,9 @@ class MaterialRefinementPipeline:
             "uv_prior_roughness": inputs["uv_prior_roughness"].unsqueeze(0).to(self.device),
             "uv_prior_metallic": inputs["uv_prior_metallic"].unsqueeze(0).to(self.device),
             "uv_prior_confidence": inputs["uv_prior_confidence"].unsqueeze(0).to(self.device),
+            "input_prior_roughness": inputs["uv_prior_roughness"].unsqueeze(0).to(self.device),
+            "input_prior_metallic": inputs["uv_prior_metallic"].unsqueeze(0).to(self.device),
+            "input_prior_confidence": inputs["uv_prior_confidence"].unsqueeze(0).to(self.device),
             "view_features": torch.zeros(
                 1,
                 1,

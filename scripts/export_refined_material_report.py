@@ -49,6 +49,7 @@ def summarize(rows: list[dict]) -> dict:
     by_generator = defaultdict(lambda: {"count": 0, "baseline_total_mae": 0.0, "refined_total_mae": 0.0, "improvement_total": 0.0})
     by_license_bucket = defaultdict(lambda: {"count": 0, "baseline_total_mae": 0.0, "refined_total_mae": 0.0, "improvement_total": 0.0})
     by_category_bucket = defaultdict(lambda: {"count": 0, "baseline_total_mae": 0.0, "refined_total_mae": 0.0, "improvement_total": 0.0})
+    by_prior_source_type = defaultdict(lambda: {"count": 0, "baseline_total_mae": 0.0, "refined_total_mae": 0.0, "improvement_total": 0.0})
     for row in rows:
         for tag in row.get("baseline_tags", []):
             baseline_tag_counts[tag] += 1
@@ -69,6 +70,11 @@ def summarize(rows: list[dict]) -> dict:
         by_category_bucket[category_bucket]["baseline_total_mae"] += float(row["baseline_total_mae"])
         by_category_bucket[category_bucket]["refined_total_mae"] += float(row["refined_total_mae"])
         by_category_bucket[category_bucket]["improvement_total"] += float(row["improvement_total"])
+        prior_source_type = str(row.get("prior_source_type", row.get("prior_label", "unknown")))
+        by_prior_source_type[prior_source_type]["count"] += 1
+        by_prior_source_type[prior_source_type]["baseline_total_mae"] += float(row["baseline_total_mae"])
+        by_prior_source_type[prior_source_type]["refined_total_mae"] += float(row["refined_total_mae"])
+        by_prior_source_type[prior_source_type]["improvement_total"] += float(row["improvement_total"])
     generator_summary = {}
     for generator_id, item in by_generator.items():
         count = max(int(item["count"]), 1)
@@ -96,16 +102,30 @@ def summarize(rows: list[dict]) -> dict:
             "refined_total_mae": item["refined_total_mae"] / count,
             "improvement_total": item["improvement_total"] / count,
         }
+    prior_source_summary = {}
+    for prior_source_type, item in by_prior_source_type.items():
+        count = max(int(item["count"]), 1)
+        prior_source_summary[prior_source_type] = {
+            "count": int(item["count"]),
+            "baseline_total_mae": item["baseline_total_mae"] / count,
+            "input_prior_total_mae": item["baseline_total_mae"] / count,
+            "refined_total_mae": item["refined_total_mae"] / count,
+            "improvement_total": item["improvement_total"] / count,
+            "gain_total": item["improvement_total"] / count,
+        }
     return {
         "rows": len(rows),
         "baseline_total_mae": sum(row["baseline_total_mae"] for row in rows) / max(len(rows), 1),
+        "input_prior_total_mae": sum(row["baseline_total_mae"] for row in rows) / max(len(rows), 1),
         "refined_total_mae": sum(row["refined_total_mae"] for row in rows) / max(len(rows), 1),
+        "gain_total": sum(row["improvement_total"] for row in rows) / max(len(rows), 1),
         "avg_improvement": sum(row["improvement_total"] for row in rows) / max(len(rows), 1),
         "baseline_tag_counts": dict(baseline_tag_counts),
         "refined_tag_counts": dict(refined_tag_counts),
         "by_generator": generator_summary,
         "by_license_bucket": license_summary,
         "by_category_bucket": category_summary,
+        "by_prior_source_type": prior_source_summary,
     }
 
 
@@ -209,15 +229,15 @@ def build_paper_metric_summary(summary: dict, output_dir: Path) -> Path:
             "</style></head><body><div class='wrap'>",
             "<h1>Paper Metric Summary</h1>",
             f"<p><span class='pill'>mode: {html.escape(str(summary.get('render_metric_mode', 'unknown')))}</span><span class='pill'>rows: {summary.get('rows', 0)}</span><span class='pill'>objects: {summary.get('objects', 0)}</span></p>",
-            "<div class='card'><h2>Main Metrics</h2><table><thead><tr><th>Metric</th><th>Baseline</th><th>Refined</th><th>Delta</th><th>Better</th><th>Count</th></tr></thead><tbody>",
+            "<div class='card'><h2>Main Metrics</h2><table><thead><tr><th>Metric</th><th>Input Prior</th><th>Refined</th><th>Delta</th><th>Better</th><th>Count</th></tr></thead><tbody>",
             *main_rows,
             "</tbody></table></div>",
-            "<div class='card'><h2>Material-Specific Metrics</h2><table><thead><tr><th>Metric</th><th>Baseline</th><th>Refined</th><th>Delta</th><th>Better</th><th>Count</th></tr></thead><tbody>",
+            "<div class='card'><h2>Material-Specific Metrics</h2><table><thead><tr><th>Metric</th><th>Input Prior</th><th>Refined</th><th>Delta</th><th>Better</th><th>Count</th></tr></thead><tbody>",
             *special_rows,
             "</tbody></table>",
             "<h3>Prior Residual Safety</h3>",
             f"<p>score {fmt(residual.get('safety_score'))}, safe improvement {fmt(residual.get('safe_improvement_rate'))}, unnecessary change {fmt(residual.get('unnecessary_change_rate'))}, regression {fmt(residual.get('regression_rate'))}</p>",
-            "<h3>Confidence-Calibrated Error</h3><table><thead><tr><th>Confidence Bin</th><th>Samples</th><th>Baseline</th><th>Refined</th><th>Improvement</th></tr></thead><tbody>",
+            "<h3>Confidence-Calibrated Error</h3><table><thead><tr><th>Confidence Bin</th><th>Samples</th><th>Input Prior</th><th>Refined</th><th>Gain</th></tr></thead><tbody>",
             *[
                 f"<tr><td>{html.escape(name)}</td><td>{item.get('sample_count', 0)}</td><td>{fmt(item.get('baseline_total_mae'))}</td><td>{fmt(item.get('refined_total_mae'))}</td><td class='{metric_delta_class(item.get('improvement_total'))}'>{fmt(item.get('improvement_total'))}</td></tr>"
                 for name, item in confidence.items()
@@ -226,7 +246,7 @@ def build_paper_metric_summary(summary: dict, output_dir: Path) -> Path:
             "<div class='card'><h2>Metal / Non-Metal Diagnostics</h2><table><thead><tr><th>Level</th><th>Variant</th><th>F1</th><th>AUROC</th><th>Balanced Acc.</th><th>Confusion Rate</th></tr></thead><tbody>",
             *(metal_level_rows("uv_level") + metal_level_rows("view_level") + metal_level_rows("object_level")),
             "</tbody></table></div>",
-            "<div class='card'><h2>Material Family Breakdown</h2><table><thead><tr><th>Family</th><th>Count</th><th>Baseline</th><th>Refined</th><th>Improvement</th></tr></thead><tbody>",
+            "<div class='card'><h2>Material Family Breakdown</h2><table><thead><tr><th>Family</th><th>Count</th><th>Input Prior</th><th>Refined</th><th>Gain</th></tr></thead><tbody>",
             *(family_rows or ["<tr><td colspan='5'>No material family breakdown available.</td></tr>"]),
             "</tbody></table></div>",
             "<div class='card'><h2>Metric Availability</h2><table><thead><tr><th>Metric</th><th>Available</th><th>Count</th><th>Reason</th></tr></thead><tbody>",
@@ -278,11 +298,11 @@ def build_report(metrics_json: Path, output_dir: Path) -> Path:
         "<p><a href='paper_metric_summary.html'>Paper metric summary</a> | <a href='metric_disagreement_report.html'>Metric disagreement report</a></p>",
         "<div class='stats'>",
         f"<div class='stat'><div>Rows</div><h2>{summary['rows']}</h2></div>",
-        f"<div class='stat'><div>Baseline Total MAE</div><h2>{summary['baseline_total_mae']:.4f}</h2></div>",
+        f"<div class='stat'><div>Input Prior Total MAE</div><h2>{summary['input_prior_total_mae']:.4f}</h2></div>",
         f"<div class='stat'><div>Refined Total MAE</div><h2>{summary['refined_total_mae']:.4f}</h2></div>",
         f"<div class='stat'><div>Avg Improvement</div><h2>{summary['avg_improvement']:.4f}</h2></div>",
         "</div>",
-        "<table><thead><tr><th>Tag</th><th>Baseline</th><th>Refined</th><th>Reduction</th></tr></thead><tbody>",
+        "<table><thead><tr><th>Tag</th><th>Input Prior</th><th>Refined</th><th>Reduction</th></tr></thead><tbody>",
     ]
     for tag in FAILURE_TAGS:
         lines.append(
@@ -294,17 +314,22 @@ def build_report(metrics_json: Path, output_dir: Path) -> Path:
                 summary["baseline_tag_counts"].get(tag, 0) - summary["refined_tag_counts"].get(tag, 0),
             )
         )
-    lines.extend(["</tbody></table>", "<h2>By Generator</h2>", "<table><thead><tr><th>Generator</th><th>Count</th><th>Baseline MAE</th><th>Refined MAE</th><th>Improvement</th></tr></thead><tbody>"])
+    lines.extend(["</tbody></table>", "<h2>By Generator</h2>", "<table><thead><tr><th>Generator</th><th>Count</th><th>Input Prior MAE</th><th>Refined MAE</th><th>Gain</th></tr></thead><tbody>"])
     for generator_id, item in sorted(summary["by_generator"].items()):
         lines.append(
             f"<tr><td>{html.escape(generator_id)}</td><td>{item['count']}</td><td>{item['baseline_total_mae']:.4f}</td><td>{item['refined_total_mae']:.4f}</td><td>{item['improvement_total']:.4f}</td></tr>"
         )
-    lines.extend(["</tbody></table>", "<h2>By License Bucket</h2>", "<table><thead><tr><th>License</th><th>Count</th><th>Baseline MAE</th><th>Refined MAE</th><th>Improvement</th></tr></thead><tbody>"])
+    lines.extend(["</tbody></table>", "<h2>By Prior Source Type</h2>", "<table><thead><tr><th>Prior Source</th><th>Count</th><th>Input Prior MAE</th><th>Refined MAE</th><th>Gain</th></tr></thead><tbody>"])
+    for prior_source_type, item in sorted(summary["by_prior_source_type"].items()):
+        lines.append(
+            f"<tr><td>{html.escape(prior_source_type)}</td><td>{item['count']}</td><td>{item['baseline_total_mae']:.4f}</td><td>{item['refined_total_mae']:.4f}</td><td>{item['improvement_total']:.4f}</td></tr>"
+        )
+    lines.extend(["</tbody></table>", "<h2>By License Bucket</h2>", "<table><thead><tr><th>License</th><th>Count</th><th>Input Prior MAE</th><th>Refined MAE</th><th>Gain</th></tr></thead><tbody>"])
     for license_bucket, item in sorted(summary["by_license_bucket"].items()):
         lines.append(
             f"<tr><td>{html.escape(license_bucket)}</td><td>{item['count']}</td><td>{item['baseline_total_mae']:.4f}</td><td>{item['refined_total_mae']:.4f}</td><td>{item['improvement_total']:.4f}</td></tr>"
         )
-    lines.extend(["</tbody></table>", "<h2>By Category Bucket</h2>", "<table><thead><tr><th>Category</th><th>Count</th><th>Baseline MAE</th><th>Refined MAE</th><th>Improvement</th></tr></thead><tbody>"])
+    lines.extend(["</tbody></table>", "<h2>By Category Bucket</h2>", "<table><thead><tr><th>Category</th><th>Count</th><th>Input Prior MAE</th><th>Refined MAE</th><th>Gain</th></tr></thead><tbody>"])
     for category_bucket, item in sorted(summary["by_category_bucket"].items()):
         lines.append(
             f"<tr><td>{html.escape(category_bucket)}</td><td>{item['count']}</td><td>{item['baseline_total_mae']:.4f}</td><td>{item['refined_total_mae']:.4f}</td><td>{item['improvement_total']:.4f}</td></tr>"
@@ -349,14 +374,14 @@ def build_report(metrics_json: Path, output_dir: Path) -> Path:
             f"<div>License: {html.escape(str(row.get('license_bucket', 'unknown')))}</div>"
             f"<div>Category: {html.escape(str(row.get('category_bucket', 'unknown')))}</div>"
             f"<div>Variant: {html.escape(str(row.get('eval_variant', 'ours_full')))}</div>"
-            f"<div>Baseline total MAE: {row['baseline_total_mae']:.4f}</div>"
+            f"<div>Input prior total MAE: {row.get('input_prior_total_mae', row['baseline_total_mae']):.4f}</div>"
             f"<div>Refined total MAE: {row['refined_total_mae']:.4f}</div>"
-            f"<div>Improvement: {row['improvement_total']:.4f}</div>"
-            f"<div>PSNR b/r: {fmt(row.get('baseline_psnr'))} / {fmt(row.get('refined_psnr'))}</div>"
-            f"<div>SSIM b/r: {fmt(row.get('baseline_ssim'))} / {fmt(row.get('refined_ssim'))}</div>"
-            f"<div>LPIPS b/r: {fmt(row.get('baseline_lpips'))} / {fmt(row.get('refined_lpips'))}</div>"
-            f"<div>Boundary bleed b/r: {fmt(row.get('baseline_boundary_bleed_score'))} / {fmt(row.get('refined_boundary_bleed_score'))}</div>"
-            f"<div class='chips'><span>baseline: {html.escape(baseline_tags)}</span><span>refined: {html.escape(refined_tags)}</span></div>"
+            f"<div>Gain: {row.get('gain_total', row['improvement_total']):.4f}</div>"
+            f"<div>PSNR prior/refined: {fmt(row.get('baseline_psnr'))} / {fmt(row.get('refined_psnr'))}</div>"
+            f"<div>SSIM prior/refined: {fmt(row.get('baseline_ssim'))} / {fmt(row.get('refined_ssim'))}</div>"
+            f"<div>LPIPS prior/refined: {fmt(row.get('baseline_lpips'))} / {fmt(row.get('refined_lpips'))}</div>"
+            f"<div>Boundary bleed prior/refined: {fmt(row.get('baseline_boundary_bleed_score'))} / {fmt(row.get('refined_boundary_bleed_score'))}</div>"
+            f"<div class='chips'><span>input_prior: {html.escape(baseline_tags)}</span><span>refined: {html.escape(refined_tags)}</span></div>"
             f"<div class='atlas'>{''.join(atlas_html)}</div>"
             f"<div class='renders'>{''.join(render_html)}</div>"
             "</div>"

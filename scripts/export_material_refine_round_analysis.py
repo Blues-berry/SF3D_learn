@@ -59,11 +59,11 @@ def build_analysis(
     audit_summary = audit_payload["summary"]
     if audit_summary.get("identity_warning"):
         warnings.append(
-            "Target roughness/metallic maps are identical to prior maps for most audited records; baseline-vs-refined MAE is not a quality-improvement proof."
+            "Target roughness/metallic maps are identical to input prior maps for most audited records; input-prior-vs-refined MAE is not a quality-improvement proof."
         )
     if eval_summary.get("baseline_total_mae", 0.0) == 0.0 and eval_summary.get("refined_total_mae", 0.0) > 0.0:
         warnings.append(
-            "Baseline MAE is zero while refined MAE is non-zero, which indicates the current pseudo-GT favors the original prior exactly."
+            "Input prior MAE is zero while refined MAE is non-zero, which indicates the current pseudo-GT favors the input prior exactly."
         )
     return {
         "train_state": train_state,
@@ -92,9 +92,9 @@ def build_analysis(
         "manifest_audit": audit_summary,
         "warnings": warnings,
         "recommended_next_steps": [
-            "Replace or augment pseudo-GT with non-trivial RM targets before claiming quality improvement over SF3D.",
+            "Replace or augment pseudo-GT with non-trivial RM targets before claiming quality improvement over any input prior.",
             "Run manifest audit as a required gate before full training.",
-            "Keep round1 checkpoint as a pipeline smoke baseline, not as a production quality checkpoint.",
+            "Keep round1 checkpoint as a pipeline smoke reference, not as a production quality checkpoint.",
             "Use material-sensitive heldout sets for metal/non-metal confusion and boundary bleed once real targets are available.",
         ],
     }
@@ -106,7 +106,7 @@ def save_html(analysis: dict[str, Any], *, train_dir: Path, eval_dir: Path, audi
     cards = [
         ("Best Val UV MAE", metric(analysis["best_val_uv_total_mae"])),
         ("Eval Refined MAE", metric(analysis["eval"]["refined_total_mae"])),
-        ("Baseline MAE", metric(analysis["eval"]["baseline_total_mae"])),
+        ("Input Prior MAE", metric(analysis["eval"]["baseline_total_mae"])),
         ("Target==Prior", f"{analysis['manifest_audit']['same_rm_pair_rate']:.2%}"),
         ("Rendered RM Views", f"{analysis['manifest_audit'].get('rendered_rm_view_rate', 0.0):.2%}"),
     ]
@@ -133,7 +133,7 @@ def save_html(analysis: dict[str, Any], *, train_dir: Path, eval_dir: Path, audi
             f"<div><h2>Material Attributes</h2><img src='{rel(eval_dir / 'material_attribute_comparison.png', output_dir)}'></div>",
             f"<div><h2>Manifest Audit</h2><img src='{rel(audit_dir / 'manifest_audit.png', output_dir)}'></div>",
             "</div>",
-            "<div class='card'><h2>Eval By Prior</h2><table><thead><tr><th>Prior</th><th>Count</th><th>Baseline MAE</th><th>Refined MAE</th><th>Improvement</th></tr></thead><tbody>",
+            "<div class='card'><h2>Eval By Prior</h2><table><thead><tr><th>Prior</th><th>Count</th><th>Input Prior MAE</th><th>Refined MAE</th><th>Gain</th></tr></thead><tbody>",
         ]
     )
     for prior, row in (analysis["eval"].get("by_prior_label") or {}).items():

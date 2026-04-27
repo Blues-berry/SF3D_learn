@@ -33,6 +33,36 @@ HARD_VIEW_TOKENS = (
 )
 
 
+def _record_metadata_value(
+    record: CanonicalAssetRecordV1,
+    *keys: str,
+    default: str = "unknown",
+) -> str:
+    for key in keys:
+        value = getattr(record, key, None)
+        if value not in (None, ""):
+            return str(value)
+        value = record.metadata.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return str(default)
+
+
+def _record_prior_source_type(record: CanonicalAssetRecordV1) -> str:
+    value = _record_metadata_value(
+        record,
+        "prior_source_type",
+        "prior_generation_mode",
+        "prior_label",
+        default="unknown",
+    )
+    if value != "unknown":
+        return value
+    if record.prior_mode == "none" or not record.has_material_prior:
+        return "no_prior_placeholder"
+    return str(record.prior_mode or "unknown")
+
+
 def _view_importance(view_name: str) -> float:
     lowered = view_name.lower()
     if any(token in lowered for token in HARD_VIEW_TOKENS):
@@ -415,6 +445,13 @@ class CanonicalMaterialDataset(Dataset):
         # may be quantized incorrectly.  Training/eval use UV targets projected
         # through view_uvs, so UV correspondence is the strict supervision gate.
         has_effective_view_supervision = bool(record.view_supervision_ready) and (view_uvs is not None)
+        prior_source_type = _record_prior_source_type(record)
+        prior_generation_mode = _record_metadata_value(
+            record,
+            "prior_generation_mode",
+            "prior_source_type",
+            default=prior_source_type,
+        )
 
         return {
             "object_id": record.object_id,
@@ -428,7 +465,10 @@ class CanonicalMaterialDataset(Dataset):
             "license_bucket": record.license_bucket,
             "has_material_prior": bool(record.has_material_prior),
             "prior_mode": record.prior_mode,
+            "prior_source_type": prior_source_type,
+            "prior_generation_mode": prior_generation_mode,
             "target_source_type": record.target_source_type,
+            "target_is_prior_copy": bool(record.target_is_prior_copy),
             "target_quality_tier": record.target_quality_tier,
             "target_prior_identity": (
                 0.0 if record.target_prior_identity is None else float(record.target_prior_identity)
@@ -444,6 +484,9 @@ class CanonicalMaterialDataset(Dataset):
             "uv_prior_roughness": prior_roughness,
             "uv_prior_metallic": prior_metallic,
             "uv_prior_confidence": prior_confidence,
+            "input_prior_roughness": prior_roughness,
+            "input_prior_metallic": prior_metallic,
+            "input_prior_confidence": prior_confidence,
             "uv_target_roughness": target_roughness,
             "uv_target_metallic": target_metallic,
             "uv_target_confidence": target_confidence,
@@ -472,7 +515,10 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "license_bucket": [sample["license_bucket"] for sample in samples],
         "has_material_prior": [sample["has_material_prior"] for sample in samples],
         "prior_mode": [sample["prior_mode"] for sample in samples],
+        "prior_source_type": [sample["prior_source_type"] for sample in samples],
+        "prior_generation_mode": [sample["prior_generation_mode"] for sample in samples],
         "target_source_type": [sample["target_source_type"] for sample in samples],
+        "target_is_prior_copy": [sample["target_is_prior_copy"] for sample in samples],
         "target_quality_tier": [sample["target_quality_tier"] for sample in samples],
         "target_prior_identity": torch.tensor(
             [float(sample["target_prior_identity"]) for sample in samples],
@@ -519,6 +565,9 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     for key in tensor_keys:
         batch[key] = torch.stack([sample[key] for sample in samples], dim=0)
+    batch["input_prior_roughness"] = batch["uv_prior_roughness"]
+    batch["input_prior_metallic"] = batch["uv_prior_metallic"]
+    batch["input_prior_confidence"] = batch["uv_prior_confidence"]
 
     max_views = max(sample["view_features"].shape[0] for sample in samples)
     feature_shape = samples[0]["view_features"].shape[1:]

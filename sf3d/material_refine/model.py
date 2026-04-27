@@ -1025,6 +1025,12 @@ class MaterialRefiner(BaseModule):
         material_delta_scale: float = 0.06
         enable_render_consistency_gate: bool = False
         render_gate_strength: float = 0.25
+        enable_prior_source_embedding: bool = False
+        enable_no_prior_bootstrap: bool = False
+        enable_boundary_safety: bool = False
+        enable_change_gate: bool = False
+        enable_material_aux_head: bool = False
+        enable_render_proxy_loss: bool = False
         enable_dual_path_prior_init: bool = False
         enable_domain_prior_calibration: bool = False
         domain_feature_channels: int = 8
@@ -1066,6 +1072,20 @@ class MaterialRefiner(BaseModule):
 
     def configure(self) -> None:
         material_classes = max(2, int(self.cfg.material_context_classes))
+        self.enable_prior_source_embedding = bool(
+            self.cfg.enable_prior_source_embedding or self.cfg.enable_domain_prior_calibration
+        )
+        self.enable_no_prior_bootstrap = bool(
+            self.cfg.enable_no_prior_bootstrap or self.cfg.enable_dual_path_prior_init
+        )
+        self.enable_boundary_safety = bool(
+            self.cfg.enable_boundary_safety or self.cfg.enable_boundary_safety_module
+        )
+        self.enable_change_gate = bool(
+            self.cfg.enable_change_gate
+            or self.cfg.enable_residual_gate
+            or self.cfg.enable_confidence_gated_trunk
+        )
         if self.cfg.enable_material_sensitive_view_encoder:
             self.view_encoder = MaterialSensitiveMultiViewEncoder(
                 self.cfg.view_input_channels,
@@ -1084,7 +1104,7 @@ class MaterialRefiner(BaseModule):
 
         self.domain_channels = (
             max(1, int(self.cfg.domain_feature_channels))
-            if (self.cfg.enable_domain_prior_calibration or self.cfg.enable_dual_path_prior_init)
+            if (self.enable_prior_source_embedding or self.enable_no_prior_bootstrap)
             else 0
         )
         if self.domain_channels > 0:
@@ -1100,7 +1120,7 @@ class MaterialRefiner(BaseModule):
                 nn.Conv2d(self.domain_channels * 2, self.domain_channels, 1),
                 nn.SiLU(),
             )
-        if self.cfg.enable_dual_path_prior_init:
+        if self.enable_no_prior_bootstrap:
             self.prior_initializer = DualPathPriorInitialization(
                 domain_channels=self.domain_channels,
                 prior_feature_channels=max(1, int(self.cfg.prior_feature_channels)),
@@ -1119,13 +1139,13 @@ class MaterialRefiner(BaseModule):
         if self.cfg.enable_tri_branch_fusion:
             fused_view_channels = self.cfg.view_feature_channels * 3
         refine_channels = self.cfg.uv_input_channels + fused_view_channels + 1 + 2 + 1
-        if self.cfg.enable_dual_path_prior_init:
+        if self.enable_no_prior_bootstrap:
             refine_channels += max(1, int(self.cfg.prior_feature_channels)) + self.domain_channels + 1
         if self.cfg.enable_tri_branch_fusion:
             refine_channels += 4
         if self.cfg.enable_material_sensitive_view_encoder:
             refine_channels += 3
-        if self.cfg.enable_boundary_safety_module:
+        if self.enable_boundary_safety:
             refine_channels += 3
         if self.cfg.enable_material_topology_reasoning:
             refine_channels += max(8, int(self.cfg.topology_feature_channels)) + 1
@@ -1135,7 +1155,7 @@ class MaterialRefiner(BaseModule):
         if self.cfg.enable_confidence_gated_trunk:
             refine_out_channels = 5 + material_classes
         else:
-            refine_out_channels = 3 if self.cfg.enable_residual_gate else 2
+            refine_out_channels = 3 if self.enable_change_gate else 2
         self.refine_feature_adapter = FeatureAdapter(refine_channels)
         self.refine_head = SmallUNet(
             refine_channels,
@@ -1178,7 +1198,7 @@ class MaterialRefiner(BaseModule):
                 ConvBlock(render_gate_channels, context_channels),
                 nn.Conv2d(context_channels, 1, 1),
             )
-        if self.cfg.enable_boundary_safety_module:
+        if self.enable_boundary_safety:
             self.boundary_safety_module = BoundarySafetyModule(
                 boundary_feature_channels=self.cfg.view_feature_channels,
                 base_channels=self.cfg.base_channels,
@@ -1207,9 +1227,9 @@ class MaterialRefiner(BaseModule):
             )
 
     def build_uv_inputs(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        prior_roughness = batch["uv_prior_roughness"]
-        prior_metallic = batch["uv_prior_metallic"]
-        prior_confidence = batch["uv_prior_confidence"]
+        prior_roughness = batch.get("input_prior_roughness", batch["uv_prior_roughness"])
+        prior_metallic = batch.get("input_prior_metallic", batch["uv_prior_metallic"])
+        prior_confidence = batch.get("input_prior_confidence", batch["uv_prior_confidence"])
         if self.cfg.disable_prior_inputs:
             prior_roughness = torch.full_like(prior_roughness, 0.5)
             prior_metallic = torch.zeros_like(prior_metallic)
@@ -1420,20 +1440,23 @@ class MaterialRefiner(BaseModule):
                 view_material_entropy_uv = side_uv[:, 2:3]
                 material_transition_uv = _gradient_edge(view_material_entropy_uv)
 
-        prior = torch.cat([batch["uv_prior_roughness"], batch["uv_prior_metallic"]], dim=1)
-        prior_confidence = batch["uv_prior_confidence"]
+        input_prior_roughness = batch.get("input_prior_roughness", batch["uv_prior_roughness"])
+        input_prior_metallic = batch.get("input_prior_metallic", batch["uv_prior_metallic"])
+        input_prior_confidence = batch.get("input_prior_confidence", batch["uv_prior_confidence"])
+        prior = torch.cat([input_prior_roughness, input_prior_metallic], dim=1)
+        prior_confidence = input_prior_confidence
         if self.cfg.disable_prior_inputs:
             prior = torch.cat(
                 [
-                    torch.full_like(batch["uv_prior_roughness"], 0.5),
-                    torch.zeros_like(batch["uv_prior_metallic"]),
+                    torch.full_like(input_prior_roughness, 0.5),
+                    torch.zeros_like(input_prior_metallic),
                 ],
                 dim=1,
             )
             prior_confidence = torch.zeros_like(prior_confidence)
 
         prior_init_outputs: dict[str, torch.Tensor] | None = None
-        if self.cfg.enable_dual_path_prior_init:
+        if self.enable_no_prior_bootstrap:
             prior_init_outputs = self.prior_initializer(
                 uv_albedo=batch["uv_albedo"],
                 uv_normal=batch["uv_normal"],
@@ -1469,7 +1492,7 @@ class MaterialRefiner(BaseModule):
         boundary_safety_outputs: dict[str, torch.Tensor] | None = None
         safe_update_mask_uv = torch.ones_like(prior_confidence)
         bleed_risk_uv = torch.zeros_like(prior_confidence)
-        if self.cfg.enable_boundary_safety_module:
+        if self.enable_boundary_safety:
             boundary_safety_outputs = self.boundary_safety_module(
                 uv_mask=uv_mask,
                 boundary_cues=boundary_cues,
@@ -1543,7 +1566,7 @@ class MaterialRefiner(BaseModule):
             else fused_views
         )
         refine_parts = [uv_inputs, view_feature_for_refine, fused_valid, initial, prior_confidence]
-        if self.cfg.enable_dual_path_prior_init:
+        if self.enable_no_prior_bootstrap:
             refine_parts.extend([prior_feat_uv, domain_feat, init_confidence_uv])
         if self.cfg.enable_tri_branch_fusion:
             refine_parts.extend([view_uncertainty_uv, branch_confidence_uv])
@@ -1555,7 +1578,7 @@ class MaterialRefiner(BaseModule):
                     material_transition_uv,
                 ]
             )
-        if self.cfg.enable_boundary_safety_module:
+        if self.enable_boundary_safety:
             refine_parts.extend(
                 [
                     boundary_safety_outputs["boundary_gate_uv"],
@@ -1586,14 +1609,17 @@ class MaterialRefiner(BaseModule):
                 uncertainty_uv = torch.sigmoid(refine_raw[:, 3:4])
                 boundary_stability_uv = torch.sigmoid(refine_raw[:, 4:5])
                 trunk_material_logits = refine_raw[:, 5:]
-                if self.cfg.uncertainty_gate_strength > 0.0:
+                if self.enable_change_gate and self.cfg.uncertainty_gate_strength > 0.0:
                     strength = float(max(0.0, min(1.0, self.cfg.uncertainty_gate_strength)))
                     residual_gate = residual_gate * (1.0 - strength * uncertainty_uv)
-                residual_gate = residual_gate * (0.5 + 0.5 * boundary_stability_uv)
-            elif self.cfg.enable_residual_gate:
+                if self.enable_change_gate:
+                    residual_gate = residual_gate * (0.5 + 0.5 * boundary_stability_uv)
+            elif self.enable_change_gate:
                 residual_gate = torch.sigmoid(refine_raw[:, 2:3] + self.cfg.residual_gate_bias)
                 min_gate = float(max(0.0, min(1.0, self.cfg.min_residual_gate)))
                 residual_gate = min_gate + (1.0 - min_gate) * residual_gate
+            if not self.enable_change_gate:
+                residual_gate = torch.ones_like(prior_confidence)
             if self.cfg.prior_confidence_gate_strength > 0.0:
                 strength = float(max(0.0, min(1.0, self.cfg.prior_confidence_gate_strength)))
                 confidence_gate = 1.0 - prior_confidence.clamp(0.0, 1.0) * strength
@@ -1613,7 +1639,7 @@ class MaterialRefiner(BaseModule):
             )
             boundary_gate = (1.0 + strength * boundary_gain).clamp(1.0 - strength, 1.0 + strength)
             residual_gate = residual_gate * boundary_gate
-        if self.cfg.enable_boundary_safety_module:
+        if self.enable_boundary_safety:
             boundary_gate = boundary_gate * boundary_safety_outputs["boundary_gate_uv"]
             residual_gate = residual_gate * boundary_safety_outputs["boundary_gate_uv"]
             residual_gate = residual_gate * (0.25 + 0.75 * safe_update_mask_uv)
@@ -1754,16 +1780,45 @@ class MaterialRefiner(BaseModule):
             residual_gate = residual_gate * inverse_material_gate_uv
             provisional_refined = (initial + delta * residual_gate).clamp(0.0, 1.0)
         refined = provisional_refined
+        prior_reliability_uv = (
+            prior_init_outputs["prior_reliability_uv"]
+            if prior_init_outputs is not None
+            else prior_confidence.clamp(0.0, 1.0) * uv_mask
+        )
+        changed_pixel_rate = ((refined - initial).abs().amax(dim=1, keepdim=True) > 1.0e-3).to(refined.dtype)
+        boundary_delta_mean = (
+            ((delta * residual_gate).abs().mean(dim=1, keepdim=True) * boundary_cues).flatten(1).sum(dim=1)
+            / boundary_cues.flatten(1).sum(dim=1).clamp_min(1.0e-6)
+        )
+        diagnostics = {
+            "changed_pixel_rate": changed_pixel_rate.flatten(1).mean(dim=1),
+            "mean_abs_delta": (delta * residual_gate).abs().flatten(1).mean(dim=1),
+            "boundary_delta_mean": boundary_delta_mean,
+            "prior_reliability_mean": prior_reliability_uv.flatten(1).mean(dim=1),
+            "change_gate_mean": residual_gate.flatten(1).mean(dim=1),
+            "bootstrap_enabled": torch.full(
+                (refined.shape[0],),
+                1.0 if self.enable_no_prior_bootstrap else 0.0,
+                device=refined.device,
+                dtype=refined.dtype,
+            ),
+        }
 
         return {
             "coarse": coarse,
             "baseline": prior,
+            "input_prior": prior,
             "initial": initial,
+            "rm_init": initial,
             "rm_init_uv": initial,
             "init_confidence_uv": init_confidence_uv,
             "refined": refined,
+            "refined_rm": refined,
             "residual_delta": delta,
+            "delta_rm": delta,
             "residual_gate": residual_gate,
+            "change_gate": residual_gate,
+            "prior_reliability": prior_reliability_uv,
             "uncertainty_uv": uncertainty_uv,
             "boundary_cues": boundary_cues,
             "boundary_gate": boundary_gate,
@@ -1815,4 +1870,5 @@ class MaterialRefiner(BaseModule):
             "boundary_safety_outputs": boundary_safety_outputs,
             "topology_outputs": topology_outputs,
             "inverse_outputs": inverse_outputs,
+            "diagnostics": diagnostics,
         }

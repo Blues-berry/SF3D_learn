@@ -2,7 +2,7 @@
 
 ## 当前结论
 
-Round7 不能被表述为“整体视觉质量已经稳定提升”。它在 UV RM、view-space RM、LPIPS proxy 和 residual safety 上有真实进展，但 proxy render 的 PSNR/SSIM 退化，boundary bleed 仍明显差于 SF3D baseline。因此下一轮优化必须围绕边界扩散和渲染代理指标，而不是继续单纯压 UV MAE。
+Round7 不能被表述为“整体视觉质量已经稳定提升”。它在 UV RM、view-space RM、LPIPS proxy 和 residual safety 上有真实进展，但 proxy render 的 PSNR/SSIM 退化，boundary bleed 仍明显差于当时的 input-prior baseline（主要来自 SF3D prior）。因此下一轮优化必须围绕边界扩散和渲染代理指标，而不是继续单纯压 UV MAE。
 
 ## NG 风格终端输出整改
 
