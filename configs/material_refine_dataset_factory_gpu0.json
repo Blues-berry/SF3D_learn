@@ -2,7 +2,7 @@
   "factory_version": "sf3d_material_refine_dataset_factory_v1",
   "notes": [
     "Continuous dataset expansion plan for SF3D material-refine data only; no training is launched here.",
-    "GPU policy allows data-only render/preprocess work to fully use GPU1 when needed; no training is launched here.",
+    "GPU policy is locked to GPU0 for data-only render/preprocess work; GPU1 is left untouched.",
     "Pool-A paper promotion remains gated by license/import/target-quality audits; auxiliary and benchmark pools are explicitly marked.",
     "Storage policy: future heavy render/preprocess outputs go to /4T; repo output keeps lightweight reports/manifests.",
     "2026-04-26 policy: do not use 3D-FUTURE / 3D furniture as a future dataset source; preserve only legacy records already present in fixed Stage1-v3 manifests."
@@ -15,8 +15,8 @@
   },
   "gpu_policy": {
     "render_gpu_list": "0",
-    "keep_gpu_indices_empty": [],
-    "allow_gpu1_data_processes": true,
+    "keep_gpu_indices_empty": [1],
+    "allow_gpu1_data_processes": false,
     "max_gpu1_data_memory_mb": 32607,
     "max_gpu0_used_mb_for_new_launch": 4096,
     "poll_seconds": 300
@@ -182,7 +182,7 @@
     "prefer_paper_main_first": false,
     "interleave_selection_keys": "material_family,source_name,has_material_prior",
     "max_records": 9700,
-    "shards": 8,
+    "shards": 12,
     "workers_per_gpu": 1,
     "view_light_protocol": "production_32",
     "max_hdri_lights": 4,
@@ -500,6 +500,7 @@
       "enabled": true,
       "session": "sf3d_factory_polyhaven_material_bank",
       "output_root": "output/highlight_pool_a_8k/aux_sources/polyhaven_materials_factory",
+      "skip_if_primary_progress_exists": false,
       "retry_seconds": 1800,
       "stall_seconds": 3600,
       "progress_paths": [
@@ -574,7 +575,7 @@
     }
   ],
   "promotion": {
-    "enabled": false,
+    "enabled": true,
     "prefer_for_audit": true,
     "min_input_records": 8,
     "input_manifest_globs": [
@@ -595,7 +596,7 @@
     "report_json": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.json",
     "report_md": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.md",
     "report_html": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/target_promotion_report.html",
-    "min_input_mtime_age_seconds": 600,
+    "min_input_mtime_age_seconds": 0,
     "allowed_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
     "promotable_source_names": "ABO_locked_core,Objaverse-XL_strict_filtered_increment",
     "promote_auxiliary_to_paper_main": true,
@@ -610,7 +611,8 @@
   "stage1_v3": {
     "enabled": true,
     "input_manifest": "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
-    "output_root": "output/material_refine_paper/stage1_v3_dataset_latest",
+    "output_root": "output/material_refine_paper/stage1_v4_no3dfuture_latest",
+    "subset_prefix": "stage1_v4_no3dfuture",
     "min_input_records": 128,
     "target_records": 900,
     "min_paper_eligible": 800,
@@ -631,6 +633,7 @@
     "paper_license_buckets": "cc_by_nc_4_0,cc_by_nc_4_0_pending_reconcile,custom_tianchi_research_noncommercial_no_redistribution,Creative Commons Zero v1.0 Universal,MIT License,Apache License 2.0,BSD 3-Clause \"New\" or \"Revised\" License,The Unlicense,Creative Commons - Attribution",
     "material_quotas": "metal_dominant:0.30,ceramic_glazed_lacquer:0.20,glass_metal:0.15,mixed_thin_boundary:0.20,glossy_non_metal:0.15",
     "main_train_source_names": "ABO_locked_core,Objaverse-XL_strict_filtered_increment,Objaverse-XL_cached_strict_increment",
+    "exclude_source_names": "3D-FUTURE_highlight_local_8k",
     "train_ratio": 0.70,
     "val_ratio": 0.12,
     "iid_test_ratio": 0.10,
@@ -645,10 +648,11 @@
     "min_used_hdri_assets": 256,
     "manifests": [
       "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_strict_paper_candidates.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_balanced_paper_manifest.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_diagnostic_manifest.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_ood_eval_manifest.json"
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_strict_paper_candidates.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_balanced_paper_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_diagnostic_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_ood_eval_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_real_lighting_manifest.json"
     ],
     "manifest_globs": [
       "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
@@ -667,10 +671,11 @@
     "output_json": "output/material_refine_cleanup/post_ingest_cleanup_report.json",
     "protected_manifests": [
       "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_balanced_paper_manifest.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_strict_paper_candidates.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_diagnostic_manifest.json",
-      "output/material_refine_paper/stage1_v3_dataset_latest/stage1_v3_ood_eval_manifest.json"
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_balanced_paper_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_strict_paper_candidates.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_diagnostic_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_ood_eval_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_real_lighting_manifest.json"
     ],
     "protected_manifest_globs": [
       "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
@@ -689,6 +694,33 @@
       "/4T/CXY/sf3d_material_refine_dataset_factory",
       "output/material_refine_dataset_factory"
     ]
+  },
+  "reject_cleanup": {
+    "enabled": true,
+    "mode": "trash",
+    "min_age_seconds": 86400,
+    "max_actions": 64,
+    "trash_root": "/4T/CXY/sf3d_material_refine_reject_trash",
+    "output_json": "output/material_refine_cleanup/stage1_v4_no3dfuture_reject_cleanup_report.json",
+    "reject_manifest": "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_rejects.json",
+    "protected_manifests": [
+      "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_balanced_paper_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_strict_paper_candidates.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_diagnostic_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_ood_eval_manifest.json",
+      "output/material_refine_paper/stage1_v4_no3dfuture_latest/stage1_v4_no3dfuture_real_lighting_manifest.json"
+    ],
+    "protected_manifest_globs": [
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "/4T/CXY/sf3d_material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_supervisor_merged.json",
+      "output/material_refine_dataset_factory/longrun_gpu0_*/canonical_manifest_monitor_merged.json"
+    ],
+    "candidate_path_fields": [
+      "canonical_bundle_root"
+    ],
+    "include_source_assets": false
   },
   "quality": {
     "min_paper_eligible": 128,

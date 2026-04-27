@@ -2,7 +2,7 @@
   "supervisor_version": "sf3d_material_refine_dataset_supervisor_7day_v1",
   "notes": [
     "Data-only supervisor: keeps download, render/preprocess, merge, audit, and validation loops alive for seven days.",
-    "GPU1 may be fully used by data-only render/preprocess sessions when this accelerates dataset readiness.",
+    "GPU1 is intentionally kept untouched; this supervisor only maintains GPU0 data processing.",
     "No training command is launched from this supervisor.",
     "Storage policy: future heavy render/preprocess roots are supervised under /4T; active repo-output runs are not moved.",
     "2026-04-26 policy: do not resume legacy 3D-FUTURE / 3D furniture roots; future dataset expansion is driven by factory no-3DFUTURE inputs plus Objaverse/ABO/benchmark/material/HDRI sources."
@@ -34,18 +34,13 @@
   },
   "gpu_policy": {
     "render_gpu": 0,
-    "keep_gpu_indices_empty": [],
-    "allow_gpu1_data_processes": true,
-    "max_gpu1_data_memory_mb": 32607,
+    "keep_gpu_indices_empty": [1],
+    "allow_gpu1_data_processes": false,
+    "max_gpu1_data_memory_mb": 0,
     "warn_if_data_process_on_gpu1": true
   },
   "downloads": {
     "required_sessions": [
-      "sf3d_factory_polyhaven_hdri",
-      "sf3d_factory_objaverse_cached_increment",
-      "sf3d_factory_objaverse_cached_scarce_increment",
-      "sf3d_factory_objaverse_github_lfs_increment",
-      "sf3d_factory_objaverse_strict_full_retry",
       "sf3d_factory_polyhaven_material_bank"
     ]
   },

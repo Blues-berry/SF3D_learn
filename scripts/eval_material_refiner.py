@@ -576,6 +576,58 @@ def sample_uv_maps_to_view(uv_maps: torch.Tensor, view_uvs: torch.Tensor) -> tor
     return sampled.view(batch, views, sampled.shape[1], height, width)
 
 
+def view_uv_valid_mask(view_uv: torch.Tensor) -> torch.Tensor:
+    finite = torch.isfinite(view_uv).all(dim=-1)
+    in_range = (
+        (view_uv[..., 0] >= 0.0)
+        & (view_uv[..., 0] <= 1.0)
+        & (view_uv[..., 1] >= 0.0)
+        & (view_uv[..., 1] <= 1.0)
+    )
+    return finite & in_range
+
+
+def save_view_space_artifacts(
+    view_dir: Path,
+    safe_view_name: str,
+    *,
+    sampled_baseline: torch.Tensor,
+    sampled_target: torch.Tensor,
+    sampled_refined: torch.Tensor,
+    stored_target: torch.Tensor,
+    mask: torch.Tensor,
+    view_uv: torch.Tensor,
+) -> dict[str, str]:
+    view_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "sampled_input_prior_view_roughness": view_dir / f"{safe_view_name}_sampled_input_prior_roughness.png",
+        "sampled_input_prior_view_metallic": view_dir / f"{safe_view_name}_sampled_input_prior_metallic.png",
+        "sampled_gt_view_roughness": view_dir / f"{safe_view_name}_sampled_gt_roughness.png",
+        "sampled_gt_view_metallic": view_dir / f"{safe_view_name}_sampled_gt_metallic.png",
+        "sampled_pred_view_roughness": view_dir / f"{safe_view_name}_sampled_pred_roughness.png",
+        "sampled_pred_view_metallic": view_dir / f"{safe_view_name}_sampled_pred_metallic.png",
+        "stored_view_target_roughness": view_dir / f"{safe_view_name}_stored_target_roughness.png",
+        "stored_view_target_metallic": view_dir / f"{safe_view_name}_stored_target_metallic.png",
+        "prior_gt_view_error": view_dir / f"{safe_view_name}_prior_gt_view_error.png",
+        "pred_gt_view_error": view_dir / f"{safe_view_name}_pred_gt_view_error.png",
+        "view_mask": view_dir / f"{safe_view_name}_view_mask.png",
+        "view_uv_valid": view_dir / f"{safe_view_name}_view_uv_valid.png",
+    }
+    tensor_to_pil(sampled_baseline[0:1], grayscale=True).save(paths["sampled_input_prior_view_roughness"])
+    tensor_to_pil(sampled_baseline[1:2], grayscale=True).save(paths["sampled_input_prior_view_metallic"])
+    tensor_to_pil(sampled_target[0:1], grayscale=True).save(paths["sampled_gt_view_roughness"])
+    tensor_to_pil(sampled_target[1:2], grayscale=True).save(paths["sampled_gt_view_metallic"])
+    tensor_to_pil(sampled_refined[0:1], grayscale=True).save(paths["sampled_pred_view_roughness"])
+    tensor_to_pil(sampled_refined[1:2], grayscale=True).save(paths["sampled_pred_view_metallic"])
+    tensor_to_pil(stored_target[0:1], grayscale=True).save(paths["stored_view_target_roughness"])
+    tensor_to_pil(stored_target[1:2], grayscale=True).save(paths["stored_view_target_metallic"])
+    save_error_heatmap(paths["prior_gt_view_error"], (sampled_baseline - stored_target).abs())
+    save_error_heatmap(paths["pred_gt_view_error"], (sampled_refined - stored_target).abs())
+    tensor_to_pil(mask[None].float(), grayscale=True).save(paths["view_mask"])
+    tensor_to_pil(view_uv_valid_mask(view_uv)[None].float(), grayscale=True).save(paths["view_uv_valid"])
+    return {key: str(value.resolve()) for key, value in paths.items()}
+
+
 def confidence_weighted_mean(
     value: torch.Tensor,
     confidence: torch.Tensor,
@@ -2042,6 +2094,14 @@ def main() -> None:
                         "input_prior_total_mae": input_prior_total_uv,
                         "refined_total_mae": refined_uv_roughness_mae + refined_uv_metallic_mae,
                         "gain_total": gain_total_uv,
+                        "uv_prior_error": input_prior_total_uv,
+                        "uv_pred_error": refined_total_uv,
+                        "uv_gain": gain_total_uv,
+                        "uv_improved": bool(gain_total_uv > 0.0),
+                        "view_prior_error": None,
+                        "view_pred_error": None,
+                        "view_gain": None,
+                        "view_regressed": False,
                         "improvement_total": (baseline_uv_roughness_mae + baseline_uv_metallic_mae)
                         - (refined_uv_roughness_mae + refined_uv_metallic_mae),
                         "baseline_tags": [],
@@ -2089,6 +2149,10 @@ def main() -> None:
                 refined[item_idx : item_idx + 1],
                 view_uvs[item_idx : item_idx + 1],
             )[0]
+            sampled_target = sample_uv_maps_to_view(
+                target[item_idx : item_idx + 1],
+                view_uvs[item_idx : item_idx + 1],
+            )[0]
             sampled_albedo = sample_uv_maps_to_view(
                 batch["uv_albedo"][item_idx : item_idx + 1],
                 view_uvs[item_idx : item_idx + 1],
@@ -2104,6 +2168,10 @@ def main() -> None:
                 mask = batch["view_masks"][item_idx, view_idx, 0] > 0.5
                 if not mask.any():
                     continue
+                safe_view_name = "".join(
+                    char if char.isalnum() or char in {"-", "_"} else "_"
+                    for char in str(view_name)
+                )
                 gt_rough = gt_view[0].numpy()
                 gt_metal = gt_view[1].numpy()
                 baseline_view = sampled_baseline[view_idx].numpy()
@@ -2144,6 +2212,20 @@ def main() -> None:
                 input_prior_total_view = baseline_rough_mae + baseline_metal_mae
                 refined_total_view = refined_rough_mae + refined_metal_mae
                 gain_total_view = input_prior_total_view - refined_total_view
+                view_paths = {}
+                if write_artifacts:
+                    view_paths.update(
+                        save_view_space_artifacts(
+                            object_dir / "views",
+                            safe_view_name,
+                            sampled_baseline=sampled_baseline[view_idx],
+                            sampled_target=sampled_target[view_idx],
+                            sampled_refined=sampled_refined[view_idx],
+                            stored_target=gt_view,
+                            mask=mask.float(),
+                            view_uv=view_uvs[item_idx, view_idx],
+                        )
+                    )
                 target_view = np.stack([gt_rough, gt_metal], axis=0)
                 baseline_boundary = compute_boundary_bleed_metrics(
                     baseline_view,
@@ -2183,7 +2265,6 @@ def main() -> None:
                 baseline_psnr = refined_psnr = None
                 baseline_ssim = refined_ssim = None
                 baseline_lpips = refined_lpips = None
-                view_paths = {}
                 if args.render_metric_mode == "proxy_uv_shading":
                     baseline_proxy = proxy_render_from_uv_material(
                         albedo=sampled_albedo[view_idx].numpy(),
@@ -2213,10 +2294,6 @@ def main() -> None:
                                 mask_np,
                             )
                         )
-                    safe_view_name = "".join(
-                        char if char.isalnum() or char in {"-", "_"} else "_"
-                        for char in str(view_name)
-                    )
                     if write_artifacts:
                         view_dir = object_dir / "views"
                         reference_path = view_dir / f"{safe_view_name}_reference_rgb.png"
@@ -2226,6 +2303,7 @@ def main() -> None:
                         save_rgb_tensor_image(baseline_proxy_path, baseline_proxy)
                         save_rgb_tensor_image(refined_proxy_path, refined_proxy)
                         view_paths = {
+                            **view_paths,
                             "reference_rgb": str(reference_path.resolve()),
                             "baseline_proxy_render": str(baseline_proxy_path.resolve()),
                             "refined_proxy_render": str(refined_proxy_path.resolve()),
@@ -2263,6 +2341,14 @@ def main() -> None:
                         "input_prior_total_mae": input_prior_total_view,
                         "refined_total_mae": refined_rough_mae + refined_metal_mae,
                         "gain_total": gain_total_view,
+                        "uv_prior_error": input_prior_total_uv,
+                        "uv_pred_error": refined_total_uv,
+                        "uv_gain": gain_total_uv,
+                        "uv_improved": bool(gain_total_uv > 0.0),
+                        "view_prior_error": input_prior_total_view,
+                        "view_pred_error": refined_total_view,
+                        "view_gain": gain_total_view,
+                        "view_regressed": bool(gain_total_view < 0.0),
                         "improvement_total": (baseline_rough_mae + baseline_metal_mae)
                         - (refined_rough_mae + refined_metal_mae),
                         "baseline_psnr": baseline_psnr,

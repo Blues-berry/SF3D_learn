@@ -305,6 +305,18 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--prior-consistency-weight", type=float, default=0.10)
     parser.add_argument("--smoothness-weight", type=float, default=0.02)
     parser.add_argument("--view-consistency-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--enable-sampled-view-rm-loss",
+        type=parse_bool,
+        default=False,
+        help="Alias for requiring sampled UV-to-view RM supervision without relying on stored view target PNGs.",
+    )
+    parser.add_argument(
+        "--sampled-view-rm-loss-weight",
+        type=float,
+        default=0.0,
+        help="Optional explicit weight for sampled UV-to-view RM loss; falls back to --view-consistency-weight.",
+    )
     parser.add_argument("--edge-aware-weight", type=float, default=0.0)
     parser.add_argument("--edge-aware-epsilon", type=float, default=1e-3)
     parser.add_argument("--boundary-bleed-weight", type=float, default=0.0)
@@ -973,7 +985,8 @@ def compute_losses(
         refined.new_zeros(()),
     )
 
-    if args.view_consistency_mode != "disabled" and batch.get("view_uvs") is not None:
+    sampled_view_rm_loss_enabled = bool(args.enable_sampled_view_rm_loss) or args.view_consistency_mode != "disabled"
+    if sampled_view_rm_loss_enabled and batch.get("view_uvs") is not None:
         sampled_refined = sample_uv_maps_to_view(refined, batch["view_uvs"])
         view_mask = batch["view_masks"].clamp(0.0, 1.0)
         supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
@@ -993,7 +1006,7 @@ def compute_losses(
         + args.coarse_weight * coarse_l1
         + args.prior_consistency_weight * prior_consistency
         + args.smoothness_weight * smoothness
-        + args.view_consistency_weight * view_consistency
+        + max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) * view_consistency
         + args.edge_aware_weight * edge_aware
         + args.boundary_bleed_weight * boundary_bleed
         + args.gradient_preservation_weight * gradient_preservation
@@ -2337,7 +2350,11 @@ def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any
             )
             if args.view_consistency_mode == "required" and effective_view_rate <= 0.0:
                 errors.append("view_consistency_required_but_effective_view_supervision_rate_is_zero")
-            elif args.view_consistency_mode != "disabled" and args.view_consistency_weight > 0.0 and effective_view_rate <= 0.0:
+            elif (
+                (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
+                and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
+                and effective_view_rate <= 0.0
+            ):
                 warnings.append(
                     "view_consistency_configured_without_effective_view_supervision:"
                     f"mode={args.view_consistency_mode};consider_weight_0_or_disabled"
@@ -2356,6 +2373,8 @@ def run_preflight_checks(args: argparse.Namespace, device: str) -> dict[str, Any
         "output_dir": str(args.output_dir),
         "view_consistency_mode": args.view_consistency_mode,
         "view_consistency_weight": float(args.view_consistency_weight),
+        "enable_sampled_view_rm_loss": bool(args.enable_sampled_view_rm_loss),
+        "sampled_view_rm_loss_weight": float(args.sampled_view_rm_loss_weight),
         "edge_aware_weight": float(args.edge_aware_weight),
         "boundary_bleed_weight": float(args.boundary_bleed_weight),
         "boundary_band_kernel": int(args.boundary_band_kernel),
@@ -3760,7 +3779,10 @@ def evaluate(
         "max_validation_batches": int(args.max_validation_batches),
         "effective_view_supervision_samples": int(uv_mae.get("effective_view_supervision_samples", 0.0)),
         "effective_view_supervision_rate": float(uv_mae.get("effective_view_supervision_samples", 0.0) / max(uv_mae["count"], 1.0)),
-        "view_consistency_enabled": bool(args.view_consistency_mode != "disabled" and args.view_consistency_weight > 0.0),
+        "view_consistency_enabled": bool(
+            (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
+            and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
+        ),
         "render_proxy_validation": (
             finalize_render_proxy_metrics(render_proxy_store)
             if render_proxy_enabled
@@ -4631,7 +4653,10 @@ def main() -> None:
                     "global_batch_step": global_batch_step,
                     "lr": current_lr(optimizer),
                     "train/prior_dropout_probability": prior_dropout_probability,
-                    "train/view_consistency_enabled": bool(args.view_consistency_mode != "disabled" and args.view_consistency_weight > 0.0),
+                    "train/view_consistency_enabled": bool(
+                        (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
+                        and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
+                    ),
                     "train/batches_per_log_window": interval_steps,
                     "train/samples_per_second": interval_examples / interval_seconds,
                     "train/seconds_per_batch": interval_seconds / max(interval_steps, 1),
@@ -4817,7 +4842,10 @@ def main() -> None:
         train_metrics["prior_dropout_probability"] = prior_dropout_probability
         if epoch_examples > 0:
             train_metrics["effective_view_supervision_rate"] = running["effective_view_supervision_samples"] / epoch_examples
-        train_metrics["view_consistency_enabled"] = bool(args.view_consistency_mode != "disabled" and args.view_consistency_weight > 0.0)
+        train_metrics["view_consistency_enabled"] = bool(
+            (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
+            and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
+        )
         train_metrics["samples_per_second"] = epoch_examples / epoch_seconds
         train_metrics["epoch_seconds"] = epoch_seconds
         epoch_payload: dict[str, Any] = {

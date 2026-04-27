@@ -204,6 +204,28 @@ def delta_image(path_a: str | Path | None, path_b: str | Path | None, *, size: i
     return Image.fromarray(heat, mode="RGB").resize((size, size), Image.Resampling.LANCZOS)
 
 
+def view_space_tiles(paths: dict[str, Any], size: int) -> list[Image.Image]:
+    keys = [
+        ("reference_rgb", "Input RGB view", "RGB"),
+        ("sampled_input_prior_view_roughness", "View Prior rough", "L"),
+        ("sampled_input_prior_view_metallic", "View Prior metal", "L"),
+        ("sampled_gt_view_roughness", "View GT rough", "L"),
+        ("sampled_gt_view_metallic", "View GT metal", "L"),
+        ("sampled_pred_view_roughness", "View Pred rough", "L"),
+        ("sampled_pred_view_metallic", "View Pred metal", "L"),
+        ("prior_gt_view_error", "|Prior-GT| view", "RGB"),
+        ("pred_gt_view_error", "|Pred-GT| view", "RGB"),
+        ("view_mask", "View mask", "L"),
+        ("view_uv_valid", "view_uv valid", "L"),
+    ]
+    if not any(paths.get(key) for key, _, _ in keys):
+        return []
+    return [
+        label_image(load_image(paths.get(key), size=size, mode=mode), label)
+        for key, label, mode in keys
+    ]
+
+
 def view_rgb_paths(manifest_path: Path, manifest_payload: dict[str, Any], record: dict[str, Any]) -> list[tuple[str, Path | None]]:
     root = resolve_record_path(manifest_path, manifest_payload, record, record.get("canonical_buffer_root"))
     paths: list[tuple[str, Path | None]] = []
@@ -286,6 +308,7 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
         label_image(delta_image(paths.get("refined_metallic"), paths.get("target_metallic"), size=size), "|Pred-GT| metal"),
         label_image(delta_image(paths.get("refined_metallic"), paths.get("baseline_metallic"), size=size), "|Pred-Prior| metal"),
     ])
+    tiles.extend(view_space_tiles(paths, size))
 
     columns = 5
     rows = int(np.ceil(len(tiles) / columns))
@@ -299,12 +322,18 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
         f"{row.get('view_name')} | {prior_label}"
     )
     regression_flag = bool((finite_float(row.get("gain_total", row.get("improvement_total"))) or 0.0) < 0.0)
+    uv_gain = finite_float(row.get("uv_gain"))
+    view_gain = finite_float(row.get("view_gain", row.get("gain_total", row.get("improvement_total"))))
+    uv_improved = bool(uv_gain is not None and uv_gain > 0.0)
+    view_regressed = bool(view_gain is not None and view_gain < 0.0)
     metrics = (
         f"{baseline_metadata(row, record)} | "
         f"input_prior_total={fmt_metric(row.get('input_prior_total_mae', row.get('baseline_total_mae')))}  "
         f"refined_total={fmt_metric(row.get('refined_total_mae'))}  "
         f"gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))}  "
-        f"regression_flag={regression_flag}"
+        f"regression_flag={regression_flag}  "
+        f"uv_gain={fmt_metric(uv_gain)} view_gain={fmt_metric(view_gain)} "
+        f"uv_improved={uv_improved} view_regressed={view_regressed}"
     )
     draw.text((14, 14), title, fill=(242, 247, 255))
     draw.text((14, 42), metrics, fill=(180, 205, 224))
@@ -317,10 +346,12 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
     cards = []
     for row, panel_path in zip(rows, panel_paths):
         record = records.get(str(row.get("object_id")))
+        uv_gain = finite_float(row.get("uv_gain"))
+        view_gain = finite_float(row.get("view_gain", row.get("gain_total", row.get("improvement_total"))))
         cards.append("\n".join([
             "<section class='card'>",
             f"<h2>{row.get('object_id')}</h2>",
-            "<div class='meta'>" + f"generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | {baseline_metadata(row, record)} | gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))}" + "</div>",
+            "<div class='meta'>" + f"generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | {baseline_metadata(row, record)} | gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))} | uv_gain={fmt_metric(uv_gain)} | view_gain={fmt_metric(view_gain)}" + "</div>",
             f"<img src='{panel_path.name}' alt='{row.get('object_id')} comparison panel'>",
             "</section>",
         ]))
@@ -330,7 +361,7 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
         "<html><head><meta charset='utf-8'><title>Material Validation Comparison Panels</title>",
         "<style>body{margin:0;background:#081019;color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1400px;margin:0 auto;padding:28px}.card{background:#111b27;border:1px solid #263648;border-radius:18px;padding:18px;margin:18px 0}.meta{color:#a9c4d8;margin:6px 0 14px}img{width:100%;border-radius:12px;background:#090d13}</style></head><body><main class='wrap'>",
         "<h1>Input Prior vs Material Refiner Validation Panels</h1>",
-        "<p>Each panel shows canonical RGB views, input prior RM maps, GT/target maps, predicted maps, and error maps. The prior label is source-aware and should only say SF3D when the atlas is traceable to an SF3D output.</p>",
+        "<p>Each panel shows canonical RGB views, UV RM maps, GT/target maps, predicted maps, error maps, and a view-space row when the eval exported sampled view artifacts. The prior label is source-aware and should only say SF3D when the atlas is traceable to an SF3D output.</p>",
         *cards,
         "</main></body></html>",
     ]), encoding="utf-8")

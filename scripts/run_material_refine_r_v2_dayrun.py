@@ -73,6 +73,14 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
 def run_cmd(
     cmd: list[str],
     *,
@@ -540,6 +548,50 @@ def run_metric_consistency_audit(args: argparse.Namespace, eval_dir: Path, log_p
     return payload
 
 
+def run_view_consistency_audit(
+    args: argparse.Namespace,
+    *,
+    manifest: Path,
+    checkpoint: Path | None,
+    eval_dir: Path,
+    log_path: Path,
+) -> dict[str, Any]:
+    if checkpoint is None or not checkpoint.exists():
+        return {"code": None, "passed": False, "reason": "missing_checkpoint"}
+    if not (eval_dir / "summary.json").exists() or not (eval_dir / "metrics.json").exists():
+        return {"code": None, "passed": False, "reason": "missing_eval_outputs"}
+    output_dir = args.output_root / "view_consistency_audit"
+    code = run_cmd(
+        [
+            PYTHON,
+            "scripts/audit_material_refine_view_consistency.py",
+            "--eval-dir",
+            str(eval_dir),
+            "--manifest",
+            str(manifest),
+            "--checkpoint",
+            str(checkpoint),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--num-workers",
+            "0",
+        ],
+        log_path=log_path,
+        dry_run=args.dry_run,
+    )
+    run_summary_path = output_dir / "audit_run_summary.json"
+    identity_path = output_dir / "view_identity_test_summary.json"
+    root_cause_path = output_dir / "view_degradation_root_cause.json"
+    payload = load_json(run_summary_path) if run_summary_path.exists() else {}
+    payload["code"] = code
+    payload["identity_summary"] = load_json(identity_path) if identity_path.exists() else {}
+    payload["root_cause"] = load_json(root_cause_path) if root_cause_path.exists() else {}
+    payload["output_dir"] = str(output_dir.resolve())
+    return payload
+
+
 def write_case_indexes(eval_dir: Path) -> None:
     path = eval_dir / "diagnostic_cases.json"
     if not path.exists():
@@ -663,6 +715,18 @@ def phase2(args: argparse.Namespace, manifest: Path) -> dict[str, Any]:
         },
     )
     summary = result.get("summary") or {}
+    checkpoint_path = Path(result["checkpoint"]) if result.get("checkpoint") else None
+    log_path = args.output_root / "logs" / "r-v2-acceptance-128.log"
+    view_consistency_audit = {}
+    if summary:
+        view_consistency_audit = run_view_consistency_audit(
+            args,
+            manifest=manifest,
+            checkpoint=checkpoint_path,
+            eval_dir=args.output_root / "acceptance_128_eval",
+            log_path=log_path,
+        )
+    result["view_consistency_audit"] = view_consistency_audit
     by_prior_label = summary.get("by_prior_label") or {}
     with_prior_reliability = (by_prior_label.get("with_prior") or {}).get("prior_reliability_mean")
     without_prior_reliability = (by_prior_label.get("without_prior") or {}).get("prior_reliability_mean")
@@ -734,6 +798,12 @@ def phase2(args: argparse.Namespace, manifest: Path) -> dict[str, Any]:
         f"- summary_regression_rate: `{metric_audit.get('summary_regression_rate')}`",
         f"- audit: `{rel(args.output_root / 'acceptance_128_eval' / 'metric_consistency_audit.md')}`",
         f"- debug_csv: `{rel(args.output_root / 'acceptance_128_eval' / 'metric_consistency_debug.csv')}`",
+        "",
+        "## View Consistency Audit",
+        "",
+        f"- code: `{view_consistency_audit.get('code')}`",
+        f"- output_dir: `{rel(Path(view_consistency_audit.get('output_dir', args.output_root / 'view_consistency_audit')))}`",
+        f"- root_cause: `{(view_consistency_audit.get('root_cause') or {}).get('classification')}`",
         "",
     ]
     (args.output_root / "r_v2_acceptance_128_note.md").write_text("\n".join(note), encoding="utf-8")
@@ -903,43 +973,113 @@ def rehearsal_manifest() -> Path | None:
     return None
 
 
+def identity_test_pass(view_audit: dict[str, Any], mode: str) -> bool:
+    rows = ((view_audit.get("identity_summary") or {}).get("rows") or [])
+    if not rows:
+        rows = (((view_audit.get("summary") or {}).get("identity_rows")) or [])
+    for row in rows:
+        if row.get("mode") == mode:
+            return bool(row.get("identity_pass"))
+    return False
+
+
+def target_prior_identity_mean_for_gate(args: argparse.Namespace, phase2_result: dict[str, Any]) -> float | None:
+    candidates: list[Any] = []
+    for path in [
+        args.output_root / "subsets/r_v2_acceptance_128_manifest.json",
+        args.output_root / "acceptance_128_eval/manifest_snapshot.json",
+        args.output_root / "phase1_acceptance_subset.json",
+    ]:
+        if not path.exists():
+            continue
+        payload = load_json(path)
+        if isinstance(payload.get("summary"), dict):
+            candidates.append(payload["summary"].get("target_prior_identity_mean"))
+        candidates.append(payload.get("target_prior_identity_mean"))
+    rows = (((phase2_result.get("view_consistency_audit") or {}).get("summary") or {}).get("identity_rows")) or []
+    if rows:
+        candidates.append((phase2_result.get("view_consistency_audit") or {}).get("target_prior_identity_mean"))
+    for value in candidates:
+        number = finite_float(value)
+        if number is not None:
+            return number
+    return None
+
+
 def phase4_metric_gate(args: argparse.Namespace, phase2_result: dict[str, Any]) -> dict[str, Any]:
     audit = phase2_result.get("metric_consistency_audit") or {}
     audit_path = args.output_root / "acceptance_128_eval" / "metric_consistency_audit.json"
     if not audit and audit_path.exists():
         audit = load_json(audit_path)
+    summary = phase2_result.get("summary") or {}
+    view_level = summary.get("view_level") or {}
+    view_audit = phase2_result.get("view_consistency_audit") or {}
+    view_audit_path = args.output_root / "view_consistency_audit" / "audit_run_summary.json"
+    if not view_audit and view_audit_path.exists():
+        view_audit = load_json(view_audit_path)
+        identity_path = args.output_root / "view_consistency_audit" / "view_identity_test_summary.json"
+        if identity_path.exists():
+            view_audit["identity_summary"] = load_json(identity_path)
+    target_prior_identity_mean = target_prior_identity_mean_for_gate(args, phase2_result)
+    uv_gain = finite_float(summary.get("gain_total"))
+    uv_improvement_rate = finite_float(summary.get("improvement_rate"))
+    uv_regression_rate = finite_float(summary.get("regression_rate"))
+    view_gain = finite_float(view_level.get("gain_total"))
+    view_regression_rate = finite_float(view_level.get("regression_rate"))
+    gate_checks = {
+        "metric_consistency_pass": bool(audit.get("metric_consistency_pass")),
+        "uv_object_gain_total_positive": uv_gain is not None and uv_gain > 0.0,
+        "uv_object_improvement_rate_gt_regression_rate": (
+            uv_improvement_rate is not None
+            and uv_regression_rate is not None
+            and uv_improvement_rate > uv_regression_rate
+        ),
+        "view_level_direction_ok": (
+            view_gain is not None
+            and (
+                view_gain >= 0.0
+                or (view_regression_rate is not None and view_regression_rate < 0.50)
+            )
+        ),
+        "target_prior_identity_mean_ok": (
+            target_prior_identity_mean is not None and target_prior_identity_mean <= 0.30
+        ),
+        "target_as_pred_identity_pass": identity_test_pass(view_audit, "target_as_pred"),
+        "prior_as_pred_identity_pass": identity_test_pass(view_audit, "prior_as_pred"),
+    }
+    gate_payload = {
+        "audit_path": str(audit_path.resolve()),
+        "view_audit_path": str(view_audit_path.resolve()),
+        "audit": audit,
+        "view_consistency_audit": view_audit,
+        "checks": gate_checks,
+        "values": {
+            "uv_object_gain_total": uv_gain,
+            "uv_object_improvement_rate": uv_improvement_rate,
+            "uv_object_regression_rate": uv_regression_rate,
+            "view_level_gain_total": view_gain,
+            "view_level_regression_rate": view_regression_rate,
+            "target_prior_identity_mean": target_prior_identity_mean,
+        },
+    }
     if not audit:
         return {
+            **gate_payload,
             "passed": False,
             "reason": "metric_consistency_audit_missing",
-            "audit_path": str(audit_path.resolve()),
         }
-    if not audit.get("metric_consistency_pass"):
+    failed = [key for key, value in gate_checks.items() if not value]
+    if failed:
         return {
+            **gate_payload,
             "passed": False,
-            "reason": "metric_consistency_audit_failed",
-            "audit_path": str(audit_path.resolve()),
-            "audit": audit,
-        }
-    if audit.get("view_row_regression_dominates"):
-        return {
-            "passed": False,
-            "reason": "view_level_regression_dominates",
-            "audit_path": str(audit_path.resolve()),
-            "audit": audit,
-        }
-    if not audit.get("phase4_rehearsal_gate_pass", False):
-        return {
-            "passed": False,
-            "reason": "phase4_rehearsal_gate_failed",
-            "audit_path": str(audit_path.resolve()),
-            "audit": audit,
+            "reason": "phase4_metric_gate_failed:" + ",".join(failed),
+            "failed_checks": failed,
         }
     return {
+        **gate_payload,
         "passed": True,
-        "reason": "metric_consistency_and_view_direction_passed",
-        "audit_path": str(audit_path.resolve()),
-        "audit": audit,
+        "reason": "phase4_metric_gate_passed",
     }
 
 

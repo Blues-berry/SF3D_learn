@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", action="append", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--subset-prefix",
+        type=str,
+        default="stage1_v3",
+        help="Prefix used for output filenames and subset names, e.g. stage1_v4_no3dfuture.",
+    )
     parser.add_argument("--target-records", type=int, default=900)
     parser.add_argument("--min-paper-eligible", type=int, default=800)
     parser.add_argument("--min-material-family-records", type=int, default=64)
@@ -90,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=",".join(sorted(DEFAULT_MAIN_TRAIN_SOURCES)),
         help="Sources allowed to receive train/val/IID/material-holdout splits. Other strict sources become OOD test.",
+    )
+    parser.add_argument(
+        "--exclude-source-names",
+        type=str,
+        default="",
+        help="Comma-separated source_name denylist removed from all paper/diagnostic/OOD subsets.",
     )
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.12)
@@ -613,6 +625,12 @@ def build_quality_blockers(
     return blockers
 
 
+def safe_prefix(value: str) -> str:
+    text = str(value or "stage1_v3").strip()
+    cleaned = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in text)
+    return cleaned or "stage1_v3"
+
+
 def write_report_md(path: Path, report: dict[str, Any]) -> None:
     lines = [
         "# Stage1-v3 Dataset Build Report",
@@ -687,8 +705,10 @@ def write_report_html(path: Path, report: dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
+    subset_prefix = safe_prefix(args.subset_prefix)
     allowed_license_buckets = parse_csv(args.paper_license_buckets)
     main_train_sources = parse_csv(args.main_train_source_names)
+    excluded_source_names = parse_csv(args.exclude_source_names)
     quotas = parse_quotas(args.material_quotas)
 
     source_audits: dict[str, Any] = {}
@@ -719,7 +739,11 @@ def main() -> None:
             all_records.append(merge_audit_fields(record, rows.get(object_key(record)), source_manifest=manifest))
         source_audits[str(manifest.resolve())] = audit_payload.get("summary", {})
 
-    unique_records = dedupe_records(all_records)
+    unique_records = [
+        record
+        for record in dedupe_records(all_records)
+        if str(record.get("source_name") or "unknown") not in excluded_source_names
+    ]
 
     strict_records: list[dict[str, Any]] = []
     auxiliary_records: list[dict[str, Any]] = []
@@ -809,6 +833,26 @@ def main() -> None:
         default_split="test",
     )
 
+    real_lighting_candidates = [
+        record
+        for record in diagnostic_candidates
+        if any(
+            token in str(record.get("lighting_bank_id") or "").lower()
+            for token in ("polyhaven", "hdri", "natural", "stress", "production")
+        )
+    ]
+    real_lighting_records = take_balanced_by_material(
+        real_lighting_candidates,
+        limit=max(0, int(args.max_ood_records)),
+        min_per_material_family=max(0, int(args.ood_min_per_material_family)),
+    )
+    real_lighting_records = add_role(
+        real_lighting_records,
+        role="real_lighting_eval_only",
+        paper_split="paper_test_real_lighting",
+        default_split="test",
+    )
+
     selection_policy = {
         "paper_tiers": sorted(PAPER_TIERS),
         "blocked_target_sources": sorted(BLOCKED_TARGET_SOURCES),
@@ -821,48 +865,56 @@ def main() -> None:
         "min_target_coverage": float(args.min_target_coverage),
         "identity_like_threshold": float(args.identity_like_threshold),
         "main_train_source_names": sorted(main_train_sources),
+        "excluded_source_names": sorted(excluded_source_names),
         "fill_deficits": bool(args.fill_deficits),
     }
     source_manifests = [path for path in args.manifest]
 
     strict_manifest = make_manifest(
         records=strict_candidates_records,
-        subset_name="stage1_v3_strict_paper_candidates",
+        subset_name=f"{subset_prefix}_strict_paper_candidates",
         experiment_role="paper_stage_candidates",
         source_manifests=source_manifests,
         selection_policy=selection_policy,
     )
     balanced_manifest = make_manifest(
         records=balanced_records,
-        subset_name="stage1_v3_balanced_paper",
+        subset_name=f"{subset_prefix}_balanced_paper",
         experiment_role="paper_stage_balanced",
         source_manifests=source_manifests,
         selection_policy={**selection_policy, "balanced_selection": balanced_selection},
     )
     diagnostic_manifest = make_manifest(
         records=diagnostic_records,
-        subset_name="stage1_v3_diagnostic",
+        subset_name=f"{subset_prefix}_diagnostic",
         experiment_role="diagnostic_only",
         source_manifests=source_manifests,
         selection_policy=selection_policy,
     )
     ood_manifest = make_manifest(
         records=ood_records,
-        subset_name="stage1_v3_ood_eval",
+        subset_name=f"{subset_prefix}_ood_eval",
         experiment_role="ood_eval_only",
+        source_manifests=source_manifests,
+        selection_policy=selection_policy,
+    )
+    real_lighting_manifest = make_manifest(
+        records=real_lighting_records,
+        subset_name=f"{subset_prefix}_real_lighting_eval",
+        experiment_role="real_lighting_eval_only",
         source_manifests=source_manifests,
         selection_policy=selection_policy,
     )
     auxiliary_manifest = make_manifest(
         records=auxiliary_records,
-        subset_name="stage1_v3_auxiliary_upgrade_queue",
+        subset_name=f"{subset_prefix}_auxiliary_upgrade_queue",
         experiment_role="auxiliary_upgrade_queue",
         source_manifests=source_manifests,
         selection_policy=selection_policy,
     )
     rejects_manifest = make_manifest(
         records=reject_records,
-        subset_name="stage1_v3_rejects",
+        subset_name=f"{subset_prefix}_rejects",
         experiment_role="rejected",
         source_manifests=source_manifests,
         selection_policy=selection_policy,
@@ -878,17 +930,19 @@ def main() -> None:
     recommendation = "STAGE1_V3_BALANCED_READY_FOR_DATA_HANDOFF" if stage1_v3_ready else "KEEP_AS_DATA_CANDIDATE_ONLY"
 
     paths = {
-        "strict_paper_candidates": args.output_root / "stage1_v3_strict_paper_candidates.json",
-        "balanced_paper": args.output_root / "stage1_v3_balanced_paper_manifest.json",
-        "diagnostic": args.output_root / "stage1_v3_diagnostic_manifest.json",
-        "ood_eval": args.output_root / "stage1_v3_ood_eval_manifest.json",
-        "auxiliary_upgrade_queue": args.output_root / "stage1_v3_auxiliary_upgrade_queue.json",
-        "rejects": args.output_root / "stage1_v3_rejects.json",
+        "strict_paper_candidates": args.output_root / f"{subset_prefix}_strict_paper_candidates.json",
+        "balanced_paper": args.output_root / f"{subset_prefix}_balanced_paper_manifest.json",
+        "diagnostic": args.output_root / f"{subset_prefix}_diagnostic_manifest.json",
+        "ood_eval": args.output_root / f"{subset_prefix}_ood_eval_manifest.json",
+        "real_lighting": args.output_root / f"{subset_prefix}_real_lighting_manifest.json",
+        "auxiliary_upgrade_queue": args.output_root / f"{subset_prefix}_auxiliary_upgrade_queue.json",
+        "rejects": args.output_root / f"{subset_prefix}_rejects.json",
     }
     write_json(paths["strict_paper_candidates"], strict_manifest)
     write_json(paths["balanced_paper"], balanced_manifest)
     write_json(paths["diagnostic"], diagnostic_manifest)
     write_json(paths["ood_eval"], ood_manifest)
+    write_json(paths["real_lighting"], real_lighting_manifest)
     write_json(paths["auxiliary_upgrade_queue"], auxiliary_manifest)
     write_json(paths["rejects"], rejects_manifest)
 
@@ -897,7 +951,8 @@ def main() -> None:
         "source_audit_summaries": source_audits,
         "unique_records": len(unique_records),
         "stage1_v3_ready": stage1_v3_ready,
-        "recommendation": recommendation,
+        "subset_prefix": subset_prefix,
+        "recommendation": recommendation.replace("STAGE1_V3", subset_prefix.upper()),
         "blockers": blockers,
         "strict_gate_blocker_counts": dict(blocker_counts),
         "strict_gate_blocker_counts_by_material": {
@@ -912,13 +967,14 @@ def main() -> None:
             "balanced_paper": balanced_manifest["summary"],
             "diagnostic": diagnostic_manifest["summary"],
             "ood_eval": ood_manifest["summary"],
+            "real_lighting": real_lighting_manifest["summary"],
             "auxiliary_upgrade_queue": auxiliary_manifest["summary"],
             "rejects": rejects_manifest["summary"],
         },
     }
-    write_json(args.output_root / "stage1_v3_dataset_audit.json", report)
-    write_report_md(args.output_root / "stage1_v3_dataset_audit.md", report)
-    write_report_html(args.output_root / "stage1_v3_dataset_audit.html", report)
+    write_json(args.output_root / f"{subset_prefix}_dataset_audit.json", report)
+    write_report_md(args.output_root / f"{subset_prefix}_dataset_audit.md", report)
+    write_report_html(args.output_root / f"{subset_prefix}_dataset_audit.html", report)
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
 

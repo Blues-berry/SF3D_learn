@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob as globlib
 import json
 import os
@@ -67,6 +68,28 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def try_acquire_lock(path: Path) -> Any | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.write(json.dumps({"pid": os.getpid(), "updated_at_utc": utc_now()}, ensure_ascii=False) + "\n")
+    handle.flush()
+    return handle
+
+
+def release_lock(handle: Any | None) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def run_capture(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -581,6 +604,9 @@ def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "output/material_refine_paper/reworked_candidates/factory_promoted/latest/canonical_manifest_promoted.json",
         )
     )
+    lock_path = repo_path(
+        promotion.get("lock_path", output_manifest.parent / "target_promotion.lock")
+    )
     report_json = repo_path(
         promotion.get("report_json", output_manifest.with_suffix(".promotion_report.json"))
     )
@@ -649,15 +675,25 @@ def promote_targets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
             "input_manifests": [str(path) for path in manifests],
             "command": command,
         }
-    result = run_capture(command)
-    return {
-        "action": "promoted" if result.returncode == 0 else "promotion_failed",
-        "output_manifest": str(output_manifest),
-        "report_json": str(report_json),
-        "input_manifests": [str(path) for path in manifests],
-        "returncode": result.returncode,
-        "stdout_tail": result.stdout.splitlines()[-80:],
-    }
+    lock_handle = try_acquire_lock(lock_path)
+    if lock_handle is None:
+        return {
+            "action": "locked_by_other_process",
+            "lock_path": str(lock_path),
+            "output_manifest": str(output_manifest),
+        }
+    try:
+        result = run_capture(command)
+        return {
+            "action": "promoted" if result.returncode == 0 else "promotion_failed",
+            "output_manifest": str(output_manifest),
+            "report_json": str(report_json),
+            "input_manifests": [str(path) for path in manifests],
+            "returncode": result.returncode,
+            "stdout_tail": result.stdout.splitlines()[-80:],
+        }
+    finally:
+        release_lock(lock_handle)
 
 
 def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -688,7 +724,9 @@ def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[st
     output_root = repo_path(
         stage1_v3.get("output_root", "output/material_refine_paper/stage1_v3_dataset_latest")
     )
-    report_json = output_root / "stage1_v3_dataset_audit.json"
+    subset_prefix = str(stage1_v3.get("subset_prefix", "stage1_v3"))
+    report_json = output_root / f"{subset_prefix}_dataset_audit.json"
+    lock_path = repo_path(stage1_v3.get("lock_path", output_root / f"{subset_prefix}.lock"))
     if report_json.exists() and report_json.stat().st_mtime >= input_manifest.stat().st_mtime:
         return {
             "action": "up_to_date",
@@ -704,6 +742,8 @@ def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[st
         str(input_manifest),
         "--output-root",
         str(output_root),
+        "--subset-prefix",
+        subset_prefix,
         "--target-records",
         str(stage1_v3.get("target_records", 900)),
         "--min-paper-eligible",
@@ -742,6 +782,8 @@ def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[st
         str(stage1_v3.get("material_quotas", "")),
         "--main-train-source-names",
         str(stage1_v3.get("main_train_source_names", "ABO_locked_core,3D-FUTURE_highlight_local_8k")),
+        "--exclude-source-names",
+        str(stage1_v3.get("exclude_source_names", "")),
         "--train-ratio",
         str(stage1_v3.get("train_ratio", 0.70)),
         "--val-ratio",
@@ -762,15 +804,26 @@ def build_stage1_v3_subsets(config: dict[str, Any], *, dry_run: bool) -> dict[st
             "output_root": str(output_root),
             "command": command,
         }
-    result = run_capture(command)
-    return {
-        "action": "stage1_v3_built" if result.returncode == 0 else "stage1_v3_failed",
-        "input_manifest": str(input_manifest),
-        "output_root": str(output_root),
-        "report_json": str(report_json),
-        "returncode": result.returncode,
-        "stdout_tail": result.stdout.splitlines()[-80:],
-    }
+    lock_handle = try_acquire_lock(lock_path)
+    if lock_handle is None:
+        return {
+            "action": "locked_by_other_process",
+            "lock_path": str(lock_path),
+            "input_manifest": str(input_manifest),
+            "output_root": str(output_root),
+        }
+    try:
+        result = run_capture(command)
+        return {
+            "action": "stage1_v3_built" if result.returncode == 0 else "stage1_v3_failed",
+            "input_manifest": str(input_manifest),
+            "output_root": str(output_root),
+            "report_json": str(report_json),
+            "returncode": result.returncode,
+            "stdout_tail": result.stdout.splitlines()[-80:],
+        }
+    finally:
+        release_lock(lock_handle)
 
 
 def analyze_hdri_usage(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
@@ -887,6 +940,48 @@ def run_post_ingest_cleanup(config: dict[str, Any], *, dry_run: bool) -> dict[st
     }
 
 
+def run_reject_cleanup(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    cleanup = config.get("reject_cleanup", {})
+    if not bool(cleanup.get("enabled", False)):
+        return {"action": "disabled"}
+    reject_manifest = repo_path(str(cleanup.get("reject_manifest", "")))
+    if not reject_manifest.exists():
+        return {"action": "missing_reject_manifest", "reject_manifest": str(reject_manifest)}
+    command = [
+        str(PYTHON_BIN),
+        "scripts/quarantine_material_refine_rejected_assets.py",
+        "--reject-manifest",
+        str(reject_manifest),
+        "--mode",
+        "report" if dry_run else str(cleanup.get("mode", "trash")),
+        "--min-age-seconds",
+        str(cleanup.get("min_age_seconds", 86400)),
+        "--max-actions",
+        str(cleanup.get("max_actions", 64)),
+        "--trash-root",
+        str(repo_path(cleanup.get("trash_root", "output/material_refine_cleanup/reject_trash"))),
+        "--output-json",
+        str(repo_path(cleanup.get("output_json", "output/material_refine_cleanup/reject_cleanup_report.json"))),
+    ]
+    for value in cleanup.get("protected_manifests", []):
+        command.extend(["--protected-manifest", str(repo_path(value))])
+    for pattern in cleanup.get("protected_manifest_globs", []):
+        command.extend(["--protected-manifest-glob", str(pattern)])
+    for value in cleanup.get("candidate_path_fields", []):
+        command.extend(["--candidate-path-field", str(value)])
+    if bool(cleanup.get("include_source_assets", False)):
+        command.append("--include-source-assets")
+    if dry_run:
+        return {"action": "dry_run_reject_cleanup", "command": command}
+    result = run_capture(command)
+    return {
+        "action": "reject_cleanup_ran" if result.returncode == 0 else "reject_cleanup_failed",
+        "returncode": result.returncode,
+        "output_json": str(repo_path(cleanup.get("output_json", "output/material_refine_cleanup/reject_cleanup_report.json"))),
+        "stdout_tail": result.stdout.splitlines()[-60:],
+    }
+
+
 def manifest_record_count(path: Path) -> int:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -993,6 +1088,7 @@ def run_once(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]
         state["actions"].append({"promotion": promote_targets(config, dry_run=args.dry_run)})
         state["actions"].append({"stage1_v3": build_stage1_v3_subsets(config, dry_run=args.dry_run)})
         state["actions"].append({"hdri_usage": analyze_hdri_usage(config, dry_run=args.dry_run)})
+        state["actions"].append({"reject_cleanup": run_reject_cleanup(config, dry_run=args.dry_run)})
         state["actions"].append({"post_ingest_cleanup": run_post_ingest_cleanup(config, dry_run=args.dry_run)})
     if args.start_render:
         launch, reason = should_launch_render(config, force=args.force_render)
