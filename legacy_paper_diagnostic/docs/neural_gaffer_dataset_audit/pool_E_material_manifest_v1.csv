@@ -1,3 +1,0 @@
-pool_name,source_name,license_bucket,download_status,signal_type,notes
-pool_E_material_prior_bank,OpenSVBRDF,custom_portal_terms_unstated,not_started,svbrdf_maps,strong prior source once license and portal flow are confirmed
-pool_E_material_prior_bank,MatSynth,mixed_cc0_cc_by,remote_pilot_only,material_prior_render_bank,keep release bundles split by per-material license tags

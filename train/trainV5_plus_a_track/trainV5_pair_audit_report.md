@@ -1,6 +1,6 @@
 # TrainV5 Pair Audit Report
 
-- generated_at_utc: `2026-04-28T03:33:36Z`
+- generated_at_utc: `2026-04-28T12:24:43Z`
 - audit_pass: `true`
 - target_bundles: `322`
 - prior_variants: `1610`

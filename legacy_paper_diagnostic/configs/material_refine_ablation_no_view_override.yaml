@@ -1,4 +1,0 @@
-disable_view_fusion: true
-tracker_run_name: material-refine-paper-ablation-no-view
-tracker_group: paper-ablation
-tracker_tags: material-refine,paper,ablation,no-view
