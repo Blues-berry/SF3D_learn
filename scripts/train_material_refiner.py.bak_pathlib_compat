@@ -16,16 +16,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
-# ---- pathlib checkpoint compatibility shim ----
-# Some checkpoints were saved with newer pathlib internals, e.g. pathlib._local.
-# Python 3.10 stdlib pathlib is a module, not a package, so torch.load may fail
-# with: ModuleNotFoundError: No module named 'pathlib._local'.
-import sys as _sys_pathlib_compat
-import pathlib as _pathlib_compat
-_sys_pathlib_compat.modules.setdefault("pathlib._local", _pathlib_compat)
-# ---- end pathlib checkpoint compatibility shim ----
-
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw, ImageFont

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import statistics
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,15 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sf3d.material_refine.trainv5_target_gate import (  # noqa: E402
+    TARGET_GATE_VERSION,
+    target_prior_relation_diagnostics,
+    trainv5_target_truth_gate,
+)
+
 DEFAULT_INPUT = REPO_ROOT / "output/material_refine_v1_fixed/releases/stage1_v1_fixed_trainable_manifest.json"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "train/trainV5_initial"
 DEFAULT_MIN_FREE_GB = 20.0
@@ -182,25 +192,11 @@ def prior_quality_bin(similarity: float | None, has_prior: bool, args: argparse.
 
 
 def target_gate(record: dict[str, Any], args: argparse.Namespace) -> tuple[bool, list[str]]:
-    blockers: list[str] = []
-    if not bool_field(record, "target_as_pred_pass"):
-        blockers.append("target_as_pred_fail")
-    mean = finite_float(record.get("target_view_alignment_mean"))
-    p95 = finite_float(record.get("target_view_alignment_p95"))
-    if mean is None or mean >= float(args.mean_threshold):
-        blockers.append("target_view_alignment_mean_fail")
-    if p95 is None or p95 >= float(args.p95_threshold):
-        blockers.append("target_view_alignment_p95_fail")
-    if bool_field(record, "target_is_prior_copy") or bool_field(record, "copied_from_prior"):
-        blockers.append("target_is_prior_copy")
-    if str(record.get("license_bucket") or "unknown") not in ALLOWED_LICENSE_BUCKETS:
-        blockers.append("license_blocked")
-    if not any(path_exists(record.get(key)) for key in ("source_model_path", "canonical_glb_path", "canonical_mesh_path")):
-        blockers.append("missing_asset")
-    for key in ("canonical_buffer_root", "uv_target_roughness_path", "uv_target_metallic_path", "uv_target_confidence_path"):
-        if not path_exists(record.get(key)):
-            blockers.append(f"missing_{key}")
-    return not blockers, blockers
+    return trainv5_target_truth_gate(
+        record,
+        mean_threshold=float(args.mean_threshold),
+        p95_threshold=float(args.p95_threshold),
+    )
 
 
 def prior_spatiality(record: dict[str, Any], roughness_prior: str, metallic_prior: str) -> str:
@@ -286,8 +282,10 @@ def build_target_bundle(record: dict[str, Any], args: argparse.Namespace) -> dic
         "target_view_alignment_mean": finite_float(record.get("target_view_alignment_mean")),
         "target_view_alignment_p95": finite_float(record.get("target_view_alignment_p95")),
         "target_is_prior_copy": bool_field(record, "target_is_prior_copy") or bool_field(record, "copied_from_prior"),
-        "target_gate_pass": gate_pass,
-        "target_gate_blockers": blockers,
+        "target_gate_version": TARGET_GATE_VERSION,
+        "target_truth_gate_pass": gate_pass,
+        "target_truth_gate_blockers": blockers,
+        "target_prior_relation_diagnostic": target_prior_relation_diagnostics(record),
         "storage_tier": paths["canonical_bundle_root"]["storage_tier"],
         "logical_path": paths["canonical_bundle_root"]["logical_path"],
         "physical_path": paths["canonical_bundle_root"]["physical_path"],
@@ -333,7 +331,7 @@ def build_prior_variant(record: dict[str, Any], target_bundle_id: str, args: arg
     )
     prior_as_pred_required = spatiality in {"spatial_map", "scalar_broadcast"}
     prior_as_pred_pass = bool_field(record, "prior_as_pred_pass") if prior_as_pred_required else None
-    prior_variant_gate_pass = bool(
+    prior_variant_ready = bool(
         prior_path_resolved_ok
         and bool(leakage["prior_not_target_leakage"])
         and (prior_as_pred_pass is not False)
@@ -362,7 +360,7 @@ def build_prior_variant(record: dict[str, Any], target_bundle_id: str, args: arg
         "prior_path_resolved_ok": prior_path_resolved_ok,
         "prior_as_pred_required": prior_as_pred_required,
         "prior_as_pred_pass": prior_as_pred_pass,
-        "prior_variant_gate_pass": prior_variant_gate_pass,
+        "prior_variant_status": "ordinary_training_input" if prior_variant_ready else "diagnostic_or_control",
         "prior_not_target_leakage": bool(leakage["prior_not_target_leakage"]),
         "leakage_audit": leakage,
         "storage_tier": prior_paths["uv_prior_roughness_path"]["storage_tier"] if has_prior else "none",
@@ -374,9 +372,9 @@ def build_prior_variant(record: dict[str, Any], target_bundle_id: str, args: arg
 
 
 def build_training_pair(bundle: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any] | None:
-    if not bundle["target_gate_pass"]:
+    if not bundle["target_truth_gate_pass"]:
         return None
-    if not variant["prior_variant_gate_pass"]:
+    if variant["prior_variant_status"] != "ordinary_training_input":
         return None
     if variant["prior_variant_type"] == "identity_control":
         return None

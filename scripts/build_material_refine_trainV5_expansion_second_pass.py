@@ -21,7 +21,6 @@ BLOCKED_REASONS = {
     "is_3dfuture",
     "polyhaven_not_object",
     "duplicate_object_id",
-    "unknown_material",
     "path_unresolved",
 }
 
@@ -38,6 +37,8 @@ ALLOWED_LICENSE_BUCKETS = {
     "Creative Commons - Attribution - Share Alike",
     "cc_by_4_0_pending_reconcile",
     "smithsonian_open_access_pending_reconcile",
+    "omniobject3d_license_pending_reconcile",
+    "khronos_sample_license_pending_reconcile",
 }
 
 MATERIAL_PRIORITY = {
@@ -239,14 +240,14 @@ def classify_blockers(record: dict[str, Any], seen: set[str]) -> list[str]:
         blockers.append("missing_asset")
     elif not any(path_exists(path) for path in paths):
         blockers.append("path_unresolved")
-    if str(record.get("license_bucket") or "unknown") not in ALLOWED_LICENSE_BUCKETS:
+    license_bucket = str(record.get("license_bucket") or "unknown")
+    license_status = str(record.get("license_status") or "").lower()
+    if any(token in license_bucket.lower() or token in license_status for token in ("hard_block", "forbidden", "no_training")):
         blockers.append("license_blocked")
     if is_3dfuture(record):
         blockers.append("is_3dfuture")
     if is_polyhaven_non_object(record):
         blockers.append("polyhaven_not_object")
-    if material_family(record) in {"", "unknown", "unknown_pending_second_pass", "pending_abo_semantic_classification"}:
-        blockers.append("unknown_material")
     return [reason for reason in blockers if reason in BLOCKED_REASONS]
 
 
@@ -293,7 +294,11 @@ def build_candidate(record: dict[str, Any], seen: set[str]) -> dict[str, Any]:
         "blocked_reason": blockers,
         "priority_score": round(float(score), 4) if not blockers else 0.0,
         "priority_reason": reasons if not blockers else blockers,
-        "expected_material_family": material_family(record),
+        "expected_material_family": (
+            "unknown_material_pending_probe"
+            if material_family(record) in {"", "unknown", "unknown_pending_second_pass", "pending_abo_semantic_classification"}
+            else material_family(record)
+        ),
         "expected_prior_variant_types": expected_prior_variant_types(record),
         "recommended_storage_tier": recommended_storage_tier(record, score, asset_path) if not blockers else "hdd_archive_or_rejects",
         "estimated_cost_level": estimated_cost_level(size),

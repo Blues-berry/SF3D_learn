@@ -415,10 +415,10 @@ def second_pass(rows: list[dict[str, Any]], out_dir: Path) -> tuple[list[dict[st
         blockers: list[str] = []
         if not bool_value(item.get("path_resolved_ok")):
             blockers.append("path_unresolved")
-        if item.get("license_status") != "allowed":
-            blockers.append("license_blocked" if item.get("license_status") == "hard_blocked" else "license_pending")
+        if item.get("license_status") == "hard_blocked":
+            blockers.append("license_blocked")
         if str(item.get("expected_material_family")) == "still_unknown":
-            blockers.append("unknown_material")
+            item["expected_material_family"] = "unknown_material_pending_probe"
         item["blocked_reason"] = blockers
         if blockers:
             item["candidate_status"] = "reject_or_unknown"

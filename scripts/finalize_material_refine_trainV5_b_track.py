@@ -24,6 +24,11 @@ from scripts.build_material_refine_trainV5_plus_a_track import (  # noqa: E402
     build_target_bundle,
     summarize,
 )
+from sf3d.material_refine.trainv5_target_gate import (  # noqa: E402
+    TARGET_GATE_VERSION,
+    target_prior_relation_diagnostics,
+    trainv5_target_truth_gate,
+)
 
 
 DEFAULT_B_ROOT = REPO_ROOT / "output/material_refine_trainV5_abc/B_track/full_1155_rebake"
@@ -126,35 +131,7 @@ def license_allowed_for_engineering(record: dict[str, Any]) -> bool:
 
 
 def trainv5_gate(record: dict[str, Any]) -> tuple[bool, list[str]]:
-    blockers: list[str] = []
-    mean = finite_float(record.get("target_view_alignment_mean"))
-    p95 = finite_float(record.get("target_view_alignment_p95"))
-    if not bool_value(record.get("target_as_pred_pass")):
-        blockers.append("target_as_pred_pass_false")
-    if mean is None or mean >= 0.08:
-        blockers.append("target_view_alignment_mean_fail")
-    if p95 is None or p95 >= 0.20:
-        blockers.append("target_view_alignment_p95_fail")
-    if bool_value(record.get("target_is_prior_copy")) or bool_value(record.get("copied_from_prior")):
-        blockers.append("target_is_prior_copy")
-    for key in (
-        "source_model_path",
-        "canonical_buffer_root",
-        "uv_target_roughness_path",
-        "uv_target_metallic_path",
-        "uv_target_confidence_path",
-        "canonical_views_json",
-    ):
-        if not path_exists(record.get(key)):
-            blockers.append(f"missing_{key}")
-    if not bool_value(record.get("view_supervision_ready", True)):
-        blockers.append("view_supervision_not_ready")
-    identity = finite_float(record.get("target_prior_identity"))
-    if identity is not None and identity >= 0.999:
-        blockers.append("target_prior_identity_near_copy")
-    if not license_allowed_for_engineering(record):
-        blockers.append("license_not_allowed_for_engineering")
-    return not blockers, blockers
+    return trainv5_target_truth_gate(record)
 
 
 def run_contract_audit(manifest: Path, output_root: Path) -> dict[str, Any]:
@@ -197,13 +174,15 @@ def write_problem_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                 "target_view_alignment_p95",
                 "target_as_pred_pass",
                 "target_is_prior_copy",
+                "target_prior_identity",
+                "target_source_type",
                 "blockers",
             ],
         )
         writer.writeheader()
         for row in rows:
             item = dict(row)
-            item["blockers"] = ";".join(str(x) for x in row.get("trainV5_target_gate_blockers", []))
+            item["blockers"] = ";".join(str(x) for x in row.get("target_truth_gate_blockers", []))
             writer.writerow(item)
 
 
@@ -216,9 +195,14 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         "summary": {
             "prepared_records": len(prepared),
             "skipped_records": len(skipped_rows),
-            "target_gate_pass": len(gate_pass_rows),
-            "target_gate_fail": len(gate_fail_rows),
+            "target_gate_version": TARGET_GATE_VERSION,
+            "target_truth_gate_pass": len(gate_pass_rows),
+            "target_truth_gate_fail": len(gate_fail_rows),
             "pass_rate": len(gate_pass_rows) / len(prepared) if prepared else 0.0,
+            "target_prior_relation_diagnostic": {
+                "target_is_prior_copy": sum(bool_value(row.get("target_is_prior_copy")) for row in prepared),
+                "target_not_prior_copy": sum(not bool_value(row.get("target_is_prior_copy")) for row in prepared),
+            },
             "material_family": distribution(prepared, "material_family"),
             "source_name": distribution(prepared, "source_name"),
             "prior_mode": distribution(prepared, "prior_mode"),
@@ -228,16 +212,14 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         "contract_audit": contract_audit,
     }
     write_json(b_root / "full_1155_diagnostic_manifest.json", diagnostic)
-    write_json(
-        b_root / "full_1155_target_gate_pass_manifest.json",
-        {
-            "generated_at_utc": utc_now(),
-            "source_manifest": str(manifest),
-            "target_gate": "TrainV5_engineering_gate_v1",
-            "records": gate_pass_rows,
-            "summary": summarize(gate_pass_rows),
-        },
-    )
+    target_truth_manifest = {
+        "generated_at_utc": utc_now(),
+        "source_manifest": str(manifest),
+        "target_gate_version": TARGET_GATE_VERSION,
+        "records": gate_pass_rows,
+        "summary": summarize(gate_pass_rows),
+    }
+    write_json(b_root / "full_1155_target_truth_gate_pass_manifest.json", target_truth_manifest)
     write_problem_csv(b_root / "full_1155_problem_cases.csv", gate_fail_rows + skipped_rows)
     summary = diagnostic["summary"]
     write_text(
@@ -249,8 +231,9 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
                 f"- generated_at_utc: `{utc_now()}`",
                 f"- prepared_records: `{len(prepared)}`",
                 f"- skipped_records: `{len(skipped_rows)}`",
-                f"- target_gate_pass: `{len(gate_pass_rows)}`",
-                f"- target_gate_fail: `{len(gate_fail_rows)}`",
+                f"- target_gate_version: `{TARGET_GATE_VERSION}`",
+                f"- target_truth_gate_pass: `{len(gate_pass_rows)}`",
+                f"- target_truth_gate_fail: `{len(gate_fail_rows)}`",
                 f"- source_model_path_exists: `{sum(path_exists(row.get('source_model_path')) for row in prepared)}`",
                 f"- canonical_buffer_root_exists: `{sum(path_exists(row.get('canonical_buffer_root')) for row in prepared)}`",
                 f"- uv_target_paths_exist: `{sum(all(path_exists(row.get(k)) for k in ('uv_target_roughness_path','uv_target_metallic_path','uv_target_confidence_path')) for row in prepared)}`",
@@ -268,9 +251,11 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
                 "- full_rebake_launched: `true`",
                 f"- prepared_records: `{len(prepared)}`",
                 f"- skipped_records: `{len(skipped_rows)}`",
-                f"- target_gate_pass: `{len(gate_pass_rows)}`",
-                f"- target_gate_fail: `{len(gate_fail_rows)}`",
+                f"- target_gate_version: `{TARGET_GATE_VERSION}`",
+                f"- target_truth_gate_pass: `{len(gate_pass_rows)}`",
+                f"- target_truth_gate_fail: `{len(gate_fail_rows)}`",
                 f"- pass_rate: `{summary['pass_rate']}`",
+                f"- target_prior_relation_diagnostic: `{json.dumps(summary['target_prior_relation_diagnostic'], ensure_ascii=False)}`",
                 f"- material_family: `{json.dumps(summary['material_family'], ensure_ascii=False)}`",
                 f"- source_name: `{json.dumps(summary['source_name'], ensure_ascii=False)}`",
                 f"- target_view_alignment_mean: `{json.dumps(summary['target_view_alignment_mean'], ensure_ascii=False)}`",
@@ -289,9 +274,11 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
             "full_rebake_launched": True,
             "prepared_records": len(prepared),
             "skipped_records": len(skipped_rows),
-            "target_gate_pass": len(gate_pass_rows),
-            "target_gate_fail": len(gate_fail_rows),
+            "target_gate_version": TARGET_GATE_VERSION,
+            "target_truth_gate_pass": len(gate_pass_rows),
+            "target_truth_gate_fail": len(gate_fail_rows),
             "pass_rate": summary["pass_rate"],
+            "target_prior_relation_diagnostic": summary["target_prior_relation_diagnostic"],
             "contract_audit": contract_audit,
         },
     )
@@ -304,13 +291,14 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
                 f"- generated_at_utc: `{utc_now()}`",
                 "- status: `completed`",
                 f"- processed: `{len(prepared) + len(skipped_rows)}/1155`",
-                f"- target_gate_pass: `{len(gate_pass_rows)}`",
-                f"- target_gate_fail: `{len(gate_fail_rows)}`",
+                f"- target_gate_version: `{TARGET_GATE_VERSION}`",
+                f"- target_truth_gate_pass: `{len(gate_pass_rows)}`",
+                f"- target_truth_gate_fail: `{len(gate_fail_rows)}`",
                 f"- pass_rate: `{summary['pass_rate']}`",
                 f"- material_family distribution: `{json.dumps(summary['material_family'], ensure_ascii=False)}`",
                 f"- source distribution: `{json.dumps(summary['source_name'], ensure_ascii=False)}`",
                 f"- prior hints: `{json.dumps(summary['prior_mode'], ensure_ascii=False)}`",
-                f"- failure reason counts: `{json.dumps(dict(Counter(';'.join(row.get('trainV5_target_gate_blockers', [])) for row in gate_fail_rows)), ensure_ascii=False)}`",
+                f"- failure reason counts: `{json.dumps(dict(Counter(';'.join(row.get('target_truth_gate_blockers', [])) for row in gate_fail_rows)), ensure_ascii=False)}`",
             ]
         ),
     )
@@ -328,8 +316,10 @@ def finalize_rebake(args: argparse.Namespace) -> tuple[list[dict[str, Any]], lis
     for row in prepared:
         gate_ok, blockers = trainv5_gate(row)
         item = dict(row)
-        item["trainV5_target_gate_pass"] = gate_ok
-        item["trainV5_target_gate_blockers"] = blockers
+        item["target_gate_version"] = TARGET_GATE_VERSION
+        item["target_truth_gate_pass"] = gate_ok
+        item["target_truth_gate_blockers"] = blockers
+        item["target_prior_relation_diagnostic"] = target_prior_relation_diagnostics(item)
         if gate_ok:
             gate_pass_rows.append(item)
         else:
@@ -574,9 +564,11 @@ def update_final_report(args: argparse.Namespace) -> None:
         f"- full_rebake_launched: `{decision.get('full_rebake_launched')}`",
         f"- prepared_records: `{decision.get('prepared_records')}`",
         f"- skipped_records: `{decision.get('skipped_records')}`",
-        f"- target_gate_pass: `{decision.get('target_gate_pass')}`",
-        f"- target_gate_fail: `{decision.get('target_gate_fail')}`",
+        f"- target_gate_version: `{decision.get('target_gate_version')}`",
+        f"- target_truth_gate_pass: `{decision.get('target_truth_gate_pass')}`",
+        f"- target_truth_gate_fail: `{decision.get('target_truth_gate_fail')}`",
         f"- pass_rate: `{decision.get('pass_rate')}`",
+        f"- target_prior_relation_diagnostic: `{json.dumps(decision.get('target_prior_relation_diagnostic', {}), ensure_ascii=False)}`",
         f"- TrainV5_plus_full_target_bundles: `{plus.get('target_bundles')}`",
         f"- TrainV5_plus_full_training_pairs: `{plus.get('training_pairs')}`",
         f"- merged_ab_target_bundles: `{merged.get('target_bundles')}`",

@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,15 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sf3d.material_refine.trainv5_target_gate import (  # noqa: E402
+    TARGET_GATE_VERSION,
+    target_prior_relation_diagnostics,
+    trainv5_target_truth_gate,
+)
+
 DEFAULT_INITIAL_DIR = REPO_ROOT / "train/trainV5_initial"
 DEFAULT_FALLBACK_MANIFEST = REPO_ROOT / "output/material_refine_v1_fixed/releases/stage1_v1_fixed_trainable_manifest.json"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "train/trainV5_plus_a_track"
@@ -192,21 +202,7 @@ def load_source_records(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
 
 
 def target_gate(record: dict[str, Any]) -> tuple[bool, list[str]]:
-    blockers: list[str] = []
-    if not bool_value(record.get("target_as_pred_pass", True)):
-        blockers.append("target_as_pred_fail")
-    mean = finite_float(record.get("target_view_alignment_mean"))
-    p95 = finite_float(record.get("target_view_alignment_p95"))
-    if mean is not None and mean >= 0.08:
-        blockers.append("target_view_alignment_mean_fail")
-    if p95 is not None and p95 >= 0.20:
-        blockers.append("target_view_alignment_p95_fail")
-    if bool_value(record.get("target_is_prior_copy")) or bool_value(record.get("copied_from_prior")):
-        blockers.append("target_is_prior_copy")
-    for key in ("uv_target_roughness_path", "uv_target_metallic_path", "uv_target_confidence_path", "canonical_buffer_root"):
-        if not path_exists(record.get(key)):
-            blockers.append(f"missing_{key}")
-    return not blockers, blockers
+    return trainv5_target_truth_gate(record)
 
 
 def leakage_audit(prior_roughness: str, prior_metallic: str, target_roughness: str, target_metallic: str) -> dict[str, Any]:
@@ -272,8 +268,10 @@ def build_target_bundle(record: dict[str, Any]) -> dict[str, Any]:
         "target_view_alignment_mean": finite_float(record.get("target_view_alignment_mean")),
         "target_view_alignment_p95": finite_float(record.get("target_view_alignment_p95")),
         "target_is_prior_copy": bool_value(record.get("target_is_prior_copy")) or bool_value(record.get("copied_from_prior")),
-        "target_gate_pass": gate_pass,
-        "target_gate_blockers": gate_blockers,
+        "target_gate_version": TARGET_GATE_VERSION,
+        "target_truth_gate_pass": gate_pass,
+        "target_truth_gate_blockers": gate_blockers,
+        "target_prior_relation_diagnostic": target_prior_relation_diagnostics(record),
         "uv_albedo_path": path_text(record, "uv_albedo_path"),
         "uv_normal_path": path_text(record, "uv_normal_path"),
         "uv_target_roughness_path": path_text(record, "uv_target_roughness_path"),
@@ -324,7 +322,7 @@ def build_prior_variant(bundle: dict[str, Any], variant_type: str, source: dict[
         "prior_path_resolved_ok": True,
         "prior_as_pred_required": False,
         "prior_as_pred_pass": None,
-        "prior_variant_gate_pass": True,
+        "prior_variant_status": "ordinary_training_input",
         "prior_not_target_leakage": True,
         "leakage_audit": {"prior_not_target_leakage": True, "leakage_audit_method": "synthetic_lazy_generation"},
         "storage_tier": "lazy_generated",
@@ -354,7 +352,7 @@ def build_prior_variant(bundle: dict[str, Any], variant_type: str, source: dict[
                 "prior_generation_recipe": "existing_pipeline_identity_control_excluded_from_ordinary_pairs",
                 "leakage_audit": audit,
                 "prior_not_target_leakage": False,
-                "prior_variant_gate_pass": False,
+                "prior_variant_status": "identity_control_excluded_from_ordinary_pairs",
             }
             prior["prior_variant_type"] = "near_gt_prior"
             prior["prior_source_type"] = "synthetic_degradation"

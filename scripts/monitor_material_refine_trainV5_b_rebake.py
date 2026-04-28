@@ -4,11 +4,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sf3d.material_refine.trainv5_target_gate import (  # noqa: E402
+    TARGET_GATE_VERSION,
+    target_prior_relation_diagnostics,
+    trainv5_target_truth_gate,
+)
 
 
 def utc_now() -> str:
@@ -84,17 +95,6 @@ def output_size_gb(path: Path) -> float:
     return float(total / (1024**3))
 
 
-def gate_pass(record: dict[str, Any]) -> bool:
-    mean = finite_float(record.get("target_view_alignment_mean"))
-    p95 = finite_float(record.get("target_view_alignment_p95"))
-    return (
-        bool_value(record.get("target_as_pred_pass", False))
-        and (mean is not None and mean < 0.08)
-        and (p95 is not None and p95 < 0.20)
-        and not bool_value(record.get("target_is_prior_copy"))
-    )
-
-
 def numeric_stats(values: list[float]) -> dict[str, Any]:
     values = sorted(values)
     if not values:
@@ -130,7 +130,11 @@ def build_snapshot(
     p95s = [finite_float(row.get("target_view_alignment_p95")) for row in prepared]
     means_clean = [float(value) for value in means if value is not None]
     p95s_clean = [float(value) for value in p95s if value is not None]
-    gate_pass_count = sum(1 for row in prepared if gate_pass(row))
+    gate_results = [trainv5_target_truth_gate(row) for row in prepared]
+    gate_pass_count = sum(1 for ok, _blockers in gate_results if ok)
+    gate_blockers = Counter(reason for _ok, blockers in gate_results for reason in blockers)
+    prior_relation = [target_prior_relation_diagnostics(row) for row in prepared]
+    target_prior_copy_count = sum(1 for row in prior_relation if bool_value(row.get("target_is_prior_copy")))
     elapsed_status = "complete" if final_is_complete else "running"
     failure_counts = Counter(str(row.get("reason") or "unknown") for row in skips)
     return {
@@ -143,9 +147,15 @@ def build_snapshot(
         "processed": processed,
         "prepared_records": len(prepared),
         "skipped_records": len(skips),
-        "target_gate_pass": gate_pass_count,
-        "target_gate_fail": max(len(prepared) - gate_pass_count, 0),
+        "target_gate_version": TARGET_GATE_VERSION,
+        "target_truth_gate_pass": gate_pass_count,
+        "target_truth_gate_fail": max(len(prepared) - gate_pass_count, 0),
+        "target_truth_gate_blockers": dict(gate_blockers),
         "pass_rate": (gate_pass_count / len(prepared)) if prepared else None,
+        "target_prior_relation_diagnostic": {
+            "target_is_prior_copy": target_prior_copy_count,
+            "target_not_prior_copy": max(len(prepared) - target_prior_copy_count, 0),
+        },
         "material_family": dict(Counter(str(row.get("material_family") or "unknown") for row in prepared)),
         "source_name": dict(Counter(str(row.get("source_name") or "unknown") for row in prepared)),
         "prior_mode": dict(Counter(str(row.get("prior_mode") or "unknown") for row in prepared)),
@@ -175,9 +185,12 @@ def write_progress(output_dir: Path, snapshot: dict[str, Any], force_final: bool
         f"- processed: `{processed}/{snapshot.get('total')}`",
         f"- prepared_records: `{snapshot.get('prepared_records')}`",
         f"- skipped_records: `{snapshot.get('skipped_records')}`",
-        f"- target_gate_pass: `{snapshot.get('target_gate_pass')}`",
-        f"- target_gate_fail: `{snapshot.get('target_gate_fail')}`",
+        f"- target_gate_version: `{snapshot.get('target_gate_version')}`",
+        f"- target_truth_gate_pass: `{snapshot.get('target_truth_gate_pass')}`",
+        f"- target_truth_gate_fail: `{snapshot.get('target_truth_gate_fail')}`",
+        f"- target_truth_gate_blockers: `{json.dumps(snapshot.get('target_truth_gate_blockers', {}), ensure_ascii=False)}`",
         f"- pass_rate: `{snapshot.get('pass_rate')}`",
+        f"- target_prior_relation_diagnostic: `{json.dumps(snapshot.get('target_prior_relation_diagnostic', {}), ensure_ascii=False)}`",
         f"- material_family distribution: `{json.dumps(snapshot.get('material_family', {}), ensure_ascii=False)}`",
         f"- source distribution: `{json.dumps(snapshot.get('source_name', {}), ensure_ascii=False)}`",
         f"- no_prior / scalar / spatial prior hints: `{json.dumps(snapshot.get('prior_mode', {}), ensure_ascii=False)}`",
