@@ -116,6 +116,51 @@ def batch_item_value(
     return default
 
 
+def safe_path_component(value: Any, *, default: str = "unknown", max_length: int = 96) -> str:
+    text = default if value is None else str(value).strip()
+    if not text:
+        text = default
+    safe_chars = []
+    last_was_separator = False
+    for char in text:
+        if char.isascii() and (char.isalnum() or char in {"-", "_", "."}):
+            safe_chars.append(char)
+            last_was_separator = False
+        elif not last_was_separator:
+            safe_chars.append("_")
+            last_was_separator = True
+    safe = "".join(safe_chars).strip("._")
+    if not safe:
+        safe = default
+    return safe[:max_length].strip("._") or default
+
+
+def first_case_identity(*values: Any) -> str:
+    for value in values:
+        text = "" if value is None else str(value).strip()
+        if text and text.lower() not in {"none", "null", "unknown"}:
+            return text
+    return "unknown"
+
+
+def material_case_id(
+    *,
+    object_id: Any,
+    prior_variant_type: Any,
+    pair_id: Any,
+    prior_variant_id: Any,
+    fallback_index: int | None = None,
+) -> str:
+    suffix = first_case_identity(pair_id, prior_variant_id, fallback_index)
+    return "__".join(
+        [
+            safe_path_component(object_id),
+            safe_path_component(prior_variant_type),
+            safe_path_component(suffix, max_length=128),
+        ]
+    )
+
+
 def paper_main_metric_row(
     *,
     method: str,
@@ -621,8 +666,8 @@ def save_view_space_artifacts(
     tensor_to_pil(sampled_refined[1:2], grayscale=True).save(paths["sampled_pred_view_metallic"])
     tensor_to_pil(stored_target[0:1], grayscale=True).save(paths["stored_view_target_roughness"])
     tensor_to_pil(stored_target[1:2], grayscale=True).save(paths["stored_view_target_metallic"])
-    save_error_heatmap(paths["prior_gt_view_error"], (sampled_baseline - stored_target).abs())
-    save_error_heatmap(paths["pred_gt_view_error"], (sampled_refined - stored_target).abs())
+    save_error_heatmap(paths["prior_gt_view_error"], (sampled_baseline - sampled_target).abs())
+    save_error_heatmap(paths["pred_gt_view_error"], (sampled_refined - sampled_target).abs())
     tensor_to_pil(mask[None].float(), grayscale=True).save(paths["view_mask"])
     tensor_to_pil(view_uv_valid_mask(view_uv)[None].float(), grayscale=True).save(paths["view_uv_valid"])
     return {key: str(value.resolve()) for key, value in paths.items()}
@@ -1917,9 +1962,64 @@ def main() -> None:
                         return float(tensor.item())
                 return finite_or_none(value)
 
+            object_id = str(object_id)
+            metadata = batch["metadata"][item_idx]
+            pair_id = str(batch_item_value(batch, metadata, "pair_id", item_idx, ""))
+            target_bundle_id = str(batch_item_value(batch, metadata, "target_bundle_id", item_idx, ""))
+            prior_variant_id = str(batch_item_value(batch, metadata, "prior_variant_id", item_idx, ""))
+            generator_id = str(batch["generator_id"][item_idx])
+            source_name = str(batch["source_name"][item_idx])
+            category_bucket = str(batch["category_bucket"][item_idx])
+            has_material_prior = bool(batch["has_material_prior"][item_idx])
+            prior_label = "with_prior" if has_material_prior else "without_prior"
+            prior_mode = str(batch["prior_mode"][item_idx])
+            prior_generation_mode = first_nonempty(
+                batch_item_value(batch, metadata, "prior_generation_mode", item_idx, ""),
+                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
+                prior_mode,
+            )
+            prior_source_type = first_nonempty(
+                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
+                prior_generation_mode,
+                prior_mode,
+            )
+            prior_variant_type = first_nonempty(
+                batch_item_value(batch, metadata, "prior_variant_type", item_idx, ""),
+                "unknown",
+            )
+            prior_quality_bin = first_nonempty(
+                batch_item_value(batch, metadata, "prior_quality_bin", item_idx, ""),
+                "unknown",
+            )
+            prior_spatiality = first_nonempty(
+                batch_item_value(batch, metadata, "prior_spatiality", item_idx, ""),
+                "unknown",
+            )
+            training_role = first_nonempty(
+                batch_item_value(batch, metadata, "training_role", item_idx, ""),
+                "unknown",
+            )
+            upstream_model_id = first_nonempty(
+                batch_item_value(batch, metadata, "upstream_model_id", item_idx, ""),
+                "unknown",
+            )
+            sample_weight = float(batch_item_value(batch, metadata, "sample_weight", item_idx, 1.0))
+            input_prior_baseline_source = (
+                "model_no_prior_bootstrap_baseline"
+                if prior_variant_type == "no_prior_bootstrap" or prior_spatiality == "no_prior"
+                else "model_input_prior_from_provided_prior"
+            )
+
             global_object_index = processed_records + item_idx
             write_artifacts = args.max_artifact_objects <= 0 or global_object_index < args.max_artifact_objects
-            object_dir = output_dir / "artifacts" / object_id
+            case_id = material_case_id(
+                object_id=object_id,
+                prior_variant_type=prior_variant_type,
+                pair_id=pair_id,
+                prior_variant_id=prior_variant_id,
+                fallback_index=global_object_index,
+            )
+            object_dir = output_dir / "artifacts" / case_id
             atlas_paths = {}
             if write_artifacts:
                 atlas_paths = save_atlas_bundle(
@@ -2001,52 +2101,6 @@ def main() -> None:
             summary["residual_safety"].append(residual_safety)
             summary["confidence_bins"].append(confidence_bins)
 
-            metadata = batch["metadata"][item_idx]
-            pair_id = str(batch_item_value(batch, metadata, "pair_id", item_idx, ""))
-            target_bundle_id = str(batch_item_value(batch, metadata, "target_bundle_id", item_idx, ""))
-            prior_variant_id = str(batch_item_value(batch, metadata, "prior_variant_id", item_idx, ""))
-            generator_id = str(batch["generator_id"][item_idx])
-            source_name = str(batch["source_name"][item_idx])
-            category_bucket = str(batch["category_bucket"][item_idx])
-            has_material_prior = bool(batch["has_material_prior"][item_idx])
-            prior_label = "with_prior" if has_material_prior else "without_prior"
-            prior_mode = str(batch["prior_mode"][item_idx])
-            prior_generation_mode = first_nonempty(
-                batch_item_value(batch, metadata, "prior_generation_mode", item_idx, ""),
-                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
-                prior_mode,
-            )
-            prior_source_type = first_nonempty(
-                batch_item_value(batch, metadata, "prior_source_type", item_idx, ""),
-                prior_generation_mode,
-                prior_mode,
-            )
-            prior_variant_type = first_nonempty(
-                batch_item_value(batch, metadata, "prior_variant_type", item_idx, ""),
-                "unknown",
-            )
-            prior_quality_bin = first_nonempty(
-                batch_item_value(batch, metadata, "prior_quality_bin", item_idx, ""),
-                "unknown",
-            )
-            prior_spatiality = first_nonempty(
-                batch_item_value(batch, metadata, "prior_spatiality", item_idx, ""),
-                "unknown",
-            )
-            training_role = first_nonempty(
-                batch_item_value(batch, metadata, "training_role", item_idx, ""),
-                "unknown",
-            )
-            upstream_model_id = first_nonempty(
-                batch_item_value(batch, metadata, "upstream_model_id", item_idx, ""),
-                "unknown",
-            )
-            sample_weight = float(batch_item_value(batch, metadata, "sample_weight", item_idx, 1.0))
-            input_prior_baseline_source = (
-                "model_no_prior_bootstrap_baseline"
-                if prior_variant_type == "no_prior_bootstrap" or prior_spatiality == "no_prior"
-                else "model_input_prior_from_provided_prior"
-            )
             supervision_tier = str(batch["supervision_tier"][item_idx])
             supervision_role = str(batch["supervision_role"][item_idx])
             license_bucket = str(batch["license_bucket"][item_idx])
@@ -2097,10 +2151,11 @@ def main() -> None:
             input_prior_total_uv = baseline_uv_roughness_mae + baseline_uv_metallic_mae
             refined_total_uv = refined_uv_roughness_mae + refined_uv_metallic_mae
             gain_total_uv = input_prior_total_uv - refined_total_uv
-            if view_targets is None or view_uvs is None or not has_effective_view_supervision:
+            if view_uvs is None or not has_effective_view_supervision:
                 rows.append(
                     {
                         "object_id": object_id,
+                        "case_id": case_id,
                         "pair_id": pair_id,
                         "target_bundle_id": target_bundle_id,
                         "prior_variant_id": prior_variant_id,
@@ -2133,6 +2188,8 @@ def main() -> None:
                         "thin_boundary_flag": thin_boundary_flag,
                         "eval_variant": args.eval_variant,
                         "view_name": "uv_space",
+                        "view_target_basis": "uv_space",
+                        "stored_view_target_available": bool(view_targets is not None),
                         "baseline_roughness_mae": baseline_uv_roughness_mae,
                         "baseline_metallic_mae": baseline_uv_metallic_mae,
                         "refined_roughness_mae": refined_uv_roughness_mae,
@@ -2211,8 +2268,14 @@ def main() -> None:
             pending_lpips_rows: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
             for view_idx, view_name in enumerate(batch["view_names"][item_idx]):
-                gt_view = view_targets[item_idx, view_idx]
-                mask = batch["view_masks"][item_idx, view_idx, 0] > 0.5
+                gt_view = sampled_target[view_idx]
+                stored_target_view = (
+                    view_targets[item_idx, view_idx]
+                    if view_targets is not None
+                    else sampled_target[view_idx]
+                )
+                valid_uv = view_uv_valid_mask(view_uvs[item_idx, view_idx])
+                mask = (batch["view_masks"][item_idx, view_idx, 0] > 0.5) & valid_uv
                 if not mask.any():
                     continue
                 safe_view_name = "".join(
@@ -2268,7 +2331,7 @@ def main() -> None:
                             sampled_baseline=sampled_baseline[view_idx],
                             sampled_target=sampled_target[view_idx],
                             sampled_refined=sampled_refined[view_idx],
-                            stored_target=gt_view,
+                            stored_target=stored_target_view,
                             mask=mask.float(),
                             view_uv=view_uvs[item_idx, view_idx],
                         )
@@ -2359,6 +2422,7 @@ def main() -> None:
                 rows.append(
                     {
                         "object_id": object_id,
+                        "case_id": case_id,
                         "pair_id": pair_id,
                         "target_bundle_id": target_bundle_id,
                         "prior_variant_id": prior_variant_id,
@@ -2391,6 +2455,8 @@ def main() -> None:
                         "thin_boundary_flag": thin_boundary_flag,
                         "eval_variant": args.eval_variant,
                         "view_name": view_name,
+                        "view_target_basis": "sampled_uv_target",
+                        "stored_view_target_available": bool(view_targets is not None),
                         "baseline_roughness_mae": baseline_rough_mae,
                         "baseline_metallic_mae": baseline_metal_mae,
                         "refined_roughness_mae": refined_rough_mae,

@@ -30,6 +30,57 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def safe_path_component(value: Any, *, default: str = "unknown", max_length: int = 96) -> str:
+    text = default if value is None else str(value).strip()
+    if not text:
+        text = default
+    safe_chars = []
+    last_was_separator = False
+    for char in text:
+        if char.isascii() and (char.isalnum() or char in {"-", "_", "."}):
+            safe_chars.append(char)
+            last_was_separator = False
+        elif not last_was_separator:
+            safe_chars.append("_")
+            last_was_separator = True
+    safe = "".join(safe_chars).strip("._")
+    if not safe:
+        safe = default
+    return safe[:max_length].strip("._") or default
+
+
+def first_case_identity(*values: Any) -> str:
+    for value in values:
+        text = "" if value is None else str(value).strip()
+        if text and text.lower() not in {"none", "null", "unknown"}:
+            return text
+    return "unknown"
+
+
+def row_case_key(row: dict[str, Any]) -> str:
+    case_id = row.get("case_id")
+    if case_id:
+        return safe_path_component(case_id, max_length=220)
+    suffix = first_case_identity(row.get("pair_id"), row.get("prior_variant_id"), row.get("target_bundle_id"))
+    return "__".join(
+        [
+            safe_path_component(row.get("object_id")),
+            safe_path_component(row.get("prior_variant_type")),
+            safe_path_component(suffix, max_length=128),
+        ]
+    )
+
+
+def row_case_label(row: dict[str, Any]) -> str:
+    return (
+        f"{row.get('object_id')} | "
+        f"pair={row.get('pair_id', 'unknown')} | "
+        f"variant={row.get('prior_variant_type', 'unknown')} | "
+        f"quality={row.get('prior_quality_bin', 'unknown')} | "
+        f"role={row.get('training_role', 'unknown')}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -242,15 +293,15 @@ def view_rgb_paths(manifest_path: Path, manifest_payload: dict[str, Any], record
 
 
 def choose_object_rows(rows: list[dict[str, Any]], max_panels: int) -> list[dict[str, Any]]:
-    by_object: dict[str, dict[str, Any]] = {}
+    by_case: dict[str, dict[str, Any]] = {}
     for row in rows:
-        object_id = str(row.get("object_id", ""))
-        if not object_id:
+        case_key = row_case_key(row)
+        if not case_key:
             continue
-        current = by_object.get(object_id)
+        current = by_case.get(case_key)
         if current is None or float(row.get("improvement_total", 0.0)) < float(current.get("improvement_total", 0.0)):
-            by_object[object_id] = row
-    representatives = list(by_object.values())
+            by_case[case_key] = row
+    representatives = list(by_case.values())
     if max_panels <= 0:
         return representatives
 
@@ -265,11 +316,11 @@ def choose_object_rows(rows: list[dict[str, Any]], max_panels: int) -> list[dict
     seen: set[str] = set()
     for bucket in (improved, regressed, uncertain, representatives):
         for row in bucket:
-            object_id = str(row.get("object_id", ""))
-            if object_id in seen:
+            case_key = row_case_key(row)
+            if case_key in seen:
                 continue
             selected.append(row)
-            seen.add(object_id)
+            seen.add(case_key)
             if len(selected) >= max_panels:
                 return selected
     return selected
@@ -317,7 +368,7 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
     canvas = Image.new("RGB", (columns * tile_width, header_height + rows * tile_height), (9, 13, 19))
     draw = ImageDraw.Draw(canvas)
     title = (
-        f"{row.get('object_id')} | generator={row.get('generator_id', 'unknown')} | "
+        f"{row_case_label(row)} | generator={row.get('generator_id', 'unknown')} | "
         f"source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | "
         f"{row.get('view_name')} | {prior_label}"
     )
@@ -350,7 +401,7 @@ def build_html(rows: list[dict[str, Any]], panel_paths: list[Path], output_dir: 
         view_gain = finite_float(row.get("view_gain", row.get("gain_total", row.get("improvement_total"))))
         cards.append("\n".join([
             "<section class='card'>",
-            f"<h2>{row.get('object_id')}</h2>",
+            f"<h2>{row_case_label(row)}</h2>",
             "<div class='meta'>" + f"generator={row.get('generator_id', 'unknown')} | source={row.get('source_name')} | material={row.get('material_family', 'unknown')} | {baseline_metadata(row, record)} | gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))} | uv_gain={fmt_metric(uv_gain)} | view_gain={fmt_metric(view_gain)}" + "</div>",
             f"<img src='{panel_path.name}' alt='{row.get('object_id')} comparison panel'>",
             "</section>",
@@ -378,7 +429,7 @@ def main() -> None:
     for row in selected_rows:
         object_id = str(row["object_id"])
         panel = build_panel(row, records.get(object_id), args.manifest, manifest_payload, args.panel_size)
-        panel_path = args.output_dir / f"{object_id}.png"
+        panel_path = args.output_dir / f"{row_case_key(row)}.png"
         panel.save(panel_path)
         panel_paths.append(panel_path)
 
@@ -403,6 +454,7 @@ def main() -> None:
         },
         "warnings": [f"missing_baseline_total_mae:{object_id}" for object_id in missing_baseline_rows],
         "selected_object_ids": [row.get("object_id") for row in selected_rows],
+        "selected_case_ids": [row_case_key(row) for row in selected_rows],
     }
     summary_path = args.output_dir / "validation_comparison_summary.json"
     summary_path.write_text(json.dumps(make_json_serializable(summary), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -431,15 +483,15 @@ def main() -> None:
         })
         if wandb is not None and int(args.wandb_max_panel_images) > 0:
             sample_panels = [
-                wandb.Image(str(panel_path), caption=f"{row.get('object_id')} | Prior={fmt_metric(row.get('input_prior_total_mae', row.get('baseline_total_mae')))} Pred={fmt_metric(row.get('refined_total_mae'))} gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))} | {prior_display_label(row, records.get(str(row.get('object_id'))))}")
+                wandb.Image(str(panel_path), caption=f"{row_case_label(row)} | Prior={fmt_metric(row.get('input_prior_total_mae', row.get('baseline_total_mae')))} Pred={fmt_metric(row.get('refined_total_mae'))} gain={fmt_metric(row.get('gain_total', row.get('improvement_total')))} | {prior_display_label(row, records.get(str(row.get('object_id'))))}")
                 for row, panel_path in zip(selected_rows, panel_paths)
             ][: max(int(args.wandb_max_panel_images), 0)]
             run.log({"validation_panels/sample_panels": sample_panels})
         if wandb is not None and bool(args.wandb_log_panel_table):
-            table = wandb.Table(columns=["object_id", "generator_id", "source_name", "prior_source_type", "target_source_type", "baseline_label", "prior_label", "baseline_total_mae", "input_prior_total_mae", "refined_total_mae", "gain_total", "panel"])
+            table = wandb.Table(columns=["case_id", "object_id", "pair_id", "prior_variant_type", "prior_quality_bin", "training_role", "generator_id", "source_name", "prior_source_type", "target_source_type", "baseline_label", "prior_label", "baseline_total_mae", "input_prior_total_mae", "refined_total_mae", "gain_total", "panel"])
             for row, panel_path in zip(selected_rows, panel_paths):
                 record = records.get(str(row.get("object_id")))
-                table.add_data(row.get("object_id"), row.get("generator_id", "unknown"), row.get("source_name"), get_value(row, record, "prior_source_type", "unknown"), get_value(row, record, "target_source_type", "unknown"), prior_display_label(row, record), row.get("prior_label"), row.get("baseline_total_mae"), row.get("input_prior_total_mae", row.get("baseline_total_mae")), row.get("refined_total_mae"), row.get("gain_total", row.get("improvement_total")), wandb.Image(str(panel_path)))
+                table.add_data(row_case_key(row), row.get("object_id"), row.get("pair_id"), row.get("prior_variant_type"), row.get("prior_quality_bin"), row.get("training_role"), row.get("generator_id", "unknown"), row.get("source_name"), get_value(row, record, "prior_source_type", "unknown"), get_value(row, record, "target_source_type", "unknown"), prior_display_label(row, record), row.get("prior_label"), row.get("baseline_total_mae"), row.get("input_prior_total_mae", row.get("baseline_total_mae")), row.get("refined_total_mae"), row.get("gain_total", row.get("improvement_total")), wandb.Image(str(panel_path)))
             run.log({"validation_panels/table": table})
         if args.wandb_log_artifacts:
             artifact_paths = [summary_path, html_path]

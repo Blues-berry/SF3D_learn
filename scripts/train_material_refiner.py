@@ -1345,7 +1345,6 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "trainer/optimizer_step",
         "trainer/global_batch_step",
         "optim/lr",
-        "best/val_uv_total_mae",
         "best/selection_metric",
         "best/epoch",
         "val/uv_total_mae",
@@ -1368,6 +1367,7 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "val/special/highlight_localization_error",
         "val/special/rm_gradient_preservation",
         "val/special/prior_residual_safety",
+        "val/sample_level/avg_improvement_total",
         "val/object_level/avg_improvement_total",
         "eval/rm/uv_total_mae",
         "eval/input_prior_total_mae",
@@ -1385,6 +1385,7 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "eval/improvement_rate",
         "eval/regression_rate",
         "eval/effective_view_supervision_rate",
+        "eval/sample_level/avg_improvement_total",
         "eval/object_level/avg_improvement_total",
     }
     return {key: value for key, value in logs.items() if key in allowed_exact}
@@ -1441,6 +1442,7 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "val/special/highlight_localization_error",
             "val/special/rm_gradient_preservation",
             "val/special/prior_residual_safety",
+            "val/sample_level/avg_improvement_total",
             "val/object_level/avg_improvement_total",
             "eval/rm/uv_total_mae",
             "eval/rm/view_total_mae",
@@ -1456,6 +1458,7 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "eval/improvement_rate",
             "eval/regression_rate",
             "eval/effective_view_supervision_rate",
+            "eval/sample_level/avg_improvement_total",
             "eval/object_level/avg_improvement_total",
             "val/improvement_uv_total_mae",
             "val/improvement_rate",
@@ -1466,11 +1469,6 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "best/epoch",
         ):
             wandb.define_metric(metric_key, step_metric="trainer/global_step")
-        wandb.define_metric(
-            "best/val_uv_total_mae",
-            step_metric="trainer/global_step",
-            summary="min",
-        )
     except Exception as exc:  # noqa: BLE001 - W&B metric setup should not block training.
         print(f"[wandb:warning] define_metric_failed={type(exc).__name__}: {exc}")
 
@@ -2995,6 +2993,33 @@ def preview_view_label(view_name: str) -> str:
     return str(view_name).split("__", 1)[0].replace("_", " ")
 
 
+def sanitize_preview_filename_component(value: Any, *, default: str = "unknown", max_length: int = 96) -> str:
+    text = default if value is None else str(value).strip()
+    if not text:
+        text = default
+    safe_chars = []
+    last_was_separator = False
+    for char in text:
+        if char.isascii() and (char.isalnum() or char in {"-", "_", "."}):
+            safe_chars.append(char)
+            last_was_separator = False
+        elif not last_was_separator:
+            safe_chars.append("_")
+            last_was_separator = True
+    safe = "".join(safe_chars).strip("._")
+    if not safe:
+        safe = default
+    return safe[:max_length].strip("._") or default
+
+
+def first_preview_identity(*values: Any) -> str:
+    for value in values:
+        text = "" if value is None else str(value).strip()
+        if text and text.lower() not in {"none", "null", "unknown"}:
+            return text
+    return "unknown"
+
+
 def save_preview_contact_sheet(
     output_dir: Path,
     *,
@@ -3054,6 +3079,13 @@ def save_validation_preview(
     baseline_metallic_mae: float,
     refined_roughness_mae: float,
     refined_metallic_mae: float,
+    pair_id: str = "",
+    target_bundle_id: str = "",
+    prior_variant_id: str = "",
+    prior_variant_type: str = "unknown",
+    prior_quality_bin: str = "unknown",
+    training_role: str = "unknown",
+    preview_slot: int = 0,
     source_name: str = "unknown_source",
     material_family: str = "unknown_material",
     prior_label: str = "unknown_prior",
@@ -3074,7 +3106,7 @@ def save_validation_preview(
     tile_size = 128
     row_label_width = 90
     gutter = 8
-    title_height = 70
+    title_height = 94
     columns = 7
     tile_width = tile_size
     tile_height = tile_size + 34
@@ -3125,16 +3157,30 @@ def save_validation_preview(
     improvement = baseline_total - refined_total
     title_font = preview_font(21, bold=True)
     detail_font = preview_font(15)
+    id_font = preview_font(12)
     draw.text((12, 10), str(object_id), font=title_font, fill=(8, 12, 18))
     draw.text(
         (12, 38),
         (
             f"Input Prior {baseline_total:.4f} | Pred {refined_total:.4f} | "
-            f"gain {improvement:+.4f} | {prior_label} | {material_family} | {source_name}"
+            f"gain {improvement:+.4f} | {prior_label} | "
+            f"variant={prior_variant_type} | quality={prior_quality_bin} | role={training_role}"
         ),
         font=detail_font,
         fill=(68, 76, 88),
     )
+    identity_line = (
+        f"pair={pair_id or 'unknown'} | target={target_bundle_id or 'unknown'} | "
+        f"prior_variant={prior_variant_id or 'unknown'}"
+    )
+    identity_detail_line = f"{identity_line} | {material_family} | {source_name}"
+    title_line_width = canvas_width - 24
+    detail_bbox = draw.textbbox((12, 62), identity_detail_line, font=id_font)
+    id_bbox = draw.textbbox((12, 62), identity_line, font=id_font)
+    if detail_bbox[2] - detail_bbox[0] <= title_line_width:
+        draw.text((12, 62), identity_detail_line, font=id_font, fill=(94, 104, 118))
+    elif id_bbox[2] - id_bbox[0] <= title_line_width:
+        draw.text((12, 62), identity_line, font=id_font, fill=(94, 104, 118))
     row_font = preview_font(20, bold=True)
     for row_index, (row_label, row_tiles) in enumerate(rows):
         y0 = title_height + gutter + row_index * (tile_height + gutter)
@@ -3148,10 +3194,67 @@ def save_validation_preview(
         for col_index, tile in enumerate(row_tiles):
             x0 = row_label_width + gutter + col_index * (tile_width + gutter)
             canvas.paste(tile, (x0, y0))
-    safe_object_id = str(object_id).replace("/", "_").replace("\\", "_")
-    output_path = preview_dir / f"{safe_object_id}.png"
+    pair_or_prior_variant_id = first_preview_identity(pair_id, prior_variant_id)
+    safe_preview_slot = max(int(preview_slot), 0)
+    safe_object_id = sanitize_preview_filename_component(object_id)
+    safe_prior_variant_type = sanitize_preview_filename_component(prior_variant_type)
+    safe_pair_or_prior_variant_id = sanitize_preview_filename_component(pair_or_prior_variant_id, max_length=128)
+    output_path = preview_dir / (
+        f"{safe_preview_slot:03d}__{safe_object_id}__{safe_prior_variant_type}__"
+        f"{safe_pair_or_prior_variant_id}.png"
+    )
     canvas.save(output_path)
     return output_path
+
+
+def build_preview_integrity_report(preview_items: list[dict[str, Any]]) -> dict[str, Any]:
+    required_metadata = [
+        "object_id",
+        "pair_id",
+        "target_bundle_id",
+        "prior_variant_id",
+        "prior_variant_type",
+        "prior_quality_bin",
+        "training_role",
+    ]
+    paths = [str(item.get("path") or "") for item in preview_items]
+    path_counts = Counter(path for path in paths if path)
+    duplicate_paths = {
+        path: count
+        for path, count in sorted(path_counts.items())
+        if count > 1
+    }
+    missing_files = [
+        path
+        for path in paths
+        if path and not Path(path).exists()
+    ]
+    missing_metadata_items = []
+    for index, item in enumerate(preview_items):
+        missing_fields = [
+            field
+            for field in required_metadata
+            if field not in item or str(item.get(field) or "").strip() == ""
+        ]
+        if missing_fields:
+            missing_metadata_items.append(
+                {
+                    "index": index,
+                    "path": str(item.get("path") or ""),
+                    "object_id": str(item.get("object_id") or ""),
+                    "missing_fields": missing_fields,
+                }
+            )
+    return {
+        "enabled": True,
+        "ok": not duplicate_paths and not missing_files and not missing_metadata_items,
+        "items": len(preview_items),
+        "unique_paths": len(path_counts),
+        "duplicate_paths": duplicate_paths,
+        "missing_files": missing_files,
+        "required_metadata_fields": required_metadata,
+        "missing_metadata_items": missing_metadata_items,
+    }
 
 
 def update_group_metric_store(
@@ -3170,6 +3273,61 @@ def update_group_metric_store(
     bucket["total_mae"] += total_mae
     bucket["roughness_mae"] += roughness_mae
     bucket["metallic_mae"] += metallic_mae
+
+
+def update_object_improvement_store(
+    store: dict[str, dict[str, float]],
+    *,
+    object_id: str,
+    total_improvement: float,
+    roughness_improvement: float,
+    metallic_improvement: float,
+) -> None:
+    bucket = store.setdefault(
+        object_id,
+        {"count": 0.0, "total": 0.0, "roughness": 0.0, "metallic": 0.0},
+    )
+    bucket["count"] += 1.0
+    bucket["total"] += total_improvement
+    bucket["roughness"] += roughness_improvement
+    bucket["metallic"] += metallic_improvement
+
+
+def finalize_object_improvement_metrics(store: dict[str, dict[str, float]]) -> dict[str, Any]:
+    object_values = []
+    for object_id, bucket in sorted(store.items()):
+        count = max(float(bucket.get("count", 0.0)), 1.0)
+        object_values.append(
+            {
+                "object_id": object_id,
+                "count": int(bucket.get("count", 0.0)),
+                "avg_improvement_total": float(bucket.get("total", 0.0) / count),
+                "avg_improvement_roughness": float(bucket.get("roughness", 0.0) / count),
+                "avg_improvement_metallic": float(bucket.get("metallic", 0.0) / count),
+            }
+        )
+    object_count = max(len(object_values), 1)
+    improved = sum(1 for item in object_values if item["avg_improvement_total"] > 1e-6)
+    regressed = sum(1 for item in object_values if item["avg_improvement_total"] < -1e-6)
+    unchanged = len(object_values) - improved - regressed
+    return {
+        "object_count": len(object_values),
+        "avg_improvement_total": (
+            sum(item["avg_improvement_total"] for item in object_values) / object_count
+        ),
+        "avg_improvement_roughness": (
+            sum(item["avg_improvement_roughness"] for item in object_values) / object_count
+        ),
+        "avg_improvement_metallic": (
+            sum(item["avg_improvement_metallic"] for item in object_values) / object_count
+        ),
+        "improved_objects": improved,
+        "regressed_objects": regressed,
+        "unchanged_objects": unchanged,
+        "improvement_rate": improved / object_count,
+        "regression_rate": regressed / object_count,
+        "unchanged_rate": unchanged / object_count,
+    }
 
 
 def finalize_group_metrics(store: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -3608,6 +3766,7 @@ def evaluate(
     group_store: dict[str, dict[str, float]] = {}
     baseline_group_store: dict[str, dict[str, float]] = {}
     improvement_group_store: dict[str, dict[str, float]] = {}
+    object_improvement_store: dict[str, dict[str, float]] = {}
     steps = 0
     preview_paths: list[Path] = []
     preview_items: list[dict[str, Any]] = []
@@ -3691,14 +3850,19 @@ def evaluate(
             uv_mae.setdefault("effective_view_supervision_samples", 0.0)
             uv_mae["effective_view_supervision_samples"] += float(effective_view_samples)
 
+            batch_size = len(batch["object_id"])
             for item_index, object_id in enumerate(batch["object_id"]):
+                object_id = str(object_id)
+                pair_id = str(batch.get("pair_id", ["unknown"] * batch_size)[item_index] or "unknown")
+                target_bundle_id = str(batch.get("target_bundle_id", ["unknown"] * batch_size)[item_index] or "unknown")
+                prior_variant_id = str(batch.get("prior_variant_id", ["unknown"] * batch_size)[item_index] or "unknown")
                 generator_id = str(batch["generator_id"][item_index])
                 source_name = str(batch["source_name"][item_index])
                 material_family = str(batch["material_family"][item_index])
                 prior_name = "with_prior" if bool(batch["has_material_prior"][item_index]) else "without_prior"
-                prior_variant_type = str(batch.get("prior_variant_type", ["unknown"] * len(batch["object_id"]))[item_index])
-                prior_quality_bin = str(batch.get("prior_quality_bin", ["unknown"] * len(batch["object_id"]))[item_index])
-                training_role = str(batch.get("training_role", ["unknown"] * len(batch["object_id"]))[item_index])
+                prior_variant_type = str(batch.get("prior_variant_type", ["unknown"] * batch_size)[item_index] or "unknown")
+                prior_quality_bin = str(batch.get("prior_quality_bin", ["unknown"] * batch_size)[item_index] or "unknown")
+                training_role = str(batch.get("training_role", ["unknown"] * batch_size)[item_index] or "unknown")
                 supervision_tier = str(batch["supervision_tier"][item_index])
                 metric_kwargs = {
                     "total_mae": float(total_mae[item_index].item()),
@@ -3715,6 +3879,13 @@ def evaluate(
                     "roughness_mae": float(improvement_roughness[item_index].item()),
                     "metallic_mae": float(improvement_metallic[item_index].item()),
                 }
+                update_object_improvement_store(
+                    object_improvement_store,
+                    object_id=object_id,
+                    total_improvement=improvement_metric_kwargs["total_mae"],
+                    roughness_improvement=improvement_metric_kwargs["roughness_mae"],
+                    metallic_improvement=improvement_metric_kwargs["metallic_mae"],
+                )
                 update_group_metric_store(group_store, key=f"generator/{generator_id}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"source/{source_name}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"prior/{prior_name}", **metric_kwargs)
@@ -3748,6 +3919,7 @@ def evaluate(
                 )
 
                 if len(preview_paths) < args.val_preview_samples:
+                    preview_slot = len(preview_paths)
                     preview_path = save_validation_preview(
                         output_dir,
                         validation_label=validation_label,
@@ -3766,6 +3938,13 @@ def evaluate(
                         baseline_metallic_mae=float(baseline_metallic_mae[item_index].item()),
                         refined_roughness_mae=float(roughness_mae[item_index].item()),
                         refined_metallic_mae=float(metallic_mae[item_index].item()),
+                        pair_id=pair_id,
+                        target_bundle_id=target_bundle_id,
+                        prior_variant_id=prior_variant_id,
+                        prior_variant_type=prior_variant_type,
+                        prior_quality_bin=prior_quality_bin,
+                        training_role=training_role,
+                        preview_slot=preview_slot,
                         source_name=source_name,
                         material_family=material_family,
                         prior_label=prior_name,
@@ -3777,10 +3956,17 @@ def evaluate(
                         {
                             "path": str(preview_path.resolve()),
                             "object_id": object_id,
+                            "pair_id": pair_id,
+                            "target_bundle_id": target_bundle_id,
+                            "prior_variant_id": prior_variant_id,
                             "generator_id": generator_id,
                             "source_name": source_name,
                             "material_family": material_family,
                             "prior_label": prior_name,
+                            "prior_variant_type": prior_variant_type,
+                            "prior_quality_bin": prior_quality_bin,
+                            "training_role": training_role,
+                            "preview_slot": preview_slot,
                             "baseline_total_mae": baseline_total,
                             "input_prior_total_mae": baseline_total,
                             "refined_total_mae": refined_total,
@@ -3822,6 +4008,7 @@ def evaluate(
         "group_metrics": finalize_group_metrics(group_store),
         "baseline_group_metrics": finalize_group_metrics(baseline_group_store),
         "improvement_group_metrics": finalize_group_metrics(improvement_group_store),
+        "object_level": finalize_object_improvement_metrics(object_improvement_store),
         "batches": int(steps),
         "max_validation_batches": int(args.max_validation_batches),
         "effective_view_supervision_samples": int(uv_mae.get("effective_view_supervision_samples", 0.0)),
@@ -3845,6 +4032,7 @@ def evaluate(
         "residual_gate_cases": residual_gate_cases,
         "preview_paths": [str(path.resolve()) for path in preview_paths],
         "preview_items": preview_items,
+        "preview_integrity": build_preview_integrity_report(preview_items),
     }
 
 
@@ -4195,7 +4383,11 @@ def run_validation_cycle(
                     item["path"],
                     caption=(
                         f"{item.get('object_id')} | "
-                        f"Prior={item.get('input_prior_total_mae', item.get('baseline_total_mae', 0.0)):.4f}"
+                        f"pair={item.get('pair_id', 'unknown')} | "
+                        f"variant={item.get('prior_variant_type', 'unknown')} | "
+                        f"quality={item.get('prior_quality_bin', 'unknown')} | "
+                        f"Prior -> Pred MAE "
+                        f"{item.get('input_prior_total_mae', item.get('baseline_total_mae', 0.0)):.4f}"
                         f" -> {item.get('refined_total_mae', 0.0):.4f} "
                         f"(gain={item.get('gain_total', item.get('improvement_total', 0.0)):+.4f})"
                     ),
@@ -4203,6 +4395,7 @@ def run_validation_cycle(
                 for item in preview_items[: args.wandb_val_preview_max]
             ]
         improvement_payload = val_payload.get("improvement_uv_mae") or {}
+        object_level_payload = val_payload.get("object_level") or {}
         special_metrics = val_payload.get("special_metrics") or {}
         residual_diag = val_payload.get("residual_gate_diagnostics") or {}
         log_payload = {
@@ -4212,7 +4405,6 @@ def run_validation_cycle(
             "lr": learning_rate,
             "best/selection_metric": best_val_metric,
             "best/epoch": best_epoch,
-            "best/val_uv_total_mae": val_payload["uv_mae"]["total"],
             "val/uv_total_mae": val_payload["uv_mae"]["total"],
             "val/rm/uv_total_mae": val_payload["uv_mae"]["total"],
             "val/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
@@ -4222,14 +4414,16 @@ def run_validation_cycle(
             "val/improvement_rate": improvement_payload.get("improvement_rate"),
             "val/regression_rate": improvement_payload.get("regression_rate"),
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
-            "val/object_level/avg_improvement_total": improvement_payload.get("total"),
+            "val/sample_level/avg_improvement_total": improvement_payload.get("total"),
+            "val/object_level/avg_improvement_total": object_level_payload.get("avg_improvement_total"),
             "eval/rm/uv_total_mae": val_payload["uv_mae"]["total"],
             "eval/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
             "eval/gain_total": improvement_payload.get("total"),
             "eval/improvement_rate": improvement_payload.get("improvement_rate"),
             "eval/regression_rate": improvement_payload.get("regression_rate"),
             "eval/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
-            "eval/object_level/avg_improvement_total": improvement_payload.get("total"),
+            "eval/sample_level/avg_improvement_total": improvement_payload.get("total"),
+            "eval/object_level/avg_improvement_total": object_level_payload.get("avg_improvement_total"),
         }
         if val_payload.get("loss"):
             log_payload["val/loss/total"] = val_payload["loss"].get("total")
@@ -4649,10 +4843,6 @@ def main() -> None:
             for key, value in losses.items():
                 running[key] += float(value.detach().cpu().item())
                 interval[key] += float(value.detach().cpu().item())
-            for prior_variant_type in set(str(item) for item in batch.get("prior_variant_type", [])):
-                variant_loss_key = f"loss/{safe_wandb_key(prior_variant_type)}"
-                running[variant_loss_key] += float(losses["total"].detach().cpu().item())
-                interval[variant_loss_key] += float(losses["total"].detach().cpu().item())
             running["prior_dropout_samples"] += float(prior_dropout_samples)
             interval["prior_dropout_samples"] += float(prior_dropout_samples)
             running["effective_view_supervision_samples"] += float(effective_view_samples)
