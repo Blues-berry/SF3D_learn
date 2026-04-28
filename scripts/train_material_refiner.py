@@ -275,10 +275,14 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-balance-mode",
         choices=[
+            "auto",
             "none",
             "generator",
             "source",
             "prior",
+            "prior_variant",
+            "prior_quality",
+            "training_role",
             "tier",
             "material",
             "generator_x_prior",
@@ -286,10 +290,15 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
             "material_x_source_x_prior",
             "material_x_generator_x_prior",
         ],
-        default="source_x_prior",
+        default="auto",
     )
     parser.add_argument("--train-balance-power", type=float, default=1.0)
     parser.add_argument("--train-samples-per-epoch", type=int, default=0)
+    parser.add_argument(
+        "--train-prior-variant-weights",
+        type=str,
+        default="near_gt_prior=1.0,mild_gap_prior=1.0,medium_gap_prior=1.0,large_gap_prior=1.0,no_prior_bootstrap=0.75",
+    )
     parser.add_argument("--train-target-quality-weights", type=str, default=None)
     parser.add_argument("--train-difficulty-metadata-key", type=str, default=None)
     parser.add_argument("--train-difficulty-weights", type=str, default=None)
@@ -584,6 +593,7 @@ def parse_args() -> argparse.Namespace:
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
     args.train_failure_tag_weights = parse_weight_map(args.train_failure_tag_weights)
+    args.train_prior_variant_weights = parse_weight_map(args.train_prior_variant_weights)
     return args
 
 
@@ -1053,6 +1063,11 @@ def compute_losses(
 
 
 def sample_balance_key(record: Any, mode: str) -> str:
+    prior_variant_type = str(record.metadata.get("prior_variant_type", "unknown"))
+    prior_quality_bin = str(record.metadata.get("prior_quality_bin", "unknown"))
+    training_role = str(record.metadata.get("training_role", "unknown"))
+    if mode == "auto":
+        mode = "prior_variant" if prior_variant_type != "unknown" else "source_x_prior"
     generator_key = str(record.generator_id)
     source_name = str(record.metadata.get("source_name", record.generator_id))
     prior_key = "with_prior" if record.has_material_prior else "without_prior"
@@ -1063,6 +1078,12 @@ def sample_balance_key(record: Any, mode: str) -> str:
         return source_name
     if mode == "prior":
         return prior_key
+    if mode == "prior_variant":
+        return prior_variant_type
+    if mode == "prior_quality":
+        return prior_quality_bin
+    if mode == "training_role":
+        return training_role
     if mode == "tier":
         return record.supervision_tier
     if mode == "material":
@@ -1080,6 +1101,10 @@ def sample_balance_key(record: Any, mode: str) -> str:
 
 def sample_extra_weight(record: Any, args: argparse.Namespace) -> float:
     weight = 1.0
+    prior_variant_type = str(record.metadata.get("prior_variant_type", "unknown"))
+    if args.train_prior_variant_weights:
+        weight *= float(args.train_prior_variant_weights.get(prior_variant_type, 1.0))
+    weight *= float(record.metadata.get("sample_weight", 1.0) or 1.0)
     if args.train_target_quality_weights:
         weight *= float(
             args.train_target_quality_weights.get(
@@ -3661,6 +3686,9 @@ def evaluate(
                 source_name = str(batch["source_name"][item_index])
                 material_family = str(batch["material_family"][item_index])
                 prior_name = "with_prior" if bool(batch["has_material_prior"][item_index]) else "without_prior"
+                prior_variant_type = str(batch.get("prior_variant_type", ["unknown"] * len(batch["object_id"]))[item_index])
+                prior_quality_bin = str(batch.get("prior_quality_bin", ["unknown"] * len(batch["object_id"]))[item_index])
+                training_role = str(batch.get("training_role", ["unknown"] * len(batch["object_id"]))[item_index])
                 supervision_tier = str(batch["supervision_tier"][item_index])
                 metric_kwargs = {
                     "total_mae": float(total_mae[item_index].item()),
@@ -3680,14 +3708,23 @@ def evaluate(
                 update_group_metric_store(group_store, key=f"generator/{generator_id}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"source/{source_name}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"prior/{prior_name}", **metric_kwargs)
+                update_group_metric_store(group_store, key=f"prior_variant_type/{prior_variant_type}", **metric_kwargs)
+                update_group_metric_store(group_store, key=f"prior_quality_bin/{prior_quality_bin}", **metric_kwargs)
+                update_group_metric_store(group_store, key=f"training_role/{training_role}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"tier/{supervision_tier}", **metric_kwargs)
                 update_group_metric_store(baseline_group_store, key=f"generator/{generator_id}", **baseline_metric_kwargs)
                 update_group_metric_store(baseline_group_store, key=f"source/{source_name}", **baseline_metric_kwargs)
                 update_group_metric_store(baseline_group_store, key=f"prior/{prior_name}", **baseline_metric_kwargs)
+                update_group_metric_store(baseline_group_store, key=f"prior_variant_type/{prior_variant_type}", **baseline_metric_kwargs)
+                update_group_metric_store(baseline_group_store, key=f"prior_quality_bin/{prior_quality_bin}", **baseline_metric_kwargs)
+                update_group_metric_store(baseline_group_store, key=f"training_role/{training_role}", **baseline_metric_kwargs)
                 update_group_metric_store(baseline_group_store, key=f"tier/{supervision_tier}", **baseline_metric_kwargs)
                 update_group_metric_store(improvement_group_store, key=f"generator/{generator_id}", **improvement_metric_kwargs)
                 update_group_metric_store(improvement_group_store, key=f"source/{source_name}", **improvement_metric_kwargs)
                 update_group_metric_store(improvement_group_store, key=f"prior/{prior_name}", **improvement_metric_kwargs)
+                update_group_metric_store(improvement_group_store, key=f"prior_variant_type/{prior_variant_type}", **improvement_metric_kwargs)
+                update_group_metric_store(improvement_group_store, key=f"prior_quality_bin/{prior_quality_bin}", **improvement_metric_kwargs)
+                update_group_metric_store(improvement_group_store, key=f"training_role/{training_role}", **improvement_metric_kwargs)
                 update_group_metric_store(improvement_group_store, key=f"tier/{supervision_tier}", **improvement_metric_kwargs)
                 update_residual_gate_diagnostics(
                     residual_gate_store,
@@ -4186,6 +4223,18 @@ def run_validation_cycle(
         }
         if val_payload.get("loss"):
             log_payload["val/loss/total"] = val_payload["loss"].get("total")
+        group_metrics = val_payload.get("group_metrics") or {}
+        baseline_group_metrics = val_payload.get("baseline_group_metrics") or {}
+        improvement_group_metrics = val_payload.get("improvement_group_metrics") or {}
+        for group_key, metrics in group_metrics.items():
+            if not str(group_key).startswith("prior_variant_type/"):
+                continue
+            variant = safe_wandb_key(str(group_key).split("/", 1)[1])
+            log_payload[f"val/uv_total_mae/{variant}"] = metrics.get("total_mae")
+            baseline_metrics = baseline_group_metrics.get(group_key) or {}
+            improvement_metrics = improvement_group_metrics.get(group_key) or {}
+            log_payload[f"val/input_prior_total_mae/{variant}"] = baseline_metrics.get("total_mae")
+            log_payload[f"val/improvement/{variant}"] = improvement_metrics.get("total_mae")
         render_proxy = val_payload.get("render_proxy_validation") or {}
         if bool(render_proxy.get("available")):
             log_payload["val/rm/view_total_mae"] = render_proxy.get("refined_view_rm_mae")
@@ -4590,6 +4639,10 @@ def main() -> None:
             for key, value in losses.items():
                 running[key] += float(value.detach().cpu().item())
                 interval[key] += float(value.detach().cpu().item())
+            for prior_variant_type in set(str(item) for item in batch.get("prior_variant_type", [])):
+                variant_loss_key = f"loss/{safe_wandb_key(prior_variant_type)}"
+                running[variant_loss_key] += float(losses["total"].detach().cpu().item())
+                interval[variant_loss_key] += float(losses["total"].detach().cpu().item())
             running["prior_dropout_samples"] += float(prior_dropout_samples)
             interval["prior_dropout_samples"] += float(prior_dropout_samples)
             running["effective_view_supervision_samples"] += float(effective_view_samples)

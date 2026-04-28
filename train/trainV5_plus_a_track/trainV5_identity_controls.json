@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-28T02:40:15Z",
+  "source_manifest": "/home/ubuntu/ssd_work/projects/stable-fast-3d/train/trainV5_initial/trainV5_target_bundles.json",
+  "data_contract": "trainV5_plus_a_track_pair_manifest_v1",
+  "notes": [
+    "Pair-based R-v2.1 data. Each ordinary pair is target_bundle + prior_variant.",
+    "Synthetic prior variants are generated lazily by dataset.py from recorded recipes; no large images are copied into train/.",
+    "A-track source is currently ABO/glossy/scalar-broadcast and does not satisfy material/source diversity alone."
+  ],
+  "records": [],
+  "summary": {
+    "records": 0,
+    "split": {},
+    "source_name": {},
+    "material_family": {},
+    "prior_variant_type": {},
+    "prior_quality_bin": {},
+    "prior_spatiality": {},
+    "training_role": {}
+  }
+}

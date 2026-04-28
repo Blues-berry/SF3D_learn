@@ -1,0 +1,17 @@
+{
+  "sanity_ready": true,
+  "target_bundles": 322,
+  "prior_variants": 1610,
+  "training_pairs": 1610,
+  "identity_control_variants": 0,
+  "each_target_has_five_ordinary_variants": true,
+  "split_nonempty": true,
+  "all_paths_resolved": true,
+  "prior_target_leakage_audit_pass": true,
+  "object_level_split_check_pass": true,
+  "split_leakage_offenders": {},
+  "ssd_active_root": "/home/ubuntu/ssd_work/projects/stable-fast-3d/dataoutput",
+  "ssd_active_free_gb": 353.27587890625,
+  "ssd_min_free_gb": 20.0,
+  "blockers": []
+}

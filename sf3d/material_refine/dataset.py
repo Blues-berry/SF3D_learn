@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -31,6 +33,121 @@ HARD_VIEW_TOKENS = (
     "metal",
     "glass",
 )
+TRAINV5_PAIR_VARIANT_TYPES = {
+    "near_gt_prior",
+    "mild_gap_prior",
+    "medium_gap_prior",
+    "large_gap_prior",
+    "no_prior_bootstrap",
+}
+TRAINV5_SYNTHETIC_VARIANT_TYPES = {
+    "synthetic_near_gt_prior",
+    "mild_gap_prior",
+    "medium_gap_prior",
+    "large_gap_prior",
+}
+
+
+def _stable_unit_float(*parts: Any) -> float:
+    text = "|".join(str(part) for part in parts)
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def _stable_signed_bias(*parts: Any, magnitude: float) -> float:
+    return (_stable_unit_float(*parts) * 2.0 - 1.0) * float(magnitude)
+
+
+def _avg_blur(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return image
+    height, width = image.shape[-2:]
+    kernel_size = min(int(kernel_size), int(height), int(width))
+    if kernel_size % 2 == 0:
+        kernel_size = max(kernel_size - 1, 1)
+    if kernel_size <= 1:
+        return image
+    return F.avg_pool2d(
+        image.unsqueeze(0),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    ).squeeze(0)
+
+
+def _down_up_low_frequency(image: torch.Tensor, factor: int) -> torch.Tensor:
+    height, width = image.shape[-2:]
+    low_height = max(height // max(int(factor), 1), 1)
+    low_width = max(width // max(int(factor), 1), 1)
+    down = F.interpolate(
+        image.unsqueeze(0),
+        size=(low_height, low_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return F.interpolate(
+        down,
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+
+
+def _masked_channel_mean(channel: torch.Tensor, confidence: torch.Tensor) -> torch.Tensor:
+    weight = confidence.clamp(0.0, 1.0)
+    denom = weight.sum().clamp_min(1.0)
+    return (channel * weight).sum() / denom
+
+
+def _build_synthetic_prior(
+    *,
+    record: CanonicalAssetRecordV1,
+    prior_variant_type: str,
+    target_roughness: torch.Tensor,
+    target_metallic: torch.Tensor,
+    target_confidence: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    variant_id = record.metadata.get("prior_variant_id") or record.metadata.get("pair_id") or record.object_id
+    recipe = str(record.metadata.get("prior_generation_recipe") or prior_variant_type)
+    rough_blur = _avg_blur(target_roughness, 5)
+    metal_blur = _avg_blur(target_metallic, 5)
+    rough_mean = _masked_channel_mean(target_roughness, target_confidence)
+    metal_mean = _masked_channel_mean(target_metallic, target_confidence)
+
+    if prior_variant_type in {"near_gt_prior", "synthetic_near_gt_prior"}:
+        roughness = 0.88 * target_roughness + 0.12 * rough_blur
+        metallic = 0.88 * target_metallic + 0.12 * metal_blur
+        bias_mag = 0.025
+    elif prior_variant_type == "mild_gap_prior":
+        roughness = 0.70 * target_roughness + 0.30 * _avg_blur(target_roughness, 9)
+        metallic = 0.70 * target_metallic + 0.30 * _avg_blur(target_metallic, 9)
+        bias_mag = 0.065
+    elif prior_variant_type == "medium_gap_prior":
+        rough_low = _down_up_low_frequency(target_roughness, 8)
+        metal_low = _down_up_low_frequency(target_metallic, 8)
+        roughness = 0.42 * target_roughness + 0.38 * rough_low + 0.20 * rough_mean
+        metallic = 0.42 * target_metallic + 0.38 * metal_low + 0.20 * metal_mean
+        bias_mag = 0.14
+    elif prior_variant_type == "large_gap_prior":
+        rough_low = _down_up_low_frequency(target_roughness, 16)
+        metal_low = _down_up_low_frequency(target_metallic, 16)
+        rough_scalar = torch.full_like(target_roughness, float(rough_mean))
+        metal_scalar = torch.full_like(target_metallic, float(metal_mean))
+        roughness = 0.15 * target_roughness + 0.30 * rough_low + 0.55 * rough_scalar
+        metallic = 0.10 * target_metallic + 0.25 * metal_low + 0.65 * metal_scalar
+        bias_mag = 0.28
+    else:
+        return target_roughness.clone(), target_metallic.clone()
+
+    roughness = roughness + _stable_signed_bias(record.object_id, variant_id, recipe, "roughness", magnitude=bias_mag)
+    metallic = metallic + _stable_signed_bias(record.object_id, variant_id, recipe, "metallic", magnitude=bias_mag)
+    roughness = roughness.clamp(0.0, 1.0)
+    metallic = metallic.clamp(0.0, 1.0)
+
+    valid = target_confidence > 0.0
+    roughness = torch.where(valid, roughness, torch.full_like(roughness, 0.5))
+    metallic = torch.where(valid, metallic, torch.zeros_like(metallic))
+    return roughness, metallic
 
 
 def _record_metadata_value(
@@ -323,6 +440,27 @@ class CanonicalMaterialDataset(Dataset):
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest_dir = self.manifest_path.parent
+        self.is_pair_manifest = False
+        try:
+            manifest_payload = json.loads(self.manifest_path.read_text())
+            records_payload = (
+                manifest_payload.get("records")
+                if isinstance(manifest_payload, dict)
+                else manifest_payload
+            )
+            if isinstance(records_payload, list) and records_payload:
+                first_record = records_payload[0]
+                self.is_pair_manifest = isinstance(first_record, dict) and (
+                    "target_bundle_id" in first_record
+                    and "prior_variant_id" in first_record
+                    and (
+                        "pair_id" in first_record
+                        or "training_pair_id" in first_record
+                        or "prior_variant_type" in first_record
+                    )
+                )
+        except (OSError, json.JSONDecodeError, TypeError):
+            self.is_pair_manifest = False
         manifest = load_canonical_manifest(self.manifest_path)
         self.atlas_size = atlas_size
         self.buffer_resolution = buffer_resolution
@@ -359,6 +497,7 @@ class CanonicalMaterialDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
+        pair_metadata = dict(record.metadata)
         albedo_path = _resolve_record_path(record, record.uv_albedo_path, self.manifest_dir)
         normal_path = _resolve_record_path(record, record.uv_normal_path, self.manifest_dir)
         prior_roughness_path = _resolve_record_path(
@@ -427,11 +566,30 @@ class CanonicalMaterialDataset(Dataset):
                     target_confidence[:1], self.atlas_size
                 )
 
-        prior_confidence = torch.ones_like(prior_roughness)
-        if record.prior_mode == "none" or not record.has_material_prior:
-            prior_confidence.zero_()
         if target_confidence.max().item() == 0:
             target_confidence.fill_(1.0)
+        prior_variant_type = str(pair_metadata.get("prior_variant_type") or "")
+        prior_spatiality = str(pair_metadata.get("prior_spatiality") or "")
+        if prior_variant_type == "no_prior_bootstrap" or prior_spatiality == "no_prior":
+            prior_roughness = torch.full_like(target_roughness, 0.5)
+            prior_metallic = torch.zeros_like(target_metallic)
+            prior_confidence = torch.zeros_like(prior_roughness)
+            has_material_prior = False
+        elif prior_variant_type in TRAINV5_SYNTHETIC_VARIANT_TYPES:
+            prior_roughness, prior_metallic = _build_synthetic_prior(
+                record=record,
+                prior_variant_type=prior_variant_type,
+                target_roughness=target_roughness,
+                target_metallic=target_metallic,
+                target_confidence=target_confidence,
+            )
+            prior_confidence = target_confidence.clone().clamp(0.0, 1.0)
+            has_material_prior = True
+        else:
+            prior_confidence = torch.ones_like(prior_roughness)
+            has_material_prior = bool(record.has_material_prior)
+        if record.prior_mode == "none" or not has_material_prior:
+            prior_confidence.zero_()
 
         view_features, view_uvs, view_masks, view_meta = _load_view_bundle(
             record,
@@ -452,8 +610,39 @@ class CanonicalMaterialDataset(Dataset):
             "prior_source_type",
             default=prior_source_type,
         )
+        if prior_variant_type == "no_prior_bootstrap":
+            prior_source_type = "no_prior"
+            prior_generation_mode = "no_prior_bootstrap"
+        pair_id = str(
+            pair_metadata.get("pair_id")
+            or pair_metadata.get("training_pair_id")
+            or ""
+        )
+        target_bundle_id = str(pair_metadata.get("target_bundle_id") or "")
+        prior_variant_id = str(pair_metadata.get("prior_variant_id") or "")
+        prior_quality_bin = str(pair_metadata.get("prior_quality_bin") or "unknown")
+        training_role = str(pair_metadata.get("training_role") or "unknown")
+        upstream_model_id = str(pair_metadata.get("upstream_model_id") or "unknown")
+        sample_weight = float(pair_metadata.get("sample_weight") or 1.0)
+        if self.is_pair_manifest:
+            pair_metadata.update(
+                {
+                    "pair_id": pair_id,
+                    "target_bundle_id": target_bundle_id,
+                    "prior_variant_id": prior_variant_id,
+                    "prior_variant_type": prior_variant_type or "unknown",
+                    "prior_quality_bin": prior_quality_bin,
+                    "prior_spatiality": prior_spatiality or "unknown",
+                    "training_role": training_role,
+                    "upstream_model_id": upstream_model_id,
+                    "sample_weight": sample_weight,
+                }
+            )
 
         return {
+            "pair_id": pair_id,
+            "target_bundle_id": target_bundle_id,
+            "prior_variant_id": prior_variant_id,
             "object_id": record.object_id,
             "split": record.default_split,
             "paper_split": str(record.paper_split or "unknown"),
@@ -463,10 +652,16 @@ class CanonicalMaterialDataset(Dataset):
             "supervision_tier": record.supervision_tier,
             "supervision_role": record.supervision_role,
             "license_bucket": record.license_bucket,
-            "has_material_prior": bool(record.has_material_prior),
+            "has_material_prior": bool(has_material_prior),
             "prior_mode": record.prior_mode,
             "prior_source_type": prior_source_type,
             "prior_generation_mode": prior_generation_mode,
+            "prior_variant_type": prior_variant_type or "unknown",
+            "prior_quality_bin": prior_quality_bin,
+            "prior_spatiality": prior_spatiality or "unknown",
+            "training_role": training_role,
+            "upstream_model_id": upstream_model_id,
+            "sample_weight": sample_weight,
             "target_source_type": record.target_source_type,
             "target_is_prior_copy": bool(record.target_is_prior_copy),
             "target_quality_tier": record.target_quality_tier,
@@ -498,12 +693,15 @@ class CanonicalMaterialDataset(Dataset):
             "view_importance": view_meta["view_importance"],
             "available_view_count": int(view_meta["available_view_count"]),
             "has_effective_view_supervision": has_effective_view_supervision,
-            "metadata": record.metadata,
+            "metadata": pair_metadata,
         }
 
 
 def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     batch: dict[str, Any] = {
+        "pair_id": [sample["pair_id"] for sample in samples],
+        "target_bundle_id": [sample["target_bundle_id"] for sample in samples],
+        "prior_variant_id": [sample["prior_variant_id"] for sample in samples],
         "object_id": [sample["object_id"] for sample in samples],
         "split": [sample["split"] for sample in samples],
         "paper_split": [sample["paper_split"] for sample in samples],
@@ -517,6 +715,15 @@ def collate_material_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "prior_mode": [sample["prior_mode"] for sample in samples],
         "prior_source_type": [sample["prior_source_type"] for sample in samples],
         "prior_generation_mode": [sample["prior_generation_mode"] for sample in samples],
+        "prior_variant_type": [sample["prior_variant_type"] for sample in samples],
+        "prior_quality_bin": [sample["prior_quality_bin"] for sample in samples],
+        "prior_spatiality": [sample["prior_spatiality"] for sample in samples],
+        "training_role": [sample["training_role"] for sample in samples],
+        "upstream_model_id": [sample["upstream_model_id"] for sample in samples],
+        "sample_weight": torch.tensor(
+            [float(sample["sample_weight"]) for sample in samples],
+            dtype=torch.float32,
+        ),
         "target_source_type": [sample["target_source_type"] for sample in samples],
         "target_is_prior_copy": [sample["target_is_prior_copy"] for sample in samples],
         "target_quality_tier": [sample["target_quality_tier"] for sample in samples],

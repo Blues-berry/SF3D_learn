@@ -1,0 +1,52 @@
+{
+  "generated_at_utc": "2026-04-28T02:40:15Z",
+  "sampler_version": "trainV5_plus_pair_sampler_v1",
+  "balance_key": "prior_variant_type",
+  "weights": {
+    "near_gt_prior": 1.0,
+    "mild_gap_prior": 1.0,
+    "medium_gap_prior": 1.0,
+    "large_gap_prior": 1.0,
+    "no_prior_bootstrap": 0.75
+  },
+  "summary": {
+    "records": 1610,
+    "split": {
+      "test": 315,
+      "train": 1105,
+      "val": 190
+    },
+    "source_name": {
+      "ABO_locked_core": 1610
+    },
+    "material_family": {
+      "glossy_non_metal": 1610
+    },
+    "prior_variant_type": {
+      "near_gt_prior": 322,
+      "mild_gap_prior": 322,
+      "medium_gap_prior": 322,
+      "large_gap_prior": 322,
+      "no_prior_bootstrap": 322
+    },
+    "prior_quality_bin": {
+      "near_gt": 322,
+      "mild_gap": 322,
+      "medium_gap": 322,
+      "large_gap": 322,
+      "no_prior": 322
+    },
+    "prior_spatiality": {
+      "scalar_broadcast": 322,
+      "spatial_map": 966,
+      "no_prior": 322
+    },
+    "training_role": {
+      "safe_refinement": 322,
+      "mild_correction": 322,
+      "main_refinement": 322,
+      "strong_correction": 322,
+      "bootstrap_refinement": 322
+    }
+  }
+}

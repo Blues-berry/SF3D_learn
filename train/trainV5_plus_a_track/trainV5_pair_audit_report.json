@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-28T02:40:28Z",
+  "input_dir": "/home/ubuntu/ssd_work/projects/stable-fast-3d/train/trainV5_plus_a_track",
+  "audit_pass": true,
+  "blockers": [],
+  "target_bundles": 322,
+  "prior_variants": 1610,
+  "training_pairs": 1610,
+  "identity_controls": 0,
+  "split": {
+    "test": 315,
+    "train": 1105,
+    "val": 190
+  },
+  "prior_variant_type": {
+    "near_gt_prior": 322,
+    "mild_gap_prior": 322,
+    "medium_gap_prior": 322,
+    "large_gap_prior": 322,
+    "no_prior_bootstrap": 322
+  },
+  "prior_quality_bin": {
+    "near_gt": 322,
+    "mild_gap": 322,
+    "medium_gap": 322,
+    "large_gap": 322,
+    "no_prior": 322
+  },
+  "prior_spatiality": {
+    "scalar_broadcast": 322,
+    "spatial_map": 966,
+    "no_prior": 322
+  },
+  "bad_variant_targets": {},
+  "split_offenders": {},
+  "leakage_cases": [],
+  "no_prior_path_cases": [],
+  "unresolved_cases": [],
+  "forbidden_train_files": []
+}

@@ -1378,6 +1378,11 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "prior_source_type",
         "prior_generation_mode",
         "prior_mode",
+        "prior_variant_type",
+        "prior_quality_bin",
+        "prior_spatiality",
+        "training_role",
+        "upstream_model_id",
         "has_material_prior",
         "supervision_tier",
         "supervision_role",
@@ -1387,6 +1392,7 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "target_is_prior_copy",
         "target_quality_tier",
         "paper_split",
+        "split",
         "material_family",
         "lighting_bank_id",
         "thin_boundary_flag",
@@ -2012,6 +2018,27 @@ def main() -> None:
                 prior_generation_mode,
                 prior_mode,
             )
+            prior_variant_type = first_nonempty(
+                batch_item_value(batch, metadata, "prior_variant_type", item_idx, ""),
+                "unknown",
+            )
+            prior_quality_bin = first_nonempty(
+                batch_item_value(batch, metadata, "prior_quality_bin", item_idx, ""),
+                "unknown",
+            )
+            prior_spatiality = first_nonempty(
+                batch_item_value(batch, metadata, "prior_spatiality", item_idx, ""),
+                "unknown",
+            )
+            training_role = first_nonempty(
+                batch_item_value(batch, metadata, "training_role", item_idx, ""),
+                "unknown",
+            )
+            upstream_model_id = first_nonempty(
+                batch_item_value(batch, metadata, "upstream_model_id", item_idx, ""),
+                "unknown",
+            )
+            sample_weight = float(batch_item_value(batch, metadata, "sample_weight", item_idx, 1.0))
             supervision_tier = str(batch["supervision_tier"][item_idx])
             supervision_role = str(batch["supervision_role"][item_idx])
             license_bucket = str(batch["license_bucket"][item_idx])
@@ -2022,6 +2049,7 @@ def main() -> None:
             target_prior_identity = float(batch["target_prior_identity"][item_idx].item())
             target_quality_tier = str(batch["target_quality_tier"][item_idx])
             paper_split = str(batch["paper_split"][item_idx])
+            split = str(batch["split"][item_idx])
             material_family = str(batch["material_family"][item_idx])
             lighting_bank_id = str(batch["lighting_bank_id"][item_idx])
             thin_boundary_flag = bool(batch["thin_boundary_flag"][item_idx])
@@ -2072,6 +2100,12 @@ def main() -> None:
                         "prior_source_type": prior_source_type,
                         "prior_generation_mode": prior_generation_mode,
                         "prior_mode": prior_mode,
+                        "prior_variant_type": prior_variant_type,
+                        "prior_quality_bin": prior_quality_bin,
+                        "prior_spatiality": prior_spatiality,
+                        "training_role": training_role,
+                        "upstream_model_id": upstream_model_id,
+                        "sample_weight": sample_weight,
                         "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
@@ -2081,6 +2115,7 @@ def main() -> None:
                         "target_is_prior_copy": target_is_prior_copy,
                         "target_quality_tier": target_quality_tier,
                         "paper_split": paper_split,
+                        "split": split,
                         "material_family": material_family,
                         "lighting_bank_id": lighting_bank_id,
                         "thin_boundary_flag": thin_boundary_flag,
@@ -2319,6 +2354,12 @@ def main() -> None:
                         "prior_source_type": prior_source_type,
                         "prior_generation_mode": prior_generation_mode,
                         "prior_mode": prior_mode,
+                        "prior_variant_type": prior_variant_type,
+                        "prior_quality_bin": prior_quality_bin,
+                        "prior_spatiality": prior_spatiality,
+                        "training_role": training_role,
+                        "upstream_model_id": upstream_model_id,
+                        "sample_weight": sample_weight,
                         "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
@@ -2328,6 +2369,7 @@ def main() -> None:
                         "target_is_prior_copy": target_is_prior_copy,
                         "target_quality_tier": target_quality_tier,
                         "paper_split": paper_split,
+                        "split": split,
                         "material_family": material_family,
                         "lighting_bank_id": lighting_bank_id,
                         "thin_boundary_flag": thin_boundary_flag,
@@ -2560,6 +2602,11 @@ def main() -> None:
         "by_prior_label": summarize_group_rows(rows, "prior_label"),
         "by_prior_source_type": summarize_group_rows(rows, "prior_source_type"),
         "by_prior_mode": summarize_group_rows(rows, "prior_mode"),
+        "by_prior_variant_type": summarize_group_rows(rows, "prior_variant_type"),
+        "by_prior_quality_bin": summarize_group_rows(rows, "prior_quality_bin"),
+        "by_prior_spatiality": summarize_group_rows(rows, "prior_spatiality"),
+        "by_training_role": summarize_group_rows(rows, "training_role"),
+        "by_split": summarize_group_rows(rows, "split"),
         "by_supervision_tier": summarize_group_rows(rows, "supervision_tier"),
         "by_supervision_role": summarize_group_rows(rows, "supervision_role"),
         "by_target_quality_tier": summarize_group_rows(rows, "target_quality_tier"),
@@ -2781,6 +2828,9 @@ def main() -> None:
             "by_prior_label": summarize_group_rows(object_rows, "prior_label"),
             "by_prior_source_type": summarize_group_rows(object_rows, "prior_source_type"),
             "by_prior_mode": summarize_group_rows(object_rows, "prior_mode"),
+            "by_prior_variant_type": summarize_group_rows(object_rows, "prior_variant_type"),
+            "by_prior_quality_bin": summarize_group_rows(object_rows, "prior_quality_bin"),
+            "by_split": summarize_group_rows(object_rows, "split"),
             "by_target_quality_tier": summarize_group_rows(object_rows, "target_quality_tier"),
             "by_material_family": summarize_group_rows(object_rows, "material_family"),
             "by_paper_split": summarize_group_rows(object_rows, "paper_split"),
@@ -2848,6 +2898,65 @@ def main() -> None:
         json.dumps(make_json_serializable(summary_payload), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    by_variant_dir = output_dir / "eval"
+    by_variant_dir.mkdir(parents=True, exist_ok=True)
+    by_variant_payload = {
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "manifest": str(args.manifest.resolve()),
+        "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint is not None else None,
+        "split": args.split,
+        "overall": {
+            "rows": len(rows),
+            "objects": len(object_rows),
+            "input_prior_total_mae": uv_baseline_total_mae,
+            "refined_total_mae": uv_refined_total_mae,
+            "gain_total": uv_improvement_total,
+            "improvement_rate": uv_direction_rates["improvement_rate"],
+            "regression_rate": uv_direction_rates["regression_rate"],
+        },
+        "by_prior_variant_type": grouped_summaries["by_prior_variant_type"],
+        "by_prior_quality_bin": grouped_summaries["by_prior_quality_bin"],
+        "by_split": grouped_summaries["by_split"],
+        "object_level": {
+            "by_prior_variant_type": summary_payload["object_level"]["by_prior_variant_type"],
+            "by_prior_quality_bin": summary_payload["object_level"]["by_prior_quality_bin"],
+            "by_split": summary_payload["object_level"]["by_split"],
+        },
+    }
+    by_variant_summary_path = by_variant_dir / "by_variant_summary.json"
+    by_variant_summary_path.write_text(
+        json.dumps(make_json_serializable(by_variant_payload), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    report_lines = [
+        "# Eval By Variant Report",
+        "",
+        f"- generated_at_utc: `{by_variant_payload['generated_at_utc']}`",
+        f"- rows: `{len(rows)}`",
+        f"- objects: `{len(object_rows)}`",
+        "",
+        "## Prior Variant Type",
+        "",
+        "| variant | count | input_prior_total_mae | refined_total_mae | gain_total | regression_rate |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for variant, metrics in sorted(grouped_summaries["by_prior_variant_type"].items()):
+        report_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(variant),
+                    str(metrics.get("count")),
+                    f"{(metrics.get('input_prior_total_mae') or 0.0):.6f}",
+                    f"{(metrics.get('refined_total_mae') or 0.0):.6f}",
+                    f"{(metrics.get('gain_total') or 0.0):.6f}",
+                    f"{(metrics.get('prior_residual_regression_rate') or 0.0):.6f}",
+                ]
+            )
+            + " |"
+        )
+    (by_variant_dir / "by_variant_report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    summary_payload["by_variant_summary_json"] = str(by_variant_summary_path.resolve())
     if args.print_summary_json:
         print(json.dumps(summary_payload, indent=2, ensure_ascii=False))
     else:
