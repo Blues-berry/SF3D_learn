@@ -2002,6 +2002,9 @@ def main() -> None:
             summary["confidence_bins"].append(confidence_bins)
 
             metadata = batch["metadata"][item_idx]
+            pair_id = str(batch_item_value(batch, metadata, "pair_id", item_idx, ""))
+            target_bundle_id = str(batch_item_value(batch, metadata, "target_bundle_id", item_idx, ""))
+            prior_variant_id = str(batch_item_value(batch, metadata, "prior_variant_id", item_idx, ""))
             generator_id = str(batch["generator_id"][item_idx])
             source_name = str(batch["source_name"][item_idx])
             category_bucket = str(batch["category_bucket"][item_idx])
@@ -2039,6 +2042,11 @@ def main() -> None:
                 "unknown",
             )
             sample_weight = float(batch_item_value(batch, metadata, "sample_weight", item_idx, 1.0))
+            input_prior_baseline_source = (
+                "model_no_prior_bootstrap_baseline"
+                if prior_variant_type == "no_prior_bootstrap" or prior_spatiality == "no_prior"
+                else "model_input_prior_from_provided_prior"
+            )
             supervision_tier = str(batch["supervision_tier"][item_idx])
             supervision_role = str(batch["supervision_role"][item_idx])
             license_bucket = str(batch["license_bucket"][item_idx])
@@ -2093,6 +2101,9 @@ def main() -> None:
                 rows.append(
                     {
                         "object_id": object_id,
+                        "pair_id": pair_id,
+                        "target_bundle_id": target_bundle_id,
+                        "prior_variant_id": prior_variant_id,
                         "generator_id": generator_id,
                         "source_name": source_name,
                         "category_bucket": category_bucket,
@@ -2106,6 +2117,7 @@ def main() -> None:
                         "training_role": training_role,
                         "upstream_model_id": upstream_model_id,
                         "sample_weight": sample_weight,
+                        "input_prior_baseline_source": input_prior_baseline_source,
                         "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
@@ -2347,6 +2359,9 @@ def main() -> None:
                 rows.append(
                     {
                         "object_id": object_id,
+                        "pair_id": pair_id,
+                        "target_bundle_id": target_bundle_id,
+                        "prior_variant_id": prior_variant_id,
                         "generator_id": generator_id,
                         "source_name": source_name,
                         "category_bucket": category_bucket,
@@ -2360,6 +2375,7 @@ def main() -> None:
                         "training_role": training_role,
                         "upstream_model_id": upstream_model_id,
                         "sample_weight": sample_weight,
+                        "input_prior_baseline_source": input_prior_baseline_source,
                         "has_material_prior": has_material_prior,
                         "supervision_tier": supervision_tier,
                         "supervision_role": supervision_role,
