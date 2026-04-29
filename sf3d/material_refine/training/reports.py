@@ -47,6 +47,9 @@ def load_validation_events(output_dir: Path) -> list[dict[str, Any]]:
                 "label": payload.get("validation_label", path.stem),
                 "epoch": payload.get("epoch"),
                 "optimizer_step": payload.get("optimizer_step"),
+                "evaluation_basis": payload.get("evaluation_basis"),
+                "record_count": payload.get("record_count"),
+                "dataset_record_count": payload.get("dataset_record_count"),
                 "uv_total": (payload.get("uv_mae") or {}).get("total"),
                 "uv_roughness": (payload.get("uv_mae") or {}).get("roughness"),
                 "uv_metallic": (payload.get("uv_mae") or {}).get("metallic"),
@@ -131,6 +134,9 @@ def summarize_latest_validation(
             "input_prior_total": baseline_payload.get("total"),
             "improvement_total": improvement_payload.get("total"),
             "selection_metric": (latest_epoch_val.get("selection_metric") or {}).get("selection_metric"),
+            "evaluation_basis": latest_epoch_val.get("evaluation_basis"),
+            "record_count": latest_epoch_val.get("record_count"),
+            "dataset_record_count": latest_epoch_val.get("dataset_record_count"),
         }
     if validation_events:
         latest_event = validation_events[-1]
@@ -143,6 +149,9 @@ def summarize_latest_validation(
             "input_prior_total": latest_event.get("input_prior_total"),
             "improvement_total": latest_event.get("uv_gain"),
             "selection_metric": latest_event.get("selection_metric"),
+            "evaluation_basis": latest_event.get("evaluation_basis"),
+            "record_count": latest_event.get("record_count"),
+            "dataset_record_count": latest_event.get("dataset_record_count"),
         }
     return {
         "source": "missing",
@@ -153,7 +162,26 @@ def summarize_latest_validation(
         "input_prior_total": None,
         "improvement_total": None,
         "selection_metric": None,
+        "evaluation_basis": None,
+        "record_count": None,
+        "dataset_record_count": None,
     }
+
+
+def load_benchmark_summary(output_dir: Path) -> dict[str, Any] | None:
+    candidate_paths = [
+        output_dir / "post_train_optimization_suite" / "val_ours_full" / "summary.json",
+        output_dir / "post_train_suite" / "val_ours_full" / "summary.json",
+    ]
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - overview export must not block training.
+            print(f"[visualization:warning] benchmark_summary_read_failed={path.name}:{type(exc).__name__}:{exc}")
+            return None
+    return None
 
 
 def build_variant_summary_rows(
@@ -201,6 +229,7 @@ def write_training_overview(
     latest_render_proxy = (latest_validation_payload or {}).get("render_proxy_validation") or {}
     latest_object_level = (latest_validation_payload or {}).get("object_level") or {}
     latest_case_level = (latest_validation_payload or {}).get("case_level") or {}
+    benchmark_summary = load_benchmark_summary(output_dir) or {}
     variant_rows = build_variant_summary_rows(latest_validation_payload)
     evidence_curve_uri = inline_png_data_uri(
         Path(str(visualization_paths["training_evidence_curves"]))
@@ -264,6 +293,8 @@ def write_training_overview(
                 f"<div><div class='metric'>Latest Train Total</div><div><code>{format_metric(latest_train.get('total'))}</code></div></div>",
                 f"<div><div class='metric'>Latest Validation Source</div><div><code>{html.escape(str(latest_validation.get('source')))}</code></div></div>",
                 f"<div><div class='metric'>Latest Validation Label</div><div><code>{html.escape(str(latest_validation.get('label')))}</code></div></div>",
+                f"<div><div class='metric'>Selection Basis</div><div><code>{html.escape(str(latest_validation.get('evaluation_basis') or 'unknown'))}</code></div></div>",
+                f"<div><div class='metric'>Selection Record Count</div><div><code>{html.escape(str(latest_validation.get('record_count') or 'unknown'))}</code> / dataset <code>{html.escape(str(latest_validation.get('dataset_record_count') or 'unknown'))}</code></div></div>",
                 f"<div><div class='metric'>Latest UV Total</div><div><code>{format_metric(latest_validation.get('val_total'))}</code></div></div>",
                 f"<div><div class='metric'>Latest Input Prior Total</div><div><code>{format_metric(latest_validation.get('input_prior_total'))}</code></div></div>",
                 f"<div><div class='metric'>Latest UV Gain</div><div><code>{format_metric(latest_validation.get('improvement_total'))}</code></div></div>",
@@ -283,6 +314,19 @@ def write_training_overview(
                     "</div>"
                 )
                 if best_event is not None
+                else "",
+                (
+                    "<div class='card'><h2>Benchmark Summary</h2><div class='grid'>"
+                    f"<div><div class='metric'>Benchmark Basis</div><div><code>{html.escape(str(benchmark_summary.get('evaluation_basis') or 'benchmark_val_full_190'))}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Rows / Objects</div><div><code>{html.escape(str(benchmark_summary.get('rows') or 'n/a'))}</code> / <code>{html.escape(str((benchmark_summary.get('object_level') or {}).get('objects') or benchmark_summary.get('objects') or 'n/a'))}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Input Prior Total</div><div><code>{format_metric(benchmark_summary.get('input_prior_total_mae'))}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Refined Total</div><div><code>{format_metric(benchmark_summary.get('refined_total_mae'))}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Gain</div><div><code>{format_metric(benchmark_summary.get('gain_total'))}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Case Regression</div><div><code>{format_metric(benchmark_summary.get('regression_rate'), 4)}</code></div></div>"
+                    f"<div><div class='metric'>Benchmark Object Regression</div><div><code>{format_metric((benchmark_summary.get('object_level') or {}).get('regression_rate'), 4)}</code></div></div>"
+                    "</div></div>"
+                )
+                if benchmark_summary
                 else "",
                 (
                     "<div class='card'><h2>By Variant</h2><table><thead><tr>"
@@ -306,7 +350,9 @@ def write_training_overview(
                 "<div class='card'><h2>Metric Semantics</h2><ul>"
                 "<li><b>RM proxy</b>: view-projected roughness/metallic target metrics computed from UV RM maps through <code>view_uvs</code>.</li>"
                 "<li><b>RGB proxy</b>: eval-only <code>proxy_uv_shading</code> metrics, not the same as RM proxy.</li>"
-                "<li><b>Real render</b>: reserved for future renderer/Blender re-render metrics.</li>"
+                "<li><b>Selection monitor</b>: <code>monitor_val_balanced_160</code> style balanced validation used for checkpoint selection.</li>"
+                "<li><b>Benchmark summary</b>: full split benchmark written after training under post-train evaluation.</li>"
+                "<li><b>Real render</b>: independent Blender re-render benchmark, separate from RM proxy and RGB proxy.</li>"
                 "<li>This run is an A-track prior-gap validation on <code>ABO_locked_core</code> / <code>glossy_non_metal</code>, not a broad generalization claim.</li>"
                 "</ul></div>",
                 "</div></body></html>",
@@ -336,7 +382,24 @@ def write_training_evidence_report(
         "metric_families": {
             "rm_proxy": "View-projected roughness/metallic metrics computed from UV RM maps and view_uvs.",
             "rgb_proxy": "Evaluation-only lightweight proxy_uv_shading metrics.",
-            "real_render": "Reserved for future renderer/Blender re-render metrics.",
+            "real_render": "Independent Blender re-render benchmark.",
+        },
+        "evaluation_basis": latest.get("evaluation_basis"),
+        "record_count": latest.get("record_count"),
+        "dataset_record_count": latest.get("dataset_record_count"),
+        "latest_validation_summary": {
+            "label": latest.get("label"),
+            "epoch": latest.get("epoch"),
+            "optimizer_step": latest.get("optimizer_step"),
+            "evaluation_basis": latest.get("evaluation_basis"),
+            "record_count": latest.get("record_count"),
+            "dataset_record_count": latest.get("dataset_record_count"),
+            "uv_gain": latest.get("uv_gain"),
+            "rm_proxy_view_mae_delta": latest.get("rm_proxy_view_mae_delta"),
+            "rm_proxy_view_mse_delta": latest.get("rm_proxy_view_mse_delta"),
+            "rm_proxy_view_psnr_delta": latest.get("rm_proxy_view_psnr_delta"),
+            "case_regression_rate": latest.get("case_regression_rate"),
+            "selection_metric": latest.get("selection_metric"),
         },
         "latest": latest,
         "best_uv_gain": best_gain,
@@ -366,7 +429,8 @@ def write_training_evidence_report(
                 "<h1>Material Refiner Training Evidence</h1>",
                 "<div class='card'>",
                 "<div><b>RM proxy</b>: view-projected roughness/metallic target metrics from UV maps and view_uvs.</div>",
-                "<div><b>RGB proxy</b>: eval proxy_uv_shading. <b>Real render</b>: future renderer/Blender metrics.</div>",
+                "<div><b>RGB proxy</b>: eval proxy_uv_shading diagnostics. <b>Real render</b>: independent Blender re-render benchmark.</div>",
+                f"<div>Selection basis: <code>{html.escape(str(latest.get('evaluation_basis') or 'unknown'))}</code>; record count: <code>{html.escape(str(latest.get('record_count') or 'unknown'))}</code> / dataset <code>{html.escape(str(latest.get('dataset_record_count') or 'unknown'))}</code></div>",
                 f"<div>Latest UV gain: <code>{format_metric(latest.get('uv_gain'))}</code>; RM proxy PSNR delta: <code>{format_metric(latest.get('rm_proxy_view_psnr_delta'))}</code>; case regression: <code>{format_metric(latest.get('case_regression_rate'), 4)}</code></div>",
                 f"<div>Best UV gain event: <code>{best_gain.get('label')}</code> = <code>{format_metric(best_gain.get('uv_gain'))}</code></div>",
                 "</div>",
@@ -559,6 +623,8 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
                 f"<div>Last val total: <code>{format_metric(latest_validation.get('val_total'))}</code></div>",
                 f"<div>Last input prior total: <code>{format_metric(latest_validation.get('input_prior_total'))}</code></div>",
                 f"<div>Last improvement: <code>{format_metric(latest_validation.get('improvement_total'))}</code></div>",
+                f"<div>Selection basis: <code>{html.escape(str(latest_validation.get('evaluation_basis') or 'unknown'))}</code></div>",
+                f"<div>Selection record count: <code>{html.escape(str(latest_validation.get('record_count') or 'unknown'))}</code> / dataset <code>{html.escape(str(latest_validation.get('dataset_record_count') or 'unknown'))}</code></div>",
                 "</div></div></body></html>",
             ]
         ),

@@ -36,6 +36,7 @@ from sf3d.material_refine.experiment import (  # noqa: E402
     sanitize_log_dict,
     wandb,
 )
+from sf3d.material_refine.eval_report import build_report  # noqa: E402
 from sf3d.material_refine.io import save_atlas_bundle  # noqa: E402
 from sf3d.material_refine.io import tensor_to_pil  # noqa: E402
 
@@ -1317,6 +1318,8 @@ def summarize_group_rows(rows: list[dict[str, Any]], key_name: str) -> dict[str,
         "refined_total_mae",
         "gain_total",
         "improvement_total",
+        "baseline_mse",
+        "refined_mse",
         "baseline_psnr",
         "refined_psnr",
         "baseline_ssim",
@@ -1373,6 +1376,85 @@ def summarize_group_rows(rows: list[dict[str, Any]], key_name: str) -> dict[str,
             item[scalar_key] = optional_mean(bucket["values"][scalar_key])
         finalized[key] = item
     return finalized
+
+
+def build_rgb_proxy_variant_summary(
+    grouped_variant: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for variant, metrics in sorted(grouped_variant.items()):
+        summary[str(variant)] = {
+            "count": int(metrics.get("count", 0) or 0),
+            "psnr": metric_pair(
+                baseline=metrics.get("baseline_psnr"),
+                refined=metrics.get("refined_psnr"),
+                higher_is_better=True,
+                count=int(metrics.get("count", 0) or 0),
+            ),
+            "mse": metric_pair(
+                baseline=metrics.get("baseline_mse"),
+                refined=metrics.get("refined_mse"),
+                higher_is_better=False,
+                count=int(metrics.get("count", 0) or 0),
+            ),
+            "ssim": metric_pair(
+                baseline=metrics.get("baseline_ssim"),
+                refined=metrics.get("refined_ssim"),
+                higher_is_better=True,
+                count=int(metrics.get("count", 0) or 0),
+            ),
+            "lpips": metric_pair(
+                baseline=metrics.get("baseline_lpips"),
+                refined=metrics.get("refined_lpips"),
+                higher_is_better=False,
+                count=int(metrics.get("count", 0) or 0),
+            ),
+        }
+    return summary
+
+
+def build_rgb_proxy_disagreement_cases(rows: list[dict[str, Any]], *, max_cases: int = 64) -> dict[str, Any]:
+    rm_better_rgb_worse: list[dict[str, Any]] = []
+    rm_worse_rgb_better: list[dict[str, Any]] = []
+    for row in rows:
+        rm_gain = finite_or_none(row.get("improvement_total"))
+        baseline_psnr = finite_or_none(row.get("baseline_psnr"))
+        refined_psnr = finite_or_none(row.get("refined_psnr"))
+        baseline_lpips = finite_or_none(row.get("baseline_lpips"))
+        refined_lpips = finite_or_none(row.get("refined_lpips"))
+        if rm_gain is None or baseline_psnr is None or refined_psnr is None:
+            continue
+        rgb_psnr_delta = refined_psnr - baseline_psnr
+        rgb_lpips_delta = None
+        if baseline_lpips is not None and refined_lpips is not None:
+            rgb_lpips_delta = baseline_lpips - refined_lpips
+        item = {
+            "object_id": row.get("object_id"),
+            "pair_id": row.get("pair_id"),
+            "prior_variant_type": row.get("prior_variant_type"),
+            "prior_quality_bin": row.get("prior_quality_bin"),
+            "training_role": row.get("training_role"),
+            "view_name": row.get("view_name"),
+            "rm_gain_total": rm_gain,
+            "rgb_proxy_psnr_delta": rgb_psnr_delta,
+            "rgb_proxy_lpips_delta": rgb_lpips_delta,
+            "baseline_total_mae": row.get("baseline_total_mae"),
+            "refined_total_mae": row.get("refined_total_mae"),
+        }
+        if rm_gain > 1e-6 and rgb_psnr_delta < -1e-6:
+            rm_better_rgb_worse.append(item)
+        elif rm_gain < -1e-6 and rgb_psnr_delta > 1e-6:
+            rm_worse_rgb_better.append(item)
+    rm_better_rgb_worse.sort(key=lambda item: (item["rm_gain_total"], -item["rgb_proxy_psnr_delta"]), reverse=True)
+    rm_worse_rgb_better.sort(key=lambda item: (-item["rm_gain_total"], item["rgb_proxy_psnr_delta"]), reverse=True)
+    return {
+        "counts": {
+            "rm_better_rgb_worse": len(rm_better_rgb_worse),
+            "rm_worse_rgb_better": len(rm_worse_rgb_better),
+        },
+        "rm_better_rgb_worse": rm_better_rgb_worse[:max_cases],
+        "rm_worse_rgb_better": rm_worse_rgb_better[:max_cases],
+    }
 
 
 def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2716,6 +2798,8 @@ def main() -> None:
         view_improvement=view_improvement_total,
         object_improvement=object_improvement_total,
     )
+    rgb_proxy_variant_summary = build_rgb_proxy_variant_summary(grouped_summaries["by_prior_variant_type"])
+    rgb_proxy_disagreement_cases = build_rgb_proxy_disagreement_cases(rows)
     disagreement_json_path, disagreement_html_path = write_metric_disagreement_report(
         output_dir,
         metric_disagreement,
@@ -2831,6 +2915,8 @@ def main() -> None:
         "manifest": str(args.manifest.resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
         "split": args.split,
+        "evaluation_basis": f"benchmark_{args.split}_full_{len(dataset.records)}",
+        "record_count": int(len(dataset.records)),
         "eval_variant": args.eval_variant,
         "rows": len(rows),
         "objects": len(object_rows),
@@ -2840,8 +2926,8 @@ def main() -> None:
         "render_metric_mode": args.render_metric_mode,
         "metric_families": {
             "rm_proxy": "View-projected roughness/metallic metrics from UV RM maps and view_uvs.",
-            "rgb_proxy": "Evaluation proxy_uv_shading metrics computed against captured/reference RGB views.",
-            "real_render": "Reserved for future renderer/Blender re-render metrics.",
+            "rgb_proxy": "Diagnostic proxy_uv_shading metrics computed against captured/reference RGB views.",
+            "real_render": "Independent Blender re-render benchmark.",
         },
         "metric_registry": {
             "main": MAIN_METRIC_NAMES,
@@ -2949,6 +3035,7 @@ def main() -> None:
                 "groups": list(grouped_summaries.keys()),
             },
             "metric_disagreement": metric_disagreement,
+            "rgb_proxy_disagreement_cases": rgb_proxy_disagreement_cases,
             "failure_taxonomy": {
                 "failure_tags": FAILURE_TAGS,
                 "tag_reduction": failure_tag_reduction,
@@ -2956,6 +3043,7 @@ def main() -> None:
             },
         },
         "metrics_by_group": grouped_summaries,
+        "rgb_proxy_by_prior_variant_type": rgb_proxy_variant_summary,
         "diagnostic_reports": {
             "metric_disagreement_json": str(disagreement_json_path.resolve()),
             "metric_disagreement_html": str(disagreement_html_path.resolve()),
@@ -2992,6 +3080,7 @@ def main() -> None:
         "manifest": str(args.manifest.resolve()),
         "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint is not None else None,
         "split": args.split,
+        "evaluation_basis": summary_payload["evaluation_basis"],
         "overall": {
             "rows": len(rows),
             "objects": len(object_rows),
@@ -3002,6 +3091,7 @@ def main() -> None:
             "regression_rate": uv_direction_rates["regression_rate"],
         },
         "by_prior_variant_type": grouped_summaries["by_prior_variant_type"],
+        "rgb_proxy_by_prior_variant_type": rgb_proxy_variant_summary,
         "by_prior_quality_bin": grouped_summaries["by_prior_quality_bin"],
         "by_split": grouped_summaries["by_split"],
         "object_level": {
@@ -3051,9 +3141,18 @@ def main() -> None:
 
     report_path = None
     if not args.skip_report:
-        from export_refined_material_report import build_report
-
-        report_path = build_report(metrics_path, output_dir)
+        try:
+            report_path = build_report(metrics_path, output_dir)
+        except Exception as exc:  # noqa: BLE001 - report generation must not block eval suite.
+            print(
+                json.dumps(
+                    {
+                        "eval_report_warning": f"{type(exc).__name__}: {exc}",
+                        "summary_json": str(summary_path.resolve()),
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
     if run is not None:
         log_payload = {
@@ -3063,13 +3162,8 @@ def main() -> None:
             "eval/memory/peak_allocated_gb": summary_payload["memory"]["peak_allocated_gb"],
         }
         main_metrics = summary_payload["metrics_main"]
-        special_metrics = summary_payload["metrics_material_specific"]
         log_payload.update(
             {
-                "eval/main/psnr": main_metrics["proxy_render_psnr"]["refined"],
-                "eval/main/mse": main_metrics["proxy_render_mse"]["refined"],
-                "eval/main/ssim": main_metrics["proxy_render_ssim"]["refined"],
-                "eval/main/lpips": main_metrics["proxy_render_lpips"]["refined"],
                 "eval/rgb_proxy/psnr/baseline": main_metrics["proxy_render_psnr"]["baseline"],
                 "eval/rgb_proxy/psnr/refined": main_metrics["proxy_render_psnr"]["refined"],
                 "eval/rgb_proxy/psnr/delta": main_metrics["proxy_render_psnr"]["delta"],
@@ -3098,11 +3192,6 @@ def main() -> None:
                 "eval/diagnostics/bootstrap_enabled_rate": summary_payload.get("bootstrap_enabled_rate"),
                 "eval/rm/uv_total_mae": main_metrics["uv_rm_mae"]["total"]["refined"],
                 "eval/rm/view_total_mae": main_metrics["view_rm_mae"]["total"]["refined"],
-                "eval/special/boundary_bleed_score": special_metrics["boundary_bleed_score"]["refined"],
-                "eval/special/metal_confusion_rate": special_metrics["metal_nonmetal_confusion"]["uv_level"]["refined"]["confusion_rate"],
-                "eval/special/highlight_localization_error": special_metrics["highlight_localization_error"]["refined"],
-                "eval/special/rm_gradient_preservation": special_metrics["rm_gradient_preservation"]["refined"],
-                "eval/special/prior_residual_safety": special_metrics["prior_residual_safety"]["safety_score"],
             }
         )
         if args.wandb_log_group_breakdowns:

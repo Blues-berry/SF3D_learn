@@ -121,7 +121,7 @@ render_proxy_validation_milestone_interval: 1
 render_proxy_validation_max_batches: 6
 val_enable_lpips: true
 val_lpips_max_images: 12
-max_validation_batches: 12
+max_validation_batches: 40
 save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: true
@@ -132,9 +132,9 @@ selection_mse_penalty: 0.50
 selection_psnr_penalty: 0.35
 selection_residual_regression_penalty: 0.18
 
-val_preview_samples: 32
-val_preview_selection: effect_showcase
-wandb_val_preview_max: 32
+val_preview_samples: 30
+val_preview_selection: balanced_by_variant
+wandb_val_preview_max: 30
 wandb_log_preview_grid: false
 save_preview_contact_sheet: false
 
