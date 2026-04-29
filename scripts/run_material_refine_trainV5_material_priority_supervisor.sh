@@ -10,6 +10,7 @@ STATUS_DIR="${STATUS_DIR:-${AUTO_ROOT}/status}"
 LOCK_FILE="${LOCK_FILE:-${AUTO_ROOT}/material_priority_cycle.lock}"
 LAST_CYCLE_JSON="${LAST_CYCLE_JSON:-${AUTO_ROOT}/last_cycle_state.json}"
 STAGE_SUMMARY_JSON="${STAGE_SUMMARY_JSON:-output/material_refine_expansion_candidates/material_priority_stage/material_priority_stage_summary.json}"
+OBJAVERSE_INCREMENT_MANIFEST="${OBJAVERSE_INCREMENT_MANIFEST:-output/highlight_pool_a_8k/objaverse_cached_increment_material_priority/objaverse_cached_increment_manifest.json}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-1800}"
 DOWNLOAD_PROBE_SIZE="${DOWNLOAD_PROBE_SIZE:-100}"
 MIN_DOWNLOAD_SUCCESS_RATE="${MIN_DOWNLOAD_SUCCESS_RATE:-0.20}"
@@ -70,26 +71,38 @@ stage_process_running() {
 }
 
 next_download_mode() {
-  python - <<'PY' "${STAGE_SUMMARY_JSON}" "${MIN_DOWNLOAD_SUCCESS_RATE}"
+  python - <<'PY' "${STAGE_SUMMARY_JSON}" "${MIN_DOWNLOAD_SUCCESS_RATE}" "${OBJAVERSE_INCREMENT_MANIFEST}"
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 threshold = float(sys.argv[2])
+increment_path = Path(sys.argv[3])
+def load_payload(candidate: Path):
+    if not candidate.exists():
+        return {}
+    try:
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 if not path.exists():
-    print("direct")
-    raise SystemExit(0)
-try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    print("direct")
-    raise SystemExit(0)
+    payload = {}
+else:
+    payload = load_payload(path)
 summary = payload.get("summary", payload) if isinstance(payload, dict) else {}
-mode = str(summary.get("download_mode") or "direct")
+mode = str(summary.get("download_mode") or "")
 attempted = int(summary.get("download_attempted") or 0)
 success_rate = float(summary.get("download_success_rate") or 0.0)
 reason = str(summary.get("download_failure_reason") or "").lower()
+if not mode:
+    increment = load_payload(increment_path)
+    mode = "direct"
+    attempted = int(increment.get("selected_count") or attempted or 0)
+    downloaded = int(increment.get("downloaded_count") or 0)
+    if attempted > 0:
+        success_rate = float(downloaded) / float(attempted)
+    reason = str(increment.get("download_error") or reason).lower()
 network_tokens = ("ssl", "max retries", "connection", "timeout", "proxy", "tls", "http")
 network_like = any(token in reason for token in network_tokens)
 if attempted > 0 and success_rate >= threshold:
