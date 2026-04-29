@@ -564,6 +564,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_material_refiner.py \\
     path.chmod(0o755)
 
 
+def write_fullrun_command(path: Path) -> None:
+    text = """#!/usr/bin/env bash
+set -euo pipefail
+
+cd /home/ubuntu/ssd_work/projects/stable-fast-3d
+python scripts/train_material_refiner.py \\
+  --config configs/material_refine_train_r_v2_1_trainV5_plus_a_full.yaml
+"""
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o755)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -663,6 +675,7 @@ def main() -> None:
     write_inventory(args.output_dir / "trainV5_inventory.md", bundles, variants, pairs, readiness)
     write_readiness(args.output_dir / "trainV5_readiness_report.md", readiness)
     write_command_draft(args.output_dir / "r_v2_1_trainV5_plus_sanity.sh")
+    write_fullrun_command(args.output_dir / "r_v2_1_trainV5_plus_fullrun.sh")
     print(json.dumps({"target_bundles": len(bundles), "prior_variants": len(variants), "training_pairs": len(pairs), "sanity_ready": readiness["sanity_ready"], "output_dir": str(args.output_dir.resolve())}, indent=2, ensure_ascii=False))
 
 

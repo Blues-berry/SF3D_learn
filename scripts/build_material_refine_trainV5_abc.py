@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_A_MANIFEST = REPO_ROOT / "train/trainV5_plus_a_track/trainV5_training_pairs.json"
 DEFAULT_B_QUEUE = (
     REPO_ROOT
-    / "output/material_refine_trainV5/expansion_second_pass/trainV5_plus_rebake_queue_preview_v2.json"
+    / "output/material_refine_trainV5/expansion_second_pass/trainV5_plus_rebake_queue_latest.json"
 )
 DEFAULT_ABC_ROOT = REPO_ROOT / "output/material_refine_trainV5_abc"
 VARIANT_ORDER = [
@@ -35,6 +35,16 @@ VARIANT_ORDER = [
     "no_prior_bootstrap",
 ]
 LARGE_TRAIN_SUFFIXES = {".png", ".exr", ".glb", ".gltf", ".fbx", ".obj", ".npz", ".npy"}
+
+
+def slugify_batch_name(text: str) -> str:
+    out = []
+    for character in str(text or ""):
+        if character.isalnum():
+            out.append(character.lower())
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "material_rebake_batch"
 
 
 def utc_now() -> str:
@@ -570,11 +580,21 @@ def normalize_b_queue_record(record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dict[str, Any]:
+def b_preflight(
+    queue_path: Path,
+    abc_root: Path,
+    min_ssd_free_gb: float,
+    batch_name: str,
+    batch_size: int,
+    expected_record_count: int,
+) -> dict[str, Any]:
     b_root = abc_root / "B_track"
-    rebake_root = b_root / "full_1155_rebake"
+    batch_slug = slugify_batch_name(batch_name)
+    rebake_root = b_root / batch_slug
     queue_payload = read_json(queue_path, {})
     raw_records = records_from_payload(queue_payload)
+    if batch_size > 0:
+        raw_records = raw_records[:batch_size]
     records = [normalize_b_queue_record(record) for record in raw_records]
     queue_hash = file_sha256(queue_path)
     path_counts = Counter()
@@ -595,6 +615,10 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
         "queue_path": str(queue_path.resolve()),
         "queue_sha256": queue_hash,
         "records": len(records),
+        "batch_name": batch_name,
+        "batch_slug": batch_slug,
+        "batch_size_limit": batch_size,
+        "expected_record_count": expected_record_count,
         "summary": summarize(records, ["material_family", "source_name", "license_bucket", "prior_mode"]),
         "path_counts": dict(path_counts),
         "suffix_counts": dict(suffix_counts),
@@ -611,21 +635,25 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
             and "object" not in str(record.get("candidate_status", "")).lower()
         ),
     }
-    input_manifest = rebake_root / "full_1155_rebake_input_manifest.json"
+    input_manifest = rebake_root / f"{batch_slug}_input_manifest.json"
     write_json(
         input_manifest,
         {
-            "manifest_version": "trainV5_abc_full_1155_rebake_input_v1",
+            "manifest_version": "trainV5_abc_rebake_input_v2",
             "generated_at_utc": utc_now(),
             "source_queue": str(queue_path.resolve()),
             "queue_sha256": queue_hash,
+            "batch_name": batch_name,
+            "batch_slug": batch_slug,
+            "batch_size_limit": batch_size,
+            "expected_record_count": expected_record_count,
             "summary": preflight["summary"],
             "records": records,
         },
     )
     write_json(b_root / "B_track_preflight.json", preflight)
     prepare_output_root = rebake_root / "prepared"
-    prepared_manifest = rebake_root / "full_1155_rebake_manifest.json"
+    prepared_manifest = rebake_root / f"{batch_slug}_manifest.json"
     command = [
         "CUDA_VISIBLE_DEVICES=0",
         "python",
@@ -665,21 +693,21 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
         "--target-view-alignment-p95-threshold",
         "0.20",
         "--partial-manifest",
-        str(rebake_root / "full_1155_partial_manifest.json"),
+        str(rebake_root / f"{batch_slug}_partial_manifest.json"),
         "--refresh-partial-every",
         "1",
         "--summary-json",
-        str(rebake_root / "full_1155_prepare_summary.json"),
+        str(rebake_root / f"{batch_slug}_prepare_summary.json"),
         "--summary-md",
-        str(rebake_root / "full_1155_prepare_summary.md"),
+        str(rebake_root / f"{batch_slug}_prepare_summary.md"),
     ]
     script_text = "#!/usr/bin/env bash\nset -euo pipefail\ncd /home/ubuntu/ssd_work/projects/stable-fast-3d\n" + " ".join(command) + "\n"
-    command_path = rebake_root / "run_full_1155_rebake_gpu0.sh"
+    command_path = rebake_root / f"run_{batch_slug}_gpu0.sh"
     write_text(command_path, script_text)
     command_path.chmod(0o755)
     blockers = []
-    if len(records) != 1155:
-        blockers.append(f"expected_1155_records_got_{len(records)}")
+    if expected_record_count > 0 and len(records) != expected_record_count:
+        blockers.append(f"expected_{expected_record_count}_records_got_{len(records)}")
     if missing:
         blockers.append(f"missing_or_unreadable_paths_{len(missing)}")
     if not preflight["output_is_symlink"]:
@@ -695,24 +723,31 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
         "blockers": blockers,
         "full_rebake_launched": False,
         "reason_not_launched": (
-            "The 1155-object Blender rebake is a long GPU job. This pass generated the frozen input "
+            "The TrainV5 B-track Blender rebake is a long GPU job. This pass generated the frozen input "
             "manifest, preflight, and resumable command draft; it did not start an unmanaged long run."
         ),
         "command_draft": str(command_path.resolve()),
         "input_manifest": str(input_manifest.resolve()),
+        "batch_name": batch_name,
+        "batch_slug": batch_slug,
+        "batch_size_limit": batch_size,
+        "expected_record_count": expected_record_count,
     }
-    write_json(rebake_root / "full_1155_decision.json", decision)
+    write_json(rebake_root / f"{batch_slug}_decision.json", decision)
     write_text(
-        rebake_root / "full_1155_decision.md",
+        rebake_root / f"{batch_slug}_decision.md",
         "\n".join(
             [
-                "# Full 1155 Rebake Decision",
+                f"# {batch_name} Decision",
                 "",
                 f"- generated_at_utc: `{decision['generated_at_utc']}`",
                 f"- status: `{status}`",
                 f"- full_rebake_launched: `false`",
                 f"- queue_records: `{len(records)}`",
                 f"- queue_sha256: `{queue_hash}`",
+                f"- batch_name: `{batch_name}`",
+                f"- batch_size_limit: `{batch_size}`",
+                f"- expected_record_count: `{expected_record_count}`",
                 f"- blockers: `{json.dumps(blockers, ensure_ascii=False)}`",
                 f"- command_draft: `{command_path}`",
                 "",
@@ -721,10 +756,10 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
         ),
     )
     write_text(
-        rebake_root / "full_1155_path_audit.md",
+        rebake_root / f"{batch_slug}_path_audit.md",
         "\n".join(
             [
-                "# Full 1155 Path Audit",
+                f"# {batch_name} Path Audit",
                 "",
                 f"- generated_at_utc: `{utc_now()}`",
                 f"- readable_file: `{path_counts.get('readable_file', 0)}`",
@@ -738,9 +773,9 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
         rebake_root / "progress_final.md",
         "\n".join(
             [
-                "# Full 1155 Progress Final",
+                f"# {batch_name} Progress Final",
                 "",
-                "- processed: `0/1155`",
+                f"- processed: `0/{len(records)}`",
                 "- target_gate_version: `TrainV5_target_truth_gate_v2`",
                 "- target_truth_gate_pass: `0`",
                 "- target_truth_gate_fail: `0`",
@@ -754,12 +789,12 @@ def b_preflight(queue_path: Path, abc_root: Path, min_ssd_free_gb: float) -> dic
     plus_full = REPO_ROOT / "train/trainV5_plus_full"
     merged_ab = REPO_ROOT / "train/trainV5_merged_ab"
     write_text(
-        plus_full / "BLOCKED_full_1155_rebake_not_completed.md",
-        "# TrainV5 Plus Full Blocked\n\nB-track full rebake has not completed, so target bundles and N*5 training pairs are not generated yet.\n",
+        plus_full / f"BLOCKED_{batch_slug}_not_completed.md",
+        "# TrainV5 Plus Full Blocked\n\nB-track rebake has not completed, so target bundles and N*5 training pairs are not generated yet.\n",
     )
     write_text(
-        merged_ab / "BLOCKED_b_track_full_not_available.md",
-        "# TrainV5 Merged AB Blocked\n\nA+B merge is blocked until B-track full target-gate pass manifest exists.\n",
+        merged_ab / f"BLOCKED_{batch_slug}_not_completed.md",
+        "# TrainV5 Merged AB Blocked\n\nA+B merge is blocked until the selected B-track target-gate pass manifest exists.\n",
     )
     return preflight
 
@@ -1092,6 +1127,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--abc-root", type=Path, default=DEFAULT_ABC_ROOT)
     parser.add_argument("--a-manifest", type=Path, default=DEFAULT_A_MANIFEST)
     parser.add_argument("--b-queue", type=Path, default=DEFAULT_B_QUEUE)
+    parser.add_argument("--b-batch-name", type=str, default="material_first_rebake_batch")
+    parser.add_argument("--b-batch-size", type=int, default=0)
+    parser.add_argument("--b-expected-record-count", type=int, default=0)
     parser.add_argument("--audit-atlas-size", type=int, default=64)
     parser.add_argument("--audit-buffer-resolution", type=int, default=32)
     parser.add_argument("--min-ssd-free-gb", type=float, default=20.0)
@@ -1116,7 +1154,14 @@ def main() -> None:
     if args.postprocess_eval_dir is not None:
         postprocess_eval(args.postprocess_eval_dir)
     if args.run_b_preflight:
-        b_preflight(args.b_queue, args.abc_root, args.min_ssd_free_gb)
+        b_preflight(
+            args.b_queue,
+            args.abc_root,
+            args.min_ssd_free_gb,
+            args.b_batch_name,
+            args.b_batch_size,
+            args.b_expected_record_count,
+        )
         pending_repair_snapshot(args.abc_root)
     if args.run_c_plans:
         write_c_plans(args.abc_root)

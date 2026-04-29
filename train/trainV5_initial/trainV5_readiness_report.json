@@ -1,5 +1,7 @@
 {
   "sanity_ready": true,
+  "manifest_role": "source_intermediate",
+  "runtime_training_ready": false,
   "target_bundles": 322,
   "prior_variants": 322,
   "training_pairs": 322,

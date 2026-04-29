@@ -603,7 +603,7 @@ def classify_case(
 
 
 def sample_uv_maps_to_view(uv_maps: torch.Tensor, view_uvs: torch.Tensor) -> torch.Tensor:
-    grid = view_uvs.clone()
+    grid = torch.where(torch.isfinite(view_uvs), view_uvs, torch.zeros_like(view_uvs)).clone()
     grid[..., 0] = grid[..., 0] * 2.0 - 1.0
     grid[..., 1] = (1.0 - grid[..., 1]) * 2.0 - 1.0
     batch, views, height, width, _ = grid.shape
@@ -2838,6 +2838,11 @@ def main() -> None:
         "effective_view_supervision_samples": int(summary["effective_view_supervision_samples"]),
         "effective_view_supervision_rate": effective_view_supervision_rate,
         "render_metric_mode": args.render_metric_mode,
+        "metric_families": {
+            "rm_proxy": "View-projected roughness/metallic metrics from UV RM maps and view_uvs.",
+            "rgb_proxy": "Evaluation proxy_uv_shading metrics computed against captured/reference RGB views.",
+            "real_render": "Reserved for future renderer/Blender re-render metrics.",
+        },
         "metric_registry": {
             "main": MAIN_METRIC_NAMES,
             "material_specific": MATERIAL_SPECIFIC_METRIC_NAMES,
@@ -3065,6 +3070,18 @@ def main() -> None:
                 "eval/main/mse": main_metrics["proxy_render_mse"]["refined"],
                 "eval/main/ssim": main_metrics["proxy_render_ssim"]["refined"],
                 "eval/main/lpips": main_metrics["proxy_render_lpips"]["refined"],
+                "eval/rgb_proxy/psnr/baseline": main_metrics["proxy_render_psnr"]["baseline"],
+                "eval/rgb_proxy/psnr/refined": main_metrics["proxy_render_psnr"]["refined"],
+                "eval/rgb_proxy/psnr/delta": main_metrics["proxy_render_psnr"]["delta"],
+                "eval/rgb_proxy/mse/baseline": main_metrics["proxy_render_mse"]["baseline"],
+                "eval/rgb_proxy/mse/refined": main_metrics["proxy_render_mse"]["refined"],
+                "eval/rgb_proxy/mse/delta": main_metrics["proxy_render_mse"]["delta"],
+                "eval/rgb_proxy/ssim/baseline": main_metrics["proxy_render_ssim"]["baseline"],
+                "eval/rgb_proxy/ssim/refined": main_metrics["proxy_render_ssim"]["refined"],
+                "eval/rgb_proxy/ssim/delta": main_metrics["proxy_render_ssim"]["delta"],
+                "eval/rgb_proxy/lpips/baseline": main_metrics["proxy_render_lpips"]["baseline"],
+                "eval/rgb_proxy/lpips/refined": main_metrics["proxy_render_lpips"]["refined"],
+                "eval/rgb_proxy/lpips/delta": main_metrics["proxy_render_lpips"]["delta"],
                 "eval/input_prior_total_mae": summary_payload["input_prior_total_mae"],
                 "eval/refined_total_mae": summary_payload["refined_total_mae"],
                 "eval/gain_total": summary_payload["gain_total"],

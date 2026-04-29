@@ -449,12 +449,15 @@ def write_inventory(
         f"- target_bundles: `{len(bundles)}`",
         f"- prior_variants: `{len(variants)}`",
         f"- training_pairs: `{len(pairs)}`",
+        "- manifest_role: `source_intermediate`",
+        "- runtime_training_ready: `false`",
         f"- split: `{json.dumps(summarize(pairs)['split'], ensure_ascii=False)}`",
         f"- material_family: `{json.dumps(summarize(pairs)['material_family'], ensure_ascii=False)}`",
         f"- prior_quality_bin: `{json.dumps(summarize(pairs)['prior_quality_bin'], ensure_ascii=False)}`",
         f"- prior_spatiality: `{json.dumps(summarize(pairs)['prior_spatiality'], ensure_ascii=False)}`",
         f"- sanity_ready: `{str(readiness['sanity_ready']).lower()}`",
         "",
+        "This directory is an intermediate TrainV5 source handoff, not a runtime training manifest. Use `train/trainV5_plus_a_track/trainV5_training_pairs.json` for `train_material_refiner.py`.",
         "Large view/UV/buffer images are not copied into `train/trainV5_initial`; manifests keep logical/physical paths to `output` or `/4T`.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -466,6 +469,8 @@ def write_readiness(path: Path, readiness: dict[str, Any]) -> None:
         "",
         f"- generated_at_utc: `{utc_now()}`",
         f"- sanity_ready: `{str(readiness['sanity_ready']).lower()}`",
+        f"- manifest_role: `{readiness['manifest_role']}`",
+        f"- runtime_training_ready: `{str(readiness['runtime_training_ready']).lower()}`",
         f"- target_bundles: `{readiness['target_bundles']}`",
         f"- training_pairs: `{readiness['training_pairs']}`",
         f"- split_nonempty: `{readiness['split_nonempty']}`",
@@ -476,7 +481,7 @@ def write_readiness(path: Path, readiness: dict[str, Any]) -> None:
         f"- ssd_active_free_gb: `{readiness['ssd_active_free_gb']}`",
         f"- blockers: `{json.dumps(readiness['blockers'], ensure_ascii=False)}`",
         "",
-        "No R training is launched by this builder. The command draft requires manual review.",
+        "This initial handoff is source/intermediate data only. Do not train `train_material_refiner.py` directly from `train/trainV5_initial/trainV5_training_pairs.json`.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -485,15 +490,10 @@ def write_command_draft(path: Path) -> None:
     text = """#!/usr/bin/env bash
 set -euo pipefail
 
-# Manual draft only. Review manifests/readiness before removing this guard.
-echo "TrainV5 R-v2.1 sanity command draft only; not auto-starting training."
+# Manual draft only. This initial manifest is source/intermediate data, not a
+# runtime training manifest.
+echo "TrainV5 initial is source/intermediate only. Use train/trainV5_plus_a_track/trainV5_training_pairs.json for training."
 exit 1
-
-# Example draft, adjust config/CLI after human review:
-# cd /home/ubuntu/ssd_work/projects/stable-fast-3d
-# /home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/train_material_refiner.py \\
-#   --config configs/material_refine_train_r_v2_1_view_aware.yaml \\
-#   --train-manifest train/trainV5_initial/trainV5_training_pairs.json
 """
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
@@ -533,6 +533,8 @@ def main() -> None:
     ssd_free = free_gb(args.ssd_active_root)
     readiness = {
         "sanity_ready": False,
+        "manifest_role": "source_intermediate",
+        "runtime_training_ready": False,
         "target_bundles": len(bundles),
         "prior_variants": len(variants),
         "training_pairs": len(pairs),
@@ -569,8 +571,11 @@ def main() -> None:
         "generated_at_utc": utc_now(),
         "source_manifest": str(args.input_manifest.resolve()),
         "data_contract": "trainV5_initial_r_only_v1",
+        "manifest_role": "source_intermediate",
+        "runtime_training_ready": False,
         "notes": [
             "R-only initial data. No online SF3D/SPAR3D/Hunyuan3D priors are generated.",
+            "This is not a runtime training manifest for train_material_refiner.py; use train/trainV5_plus_a_track/trainV5_training_pairs.json after pair expansion.",
             "Large images are referenced through logical/physical paths and are not copied into train/trainV5_initial.",
         ],
     }

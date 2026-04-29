@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import html
 import json
 import math
 import os
@@ -389,14 +391,25 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         help="Print verbose [train] interval lines in addition to the progress bar.",
     )
     parser.add_argument("--val-preview-samples", type=int, default=4)
+    parser.add_argument(
+        "--val-preview-selection",
+        choices=["effect_showcase", "first", "balanced"],
+        default="effect_showcase",
+        help="How validation preview examples are selected from each validation pass.",
+    )
     parser.add_argument("--wandb-val-preview-max", type=int, default=8)
     parser.add_argument("--wandb-log-preview-grid", type=parse_bool, default=False)
     parser.add_argument("--save-preview-contact-sheet", type=parse_bool, default=False)
     parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
-    parser.add_argument("--validation-selection-metric", choices=["uv_total", "uv_render_guarded"], default="uv_render_guarded")
+    parser.add_argument(
+        "--validation-selection-metric",
+        choices=["uv_total", "uv_render_guarded", "gain_render_guarded"],
+        default="gain_render_guarded",
+    )
     parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
+    parser.add_argument("--selection-mse-penalty", type=float, default=0.5)
     parser.add_argument("--selection-psnr-penalty", type=float, default=0.25)
     parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -809,7 +822,7 @@ def residual_safety_loss(
 
 
 def sample_uv_maps_to_view(uv_maps: torch.Tensor, view_uvs: torch.Tensor) -> torch.Tensor:
-    grid = view_uvs.clone()
+    grid = torch.where(torch.isfinite(view_uvs), view_uvs, torch.zeros_like(view_uvs)).clone()
     grid[..., 0] = grid[..., 0] * 2.0 - 1.0
     grid[..., 1] = (1.0 - grid[..., 1]) * 2.0 - 1.0
     batch, views, height, width, _ = grid.shape
@@ -825,6 +838,17 @@ def sample_uv_maps_to_view(uv_maps: torch.Tensor, view_uvs: torch.Tensor) -> tor
         align_corners=True,
     )
     return sampled.view(batch, views, sampled.shape[1], height, width)
+
+
+def view_uv_valid_mask(view_uvs: torch.Tensor) -> torch.Tensor:
+    finite = torch.isfinite(view_uvs).all(dim=-1)
+    in_range = (
+        (view_uvs[..., 0] >= 0.0)
+        & (view_uvs[..., 0] <= 1.0)
+        & (view_uvs[..., 1] >= 0.0)
+        & (view_uvs[..., 1] <= 1.0)
+    )
+    return (finite & in_range).to(view_uvs.dtype).unsqueeze(2)
 
 
 def extract_metadata_labels(value: Any) -> list[str]:
@@ -1009,6 +1033,7 @@ def compute_losses(
     if sampled_view_rm_loss_enabled and batch.get("view_uvs") is not None:
         sampled_refined = sample_uv_maps_to_view(refined, batch["view_uvs"])
         view_mask = batch["view_masks"].clamp(0.0, 1.0)
+        view_mask = view_mask * view_uv_valid_mask(batch["view_uvs"]).to(view_mask.device)
         supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
         view_mask = view_mask * supervision_mask.view(-1, 1, 1, 1, 1)
         # Some generated canonical bundles store per-view RM PNGs as RGBA masks
@@ -1351,6 +1376,8 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "val/input_prior_total_mae",
         "val/refined_total_mae",
         "val/gain_total",
+        "val/selection/gain_render_guarded",
+        "val/selection/render_guard_available",
         "val/improvement_uv_total_mae",
         "val/improvement_rate",
         "val/regression_rate",
@@ -1369,9 +1396,14 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "val/special/prior_residual_safety",
         "val/sample_level/avg_improvement_total",
         "val/object_level/avg_improvement_total",
+        "val/object_level/regression_rate",
+        "val/case_level/avg_improvement_total",
+        "val/case_level/regression_rate",
         "eval/rm/uv_total_mae",
         "eval/input_prior_total_mae",
         "eval/gain_total",
+        "eval/selection/gain_render_guarded",
+        "eval/selection/render_guard_available",
         "eval/rm/view_total_mae",
         "eval/main/mse",
         "eval/main/psnr",
@@ -1387,8 +1419,21 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "eval/effective_view_supervision_rate",
         "eval/sample_level/avg_improvement_total",
         "eval/object_level/avg_improvement_total",
+        "eval/object_level/regression_rate",
+        "eval/case_level/avg_improvement_total",
+        "eval/case_level/regression_rate",
     }
-    return {key: value for key, value in logs.items() if key in allowed_exact}
+    allowed_prefixes = (
+        "val/rm_proxy/",
+        "eval/rm_proxy/",
+        "val/by_variant/",
+        "eval/by_variant/",
+    )
+    return {
+        key: value
+        for key, value in logs.items()
+        if key in allowed_exact or key.startswith(allowed_prefixes)
+    }
 
 
 def add_step_context(
@@ -1431,8 +1476,19 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "train/residual_safety",
             "train/effective_view_supervision_rate",
             "val/uv_total_mae",
+            "val/gain_total",
+            "val/selection/gain_render_guarded",
             "val/rm/uv_total_mae",
             "val/rm/view_total_mae",
+            "val/rm_proxy/view_mae/baseline",
+            "val/rm_proxy/view_mae/refined",
+            "val/rm_proxy/view_mae/delta",
+            "val/rm_proxy/view_mse/baseline",
+            "val/rm_proxy/view_mse/refined",
+            "val/rm_proxy/view_mse/delta",
+            "val/rm_proxy/view_psnr/baseline",
+            "val/rm_proxy/view_psnr/refined",
+            "val/rm_proxy/view_psnr/delta",
             "val/main/mse",
             "val/main/psnr",
             "val/main/ssim",
@@ -1444,8 +1500,20 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "val/special/prior_residual_safety",
             "val/sample_level/avg_improvement_total",
             "val/object_level/avg_improvement_total",
+            "val/object_level/regression_rate",
+            "val/case_level/avg_improvement_total",
+            "val/case_level/regression_rate",
             "eval/rm/uv_total_mae",
             "eval/rm/view_total_mae",
+            "eval/rm_proxy/view_mae/baseline",
+            "eval/rm_proxy/view_mae/refined",
+            "eval/rm_proxy/view_mae/delta",
+            "eval/rm_proxy/view_mse/baseline",
+            "eval/rm_proxy/view_mse/refined",
+            "eval/rm_proxy/view_mse/delta",
+            "eval/rm_proxy/view_psnr/baseline",
+            "eval/rm_proxy/view_psnr/refined",
+            "eval/rm_proxy/view_psnr/delta",
             "eval/main/mse",
             "eval/main/psnr",
             "eval/main/ssim",
@@ -1460,6 +1528,9 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "eval/effective_view_supervision_rate",
             "eval/sample_level/avg_improvement_total",
             "eval/object_level/avg_improvement_total",
+            "eval/object_level/regression_rate",
+            "eval/case_level/avg_improvement_total",
+            "eval/case_level/regression_rate",
             "val/improvement_uv_total_mae",
             "val/improvement_rate",
             "val/regression_rate",
@@ -2646,8 +2717,17 @@ def print_epoch_summary(
     checkpoint_path: Path | None,
 ) -> None:
     val_payload = epoch_payload.get("val") or {}
-    val_mae = (val_payload.get("uv_mae") or {}).get("total")
-    selection_metric = (val_payload.get("selection_metric") or {}).get("selection_metric")
+    latest_validation = epoch_payload.get("latest_validation") or {}
+    val_mae = (
+        (val_payload.get("uv_mae") or {}).get("total")
+        if val_payload
+        else latest_validation.get("val_total")
+    )
+    selection_metric = (
+        (val_payload.get("selection_metric") or {}).get("selection_metric")
+        if val_payload
+        else latest_validation.get("selection_metric")
+    )
     train_payload = epoch_payload.get("train") or {}
     checkpoint_label = str(checkpoint_path) if checkpoint_path is not None else "not_saved"
     print(
@@ -2662,6 +2742,379 @@ def print_epoch_summary(
     )
 
 
+def validation_event_sort_key(path: Path) -> tuple[int, int, str]:
+    label = path.stem
+    parts = label.split("_")
+    if len(parts) >= 2 and parts[0] == "progress":
+        try:
+            return (0, int(parts[1]), label)
+        except ValueError:
+            pass
+    if len(parts) >= 2 and parts[0] == "epoch":
+        try:
+            return (1, int(parts[1]), label)
+        except ValueError:
+            pass
+    return (2, 0, label)
+
+
+def load_validation_events(output_dir: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    validation_dir = output_dir / "validation"
+    if not validation_dir.exists():
+        return events
+    for path in sorted(validation_dir.glob("*.json"), key=validation_event_sort_key):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - report export must not block training.
+            print(f"[visualization:warning] validation_event_read_failed={path.name}:{type(exc).__name__}:{exc}")
+            continue
+        render_proxy = payload.get("render_proxy_validation") or {}
+        improvement = payload.get("improvement_uv_mae") or {}
+        case_level = payload.get("case_level") or {}
+        selection = payload.get("selection_metric") or {}
+        events.append(
+            {
+                "label": payload.get("validation_label", path.stem),
+                "epoch": payload.get("epoch"),
+                "optimizer_step": payload.get("optimizer_step"),
+                "uv_total": (payload.get("uv_mae") or {}).get("total"),
+                "uv_roughness": (payload.get("uv_mae") or {}).get("roughness"),
+                "uv_metallic": (payload.get("uv_mae") or {}).get("metallic"),
+                "input_prior_total": (
+                    payload.get("input_prior_uv_mae")
+                    or payload.get("baseline_uv_mae")
+                    or {}
+                ).get("total"),
+                "uv_gain": improvement.get("total"),
+                "sample_regression_rate": improvement.get("regression_rate"),
+                "case_avg_gain": case_level.get("avg_improvement_total"),
+                "case_regression_rate": case_level.get("regression_rate"),
+                "rm_proxy_view_mae_delta": render_proxy.get("view_rm_mae_delta"),
+                "rm_proxy_view_mse_delta": render_proxy.get("proxy_rm_mse_delta"),
+                "rm_proxy_view_psnr_delta": render_proxy.get("proxy_rm_psnr_delta"),
+                "selection_metric": selection.get("selection_metric"),
+                "selection_mode": selection.get("mode"),
+                "path": str(path.resolve()),
+            }
+        )
+    return events
+
+
+def maybe_float(value: Any) -> float:
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def maybe_float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def inline_png_data_uri(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def load_latest_validation_payload(validation_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not validation_events:
+        return None
+    latest_path = validation_events[-1].get("path")
+    if not latest_path:
+        return None
+    try:
+        return json.loads(Path(str(latest_path)).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - report export must not block training.
+        print(f"[visualization:warning] latest_validation_read_failed={type(exc).__name__}:{exc}")
+        return None
+
+
+def summarize_latest_validation(
+    history: list[dict[str, Any]],
+    validation_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    latest_epoch = history[-1] if history else {}
+    latest_epoch_val = latest_epoch.get("val") or {}
+    if latest_epoch_val:
+        improvement_payload = latest_epoch_val.get("improvement_uv_mae") or {}
+        baseline_payload = (
+            latest_epoch_val.get("input_prior_uv_mae")
+            or latest_epoch_val.get("baseline_uv_mae")
+            or {}
+        )
+        return {
+            "source": "epoch_validation",
+            "label": f"epoch_{int(latest_epoch.get('epoch', 0)):03d}",
+            "epoch": latest_epoch.get("epoch"),
+            "optimizer_step": latest_epoch.get("optimizer_step"),
+            "val_total": (latest_epoch_val.get("uv_mae") or {}).get("total"),
+            "input_prior_total": baseline_payload.get("total"),
+            "improvement_total": improvement_payload.get("total"),
+            "selection_metric": (latest_epoch_val.get("selection_metric") or {}).get("selection_metric"),
+        }
+    if validation_events:
+        latest_event = validation_events[-1]
+        return {
+            "source": "validation_event",
+            "label": latest_event.get("label"),
+            "epoch": latest_event.get("epoch"),
+            "optimizer_step": latest_event.get("optimizer_step"),
+            "val_total": latest_event.get("uv_total"),
+            "input_prior_total": latest_event.get("input_prior_total"),
+            "improvement_total": latest_event.get("uv_gain"),
+            "selection_metric": latest_event.get("selection_metric"),
+        }
+    return {
+        "source": "missing",
+        "label": None,
+        "epoch": latest_epoch.get("epoch"),
+        "optimizer_step": latest_epoch.get("optimizer_step"),
+        "val_total": None,
+        "input_prior_total": None,
+        "improvement_total": None,
+        "selection_metric": None,
+    }
+
+
+def build_variant_summary_rows(
+    validation_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not validation_payload:
+        return []
+    group_metrics = validation_payload.get("group_metrics") or {}
+    baseline_group_metrics = validation_payload.get("baseline_group_metrics") or {}
+    improvement_group_metrics = validation_payload.get("improvement_group_metrics") or {}
+    rows = []
+    for group_key, metrics in sorted(group_metrics.items()):
+        if not str(group_key).startswith("prior_variant_type/"):
+            continue
+        variant = str(group_key).split("/", 1)[1]
+        rows.append(
+            {
+                "variant": variant,
+                "input_prior_total_mae": (
+                    (baseline_group_metrics.get(group_key) or {}).get("total_mae")
+                ),
+                "refined_total_mae": metrics.get("total_mae"),
+                "gain_total": (
+                    (improvement_group_metrics.get(group_key) or {}).get("total_mae")
+                ),
+            }
+        )
+    return rows
+
+
+def write_training_overview(
+    *,
+    output_dir: Path,
+    args: argparse.Namespace,
+    history: list[dict[str, Any]],
+    train_state: dict[str, Any],
+    validation_events: list[dict[str, Any]],
+    visualization_paths: dict[str, str],
+) -> Path | None:
+    if not history and not validation_events:
+        return None
+    latest_train = (history[-1].get("train") or {}) if history else {}
+    latest_validation = summarize_latest_validation(history, validation_events)
+    latest_validation_payload = load_latest_validation_payload(validation_events)
+    latest_render_proxy = (latest_validation_payload or {}).get("render_proxy_validation") or {}
+    latest_object_level = (latest_validation_payload or {}).get("object_level") or {}
+    latest_case_level = (latest_validation_payload or {}).get("case_level") or {}
+    variant_rows = build_variant_summary_rows(latest_validation_payload)
+    evidence_curve_uri = inline_png_data_uri(
+        Path(str(visualization_paths["training_evidence_curves"]))
+        if "training_evidence_curves" in visualization_paths
+        else None
+    )
+    train_curve_uri = inline_png_data_uri(
+        Path(str(visualization_paths["training_curves"]))
+        if "training_curves" in visualization_paths
+        else None
+    )
+    best_path = output_dir / "best.pt"
+    latest_path = output_dir / "latest.pt"
+    best_event = None
+    if validation_events:
+        best_event = max(
+            validation_events,
+            key=lambda item: maybe_float(item.get("uv_gain")),
+        )
+    variant_rows_html = [
+        "<tr>"
+        f"<td>{html.escape(str(row.get('variant', 'unknown')))}</td>"
+        f"<td>{format_metric(row.get('input_prior_total_mae'))}</td>"
+        f"<td>{format_metric(row.get('refined_total_mae'))}</td>"
+        f"<td>{format_metric(row.get('gain_total'))}</td>"
+        "</tr>"
+        for row in variant_rows
+    ]
+    overview_path = output_dir / "training_overview.html"
+    overview_path.write_text(
+        "\n".join(
+            [
+                "<!doctype html>",
+                "<html><head><meta charset='utf-8'><title>Material Refiner Training Overview</title>",
+                (
+                    "<style>"
+                    "body{font-family:Arial,sans-serif;background:#10151d;color:#edf2f7;margin:0;padding:24px}"
+                    ".wrap{max-width:1320px;margin:auto}"
+                    ".card{background:#18202b;border-radius:12px;padding:18px;margin:16px 0}"
+                    ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}"
+                    ".metric{font-size:13px;color:#b9e6ff;margin-bottom:6px}"
+                    "img{max-width:100%;border-radius:8px;background:#fff}"
+                    "table{border-collapse:collapse;width:100%;font-size:13px}"
+                    "th,td{border-bottom:1px solid #2d3748;padding:8px;text-align:left}"
+                    "th{color:#b9e6ff}"
+                    "code{color:#b9e6ff}"
+                    "ul{margin:8px 0 0 20px;padding:0}"
+                    "</style>"
+                ),
+                "</head><body><div class='wrap'>",
+                "<h1>Material Refiner Training Overview</h1>",
+                "<div class='card'><div class='grid'>",
+                f"<div><div class='metric'>Run</div><div><code>{html.escape(str(args.tracker_run_name or output_dir.name))}</code></div></div>",
+                f"<div><div class='metric'>Project / Group</div><div><code>{html.escape(str(args.tracker_project_name))}</code> / <code>{html.escape(str(args.tracker_group))}</code></div></div>",
+                f"<div><div class='metric'>Best Checkpoint</div><div><code>{html.escape(str(best_path.resolve() if best_path.exists() else best_path))}</code></div></div>",
+                f"<div><div class='metric'>Latest Checkpoint</div><div><code>{html.escape(str(latest_path.resolve() if latest_path.exists() else latest_path))}</code></div></div>",
+                f"<div><div class='metric'>Best Epoch</div><div><code>{html.escape(str(train_state.get('best_epoch')))}</code></div></div>",
+                f"<div><div class='metric'>Best Selection Metric</div><div><code>{format_metric(train_state.get('best_val_metric'))}</code></div></div>",
+                "</div></div>",
+                "<div class='card'><h2>Core Summary</h2><div class='grid'>",
+                f"<div><div class='metric'>Latest Train Total</div><div><code>{format_metric(latest_train.get('total'))}</code></div></div>",
+                f"<div><div class='metric'>Latest Validation Source</div><div><code>{html.escape(str(latest_validation.get('source')))}</code></div></div>",
+                f"<div><div class='metric'>Latest Validation Label</div><div><code>{html.escape(str(latest_validation.get('label')))}</code></div></div>",
+                f"<div><div class='metric'>Latest UV Total</div><div><code>{format_metric(latest_validation.get('val_total'))}</code></div></div>",
+                f"<div><div class='metric'>Latest Input Prior Total</div><div><code>{format_metric(latest_validation.get('input_prior_total'))}</code></div></div>",
+                f"<div><div class='metric'>Latest UV Gain</div><div><code>{format_metric(latest_validation.get('improvement_total'))}</code></div></div>",
+                f"<div><div class='metric'>Latest RM Proxy View MAE Delta</div><div><code>{format_metric(latest_render_proxy.get('view_rm_mae_delta'))}</code></div></div>",
+                f"<div><div class='metric'>Latest RM Proxy View MSE Delta</div><div><code>{format_metric(latest_render_proxy.get('proxy_rm_mse_delta'))}</code></div></div>",
+                f"<div><div class='metric'>Latest RM Proxy View PSNR Delta</div><div><code>{format_metric(latest_render_proxy.get('proxy_rm_psnr_delta'))}</code></div></div>",
+                f"<div><div class='metric'>Object Regression Rate</div><div><code>{format_metric(latest_object_level.get('regression_rate'), 4)}</code></div></div>",
+                f"<div><div class='metric'>Case Regression Rate</div><div><code>{format_metric(latest_case_level.get('regression_rate'), 4)}</code></div></div>",
+                f"<div><div class='metric'>Validation Events</div><div><code>{len(validation_events)}</code></div></div>",
+                "</div></div>",
+                (
+                    "<div class='card'><h2>Best Gain Event</h2>"
+                    f"<div><code>{html.escape(str(best_event.get('label')))}</code> | "
+                    f"UV gain <code>{format_metric(best_event.get('uv_gain'))}</code> | "
+                    f"RM PSNR delta <code>{format_metric(best_event.get('rm_proxy_view_psnr_delta'))}</code> | "
+                    f"case regression <code>{format_metric(best_event.get('case_regression_rate'), 4)}</code></div>"
+                    "</div>"
+                )
+                if best_event is not None
+                else "",
+                (
+                    "<div class='card'><h2>By Variant</h2><table><thead><tr>"
+                    "<th>variant</th><th>input prior total MAE</th><th>refined total MAE</th><th>UV gain</th>"
+                    "</tr></thead><tbody>"
+                    + "".join(variant_rows_html)
+                    + "</tbody></table></div>"
+                )
+                if variant_rows_html
+                else "<div class='card'><h2>By Variant</h2><div>No validation payload with by-variant metrics was available at overview export time.</div></div>",
+                (
+                    f"<div class='card'><h2>Validation Evidence Curves</h2><img src='{evidence_curve_uri}' alt='training evidence curves'></div>"
+                )
+                if evidence_curve_uri is not None
+                else "",
+                (
+                    f"<div class='card'><h2>Training Curves</h2><img src='{train_curve_uri}' alt='training curves'></div>"
+                )
+                if train_curve_uri is not None
+                else "",
+                "<div class='card'><h2>Metric Semantics</h2><ul>"
+                "<li><b>RM proxy</b>: view-projected roughness/metallic target metrics computed from UV RM maps through <code>view_uvs</code>.</li>"
+                "<li><b>RGB proxy</b>: eval-only <code>proxy_uv_shading</code> metrics, not the same as RM proxy.</li>"
+                "<li><b>Real render</b>: reserved for future renderer/Blender re-render metrics.</li>"
+                "<li>This run is an A-track prior-gap validation on <code>ABO_locked_core</code> / <code>glossy_non_metal</code>, not a broad generalization claim.</li>"
+                "</ul></div>",
+                "</div></body></html>",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return overview_path
+
+
+def write_training_evidence_report(
+    *,
+    output_dir: Path,
+    validation_events: list[dict[str, Any]],
+    figure_path: Path | None,
+) -> dict[str, str]:
+    if not validation_events:
+        return {}
+    report_json_path = output_dir / "training_evidence_report.json"
+    report_html_path = output_dir / "training_evidence_report.html"
+    latest = validation_events[-1]
+    best_gain = max(
+        validation_events,
+        key=lambda item: maybe_float(item.get("uv_gain")),
+    )
+    payload = {
+        "metric_families": {
+            "rm_proxy": "View-projected roughness/metallic metrics computed from UV RM maps and view_uvs.",
+            "rgb_proxy": "Evaluation-only lightweight proxy_uv_shading metrics.",
+            "real_render": "Reserved for future renderer/Blender re-render metrics.",
+        },
+        "latest": latest,
+        "best_uv_gain": best_gain,
+        "events": validation_events,
+    }
+    save_json(report_json_path, payload)
+    rows = []
+    for item in validation_events[-32:]:
+        rows.append(
+            "<tr>"
+            f"<td>{item.get('label')}</td>"
+            f"<td>{format_metric(item.get('uv_gain'))}</td>"
+            f"<td>{format_metric(item.get('rm_proxy_view_mae_delta'))}</td>"
+            f"<td>{format_metric(item.get('rm_proxy_view_mse_delta'))}</td>"
+            f"<td>{format_metric(item.get('rm_proxy_view_psnr_delta'))}</td>"
+            f"<td>{format_metric(item.get('case_regression_rate'), 4)}</td>"
+            f"<td>{format_metric(item.get('selection_metric'))}</td>"
+            "</tr>"
+        )
+    report_html_path.write_text(
+        "\n".join(
+            [
+                "<!doctype html>",
+                "<html><head><meta charset='utf-8'><title>Material Refiner Training Evidence</title>",
+                "<style>body{font-family:Arial,sans-serif;background:#10151d;color:#edf2f7;margin:0;padding:24px}.wrap{max-width:1220px;margin:auto}.card{background:#18202b;border-radius:10px;padding:18px;margin:16px 0}img{max-width:100%;border-radius:8px;background:white}code{color:#b9e6ff}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #2d3748;padding:7px;text-align:left}th{color:#b9e6ff}</style>",
+                "</head><body><div class='wrap'>",
+                "<h1>Material Refiner Training Evidence</h1>",
+                "<div class='card'>",
+                "<div><b>RM proxy</b>: view-projected roughness/metallic target metrics from UV maps and view_uvs.</div>",
+                "<div><b>RGB proxy</b>: eval proxy_uv_shading. <b>Real render</b>: future renderer/Blender metrics.</div>",
+                f"<div>Latest UV gain: <code>{format_metric(latest.get('uv_gain'))}</code>; RM proxy PSNR delta: <code>{format_metric(latest.get('rm_proxy_view_psnr_delta'))}</code>; case regression: <code>{format_metric(latest.get('case_regression_rate'), 4)}</code></div>",
+                f"<div>Best UV gain event: <code>{best_gain.get('label')}</code> = <code>{format_metric(best_gain.get('uv_gain'))}</code></div>",
+                "</div>",
+                f"<div class='card'><img src='{figure_path.name}' alt='training evidence curves'></div>" if figure_path is not None else "",
+                "<div class='card'><table><thead><tr><th>event</th><th>UV gain</th><th>RM MAE delta</th><th>RM MSE delta</th><th>RM PSNR delta</th><th>case regression</th><th>selection</th></tr></thead><tbody>",
+                *rows,
+                "</tbody></table></div></div></body></html>",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "training_evidence_report": str(report_html_path.resolve()),
+        "training_evidence_json": str(report_json_path.resolve()),
+    }
+
+
 def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path) -> dict[str, str]:
     if not history:
         return {}
@@ -2671,25 +3124,26 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
         print(f"[visualization:warning] export_failed={type(exc).__name__}:{exc}")
         return {}
 
+    validation_events = load_validation_events(output_dir)
     epochs = [int(item.get("epoch", index + 1)) for index, item in enumerate(history)]
     train_total = [float((item.get("train") or {}).get("total", np.nan)) for item in history]
-    val_total = [
+    val_total_epoch = [
         float(((item.get("val") or {}).get("uv_mae") or {}).get("total", np.nan))
         for item in history
     ]
-    baseline_val_total = [
+    baseline_val_total_epoch = [
         float(((item.get("val") or {}).get("baseline_uv_mae") or {}).get("total", np.nan))
         for item in history
     ]
-    improvement_val_total = [
+    improvement_val_total_epoch = [
         float(((item.get("val") or {}).get("improvement_uv_mae") or {}).get("total", np.nan))
         for item in history
     ]
-    val_roughness = [
+    val_roughness_epoch = [
         float(((item.get("val") or {}).get("uv_mae") or {}).get("roughness", np.nan))
         for item in history
     ]
-    val_metallic = [
+    val_metallic_epoch = [
         float(((item.get("val") or {}).get("uv_mae") or {}).get("metallic", np.nan))
         for item in history
     ]
@@ -2697,29 +3151,49 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
         float((item.get("train") or {}).get("samples_per_second", np.nan))
         for item in history
     ]
+    use_event_validation = bool(validation_events) and np.isnan(val_total_epoch).all()
+    if use_event_validation:
+        val_x = list(range(1, len(validation_events) + 1))
+        val_x_labels = [str(item.get("label")) for item in validation_events]
+        val_total = [maybe_float(item.get("uv_total")) for item in validation_events]
+        baseline_val_total = [maybe_float(item.get("input_prior_total")) for item in validation_events]
+        improvement_val_total = [maybe_float(item.get("uv_gain")) for item in validation_events]
+        val_roughness = [maybe_float(item.get("uv_roughness")) for item in validation_events]
+        val_metallic = [maybe_float(item.get("uv_metallic")) for item in validation_events]
+    else:
+        val_x = epochs
+        val_x_labels = [str(epoch) for epoch in epochs]
+        val_total = val_total_epoch
+        baseline_val_total = baseline_val_total_epoch
+        improvement_val_total = improvement_val_total_epoch
+        val_roughness = val_roughness_epoch
+        val_metallic = val_metallic_epoch
 
     figure_path = output_dir / "training_curves.png"
     html_path = output_dir / "training_summary.html"
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
     fig.suptitle("Material Refiner Training Curves")
-    axes[0, 0].plot(epochs, train_total, marker="o", label="train total")
-    axes[0, 0].plot(epochs, val_total, marker="o", label="val uv total")
+    if use_event_validation:
+        axes[0, 0].plot(val_x, val_total, marker="o", label="val uv total")
+    else:
+        axes[0, 0].plot(epochs, train_total, marker="o", label="train total")
+        axes[0, 0].plot(val_x, val_total, marker="o", label="val uv total")
     if not np.isnan(baseline_val_total).all():
-        axes[0, 0].plot(epochs, baseline_val_total, marker="o", label="input prior")
-    axes[0, 0].set_title("Total Loss / UV MAE")
-    axes[0, 0].set_xlabel("epoch")
+        axes[0, 0].plot(val_x, baseline_val_total, marker="o", label="input prior")
+    axes[0, 0].set_title("Validation Event UV MAE" if use_event_validation else "Total Loss / UV MAE")
+    axes[0, 0].set_xlabel("validation event" if use_event_validation else "epoch")
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.25)
 
-    axes[0, 1].plot(epochs, val_roughness, marker="o", label="roughness")
-    axes[0, 1].plot(epochs, val_metallic, marker="o", label="metallic")
+    axes[0, 1].plot(val_x, val_roughness, marker="o", label="roughness")
+    axes[0, 1].plot(val_x, val_metallic, marker="o", label="metallic")
     axes[0, 1].set_title("Validation UV MAE By Channel")
-    axes[0, 1].set_xlabel("epoch")
+    axes[0, 1].set_xlabel("validation event" if use_event_validation else "epoch")
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.25)
 
     if not np.isnan(improvement_val_total).all():
-        axes[1, 0].plot(epochs, improvement_val_total, marker="o")
+        axes[1, 0].plot(val_x, improvement_val_total, marker="o")
         axes[1, 0].axhline(0.0, color="black", linewidth=1, alpha=0.35)
         axes[1, 0].set_title("Refined Gain Over Input Prior")
         axes[1, 0].set_ylabel("baseline MAE - refined MAE")
@@ -2727,10 +3201,11 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
         axes[1, 0].plot(epochs, samples_per_second, marker="o")
         axes[1, 0].set_title("Training Throughput")
         axes[1, 0].set_ylabel("samples/sec")
-    axes[1, 0].set_xlabel("epoch")
+    axes[1, 0].set_xlabel("validation event" if not np.isnan(improvement_val_total).all() and use_event_validation else "epoch")
     axes[1, 0].grid(alpha=0.25)
 
-    best_index = int(np.nanargmin(val_total)) if not np.isnan(val_total).all() else len(epochs) - 1
+    best_index = int(np.nanargmin(val_total)) if not np.isnan(val_total).all() else len(val_total) - 1
+    latest_validation = summarize_latest_validation(history, validation_events)
     axes[1, 1].axis("off")
     axes[1, 1].text(
         0.02,
@@ -2738,12 +3213,18 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
         "\n".join(
             [
                 f"epochs: {len(history)}",
-                f"best epoch: {epochs[best_index]}",
+                (
+                    f"best validation event: {val_x_labels[best_index]}"
+                    if use_event_validation
+                    else f"best epoch: {epochs[best_index]}"
+                ),
                 f"best val total: {format_metric(val_total[best_index])}",
                 f"best baseline total: {format_metric(baseline_val_total[best_index]) if not np.isnan(baseline_val_total).all() else 'n/a'}",
                 f"best improvement: {format_metric(improvement_val_total[best_index]) if not np.isnan(improvement_val_total).all() else 'n/a'}",
                 f"last train total: {format_metric(train_total[-1])}",
-                f"last val total: {format_metric(val_total[-1])}",
+                f"last val total: {format_metric(latest_validation.get('val_total'))}",
+                f"latest validation source: {latest_validation.get('source')}",
+                f"latest validation label: {latest_validation.get('label')}",
             ]
         ),
         va="top",
@@ -2752,6 +3233,44 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
     fig.tight_layout()
     fig.savefig(figure_path, dpi=160)
     plt.close(fig)
+
+    evidence_figure_path: Path | None = None
+    if validation_events:
+        evidence_figure_path = output_dir / "training_evidence_curves.png"
+        event_x = list(range(1, len(validation_events) + 1))
+        event_labels = [str(item.get("label")) for item in validation_events]
+        uv_gain = [maybe_float(item.get("uv_gain")) for item in validation_events]
+        rm_mae_delta = [maybe_float(item.get("rm_proxy_view_mae_delta")) for item in validation_events]
+        rm_mse_delta = [maybe_float(item.get("rm_proxy_view_mse_delta")) for item in validation_events]
+        rm_psnr_delta = [maybe_float(item.get("rm_proxy_view_psnr_delta")) for item in validation_events]
+        case_regression = [maybe_float(item.get("case_regression_rate")) for item in validation_events]
+        fig2, axes2 = plt.subplots(2, 2, figsize=(13, 8))
+        fig2.suptitle("Validation Evidence: Baseline vs Refined")
+        axes2[0, 0].plot(event_x, uv_gain, marker="o")
+        axes2[0, 0].axhline(0.0, color="black", linewidth=1, alpha=0.35)
+        axes2[0, 0].set_title("UV Gain (input prior MAE - refined MAE)")
+        axes2[0, 0].grid(alpha=0.25)
+        axes2[0, 1].plot(event_x, rm_psnr_delta, marker="o", label="PSNR delta")
+        axes2[0, 1].axhline(0.0, color="black", linewidth=1, alpha=0.35)
+        axes2[0, 1].set_title("RM Proxy View PSNR Delta")
+        axes2[0, 1].grid(alpha=0.25)
+        axes2[1, 0].plot(event_x, rm_mae_delta, marker="o", label="MAE delta")
+        axes2[1, 0].plot(event_x, rm_mse_delta, marker="o", label="MSE delta")
+        axes2[1, 0].axhline(0.0, color="black", linewidth=1, alpha=0.35)
+        axes2[1, 0].set_title("RM Proxy Positive Delta Means Refined Is Better")
+        axes2[1, 0].legend()
+        axes2[1, 0].grid(alpha=0.25)
+        axes2[1, 1].plot(event_x, case_regression, marker="o")
+        axes2[1, 1].set_title("Case-Level Regression Rate")
+        axes2[1, 1].grid(alpha=0.25)
+        for axis in axes2.flat:
+            axis.set_xlabel("validation event")
+            if len(event_labels) <= 12:
+                axis.set_xticks(event_x)
+                axis.set_xticklabels(event_labels, rotation=30, ha="right")
+        fig2.tight_layout()
+        fig2.savefig(evidence_figure_path, dpi=160)
+        plt.close(fig2)
 
     latest = history[-1]
     html_path.write_text(
@@ -2767,17 +3286,30 @@ def save_training_visualizations(history: list[dict[str, Any]], output_dir: Path
                 f"<div>Last epoch: <code>{latest.get('epoch')}</code></div>",
                 f"<div>Last optimizer step: <code>{latest.get('optimizer_step')}</code></div>",
                 f"<div>Last train total: <code>{format_metric((latest.get('train') or {}).get('total'))}</code></div>",
-                f"<div>Last val total: <code>{format_metric(((latest.get('val') or {}).get('uv_mae') or {}).get('total'))}</code></div>",
-                f"<div>Last input prior total: <code>{format_metric(((latest.get('val') or {}).get('input_prior_uv_mae') or (latest.get('val') or {}).get('baseline_uv_mae') or {}).get('total'))}</code></div>",
-                f"<div>Last improvement: <code>{format_metric(((latest.get('val') or {}).get('improvement_uv_mae') or {}).get('total'))}</code></div>",
+                f"<div>Latest validation source: <code>{html.escape(str(latest_validation.get('source')))}</code></div>",
+                f"<div>Latest validation label: <code>{html.escape(str(latest_validation.get('label')))}</code></div>",
+                f"<div>Last val total: <code>{format_metric(latest_validation.get('val_total'))}</code></div>",
+                f"<div>Last input prior total: <code>{format_metric(latest_validation.get('input_prior_total'))}</code></div>",
+                f"<div>Last improvement: <code>{format_metric(latest_validation.get('improvement_total'))}</code></div>",
                 "</div></div></body></html>",
             ]
         ),
         encoding="utf-8",
     )
+    evidence_paths = write_training_evidence_report(
+        output_dir=output_dir,
+        validation_events=validation_events,
+        figure_path=evidence_figure_path,
+    )
     return {
         "training_curves": str(figure_path.resolve()),
         "training_summary": str(html_path.resolve()),
+        **(
+            {"training_evidence_curves": str(evidence_figure_path.resolve())}
+            if evidence_figure_path is not None
+            else {}
+        ),
+        **evidence_paths,
     }
 
 
@@ -3020,6 +3552,35 @@ def first_preview_identity(*values: Any) -> str:
     return "unknown"
 
 
+def preview_effect_bucket(gain_total: float) -> str:
+    if gain_total > 0.02:
+        return "positive_gain"
+    if gain_total < -0.02:
+        return "regression"
+    return "near_zero"
+
+
+def should_select_validation_preview(
+    *,
+    mode: str,
+    selected_count: int,
+    max_count: int,
+    prior_variant_type: str,
+    effect_bucket: str,
+    seen_variants: set[str],
+    seen_effects: set[str],
+) -> bool:
+    if selected_count >= max_count:
+        return False
+    if mode == "first":
+        return True
+    if selected_count < max(1, min(max_count, 2)):
+        return True
+    if mode == "balanced":
+        return prior_variant_type not in seen_variants
+    return effect_bucket not in seen_effects or prior_variant_type not in seen_variants
+
+
 def save_preview_contact_sheet(
     output_dir: Path,
     *,
@@ -3085,6 +3646,7 @@ def save_validation_preview(
     prior_variant_type: str = "unknown",
     prior_quality_bin: str = "unknown",
     training_role: str = "unknown",
+    view_rm_mae_delta: float | None = None,
     preview_slot: int = 0,
     source_name: str = "unknown_source",
     material_family: str = "unknown_material",
@@ -3163,7 +3725,7 @@ def save_validation_preview(
         (12, 38),
         (
             f"Input Prior {baseline_total:.4f} | Pred {refined_total:.4f} | "
-            f"gain {improvement:+.4f} | {prior_label} | "
+            f"UV gain {improvement:+.4f} | view RM delta {format_metric(view_rm_mae_delta, 4)} | {prior_label} | "
             f"variant={prior_variant_type} | quality={prior_quality_bin} | role={training_role}"
         ),
         font=detail_font,
@@ -3209,6 +3771,7 @@ def save_validation_preview(
 
 def build_preview_integrity_report(preview_items: list[dict[str, Any]]) -> dict[str, Any]:
     required_metadata = [
+        "case_id",
         "object_id",
         "pair_id",
         "target_bundle_id",
@@ -3293,41 +3856,69 @@ def update_object_improvement_store(
     bucket["metallic"] += metallic_improvement
 
 
-def finalize_object_improvement_metrics(store: dict[str, dict[str, float]]) -> dict[str, Any]:
-    object_values = []
-    for object_id, bucket in sorted(store.items()):
+def make_material_case_key(
+    *,
+    object_id: str,
+    pair_id: str,
+    prior_variant_id: str,
+    prior_variant_type: str,
+) -> str:
+    identity = pair_id if pair_id and pair_id != "unknown" else prior_variant_id
+    if not identity or identity == "unknown":
+        identity = "no_pair_or_variant_id"
+    return f"{object_id}|{identity}|{prior_variant_type or 'unknown'}"
+
+
+def finalize_improvement_level_metrics(
+    store: dict[str, dict[str, float]],
+    *,
+    level_name: str,
+) -> dict[str, Any]:
+    values = []
+    id_key = f"{level_name}_id"
+    for item_id, bucket in sorted(store.items()):
         count = max(float(bucket.get("count", 0.0)), 1.0)
-        object_values.append(
+        values.append(
             {
-                "object_id": object_id,
+                id_key: item_id,
                 "count": int(bucket.get("count", 0.0)),
                 "avg_improvement_total": float(bucket.get("total", 0.0) / count),
                 "avg_improvement_roughness": float(bucket.get("roughness", 0.0) / count),
                 "avg_improvement_metallic": float(bucket.get("metallic", 0.0) / count),
             }
         )
-    object_count = max(len(object_values), 1)
-    improved = sum(1 for item in object_values if item["avg_improvement_total"] > 1e-6)
-    regressed = sum(1 for item in object_values if item["avg_improvement_total"] < -1e-6)
-    unchanged = len(object_values) - improved - regressed
+    level_count = max(len(values), 1)
+    improved = sum(1 for item in values if item["avg_improvement_total"] > 1e-6)
+    regressed = sum(1 for item in values if item["avg_improvement_total"] < -1e-6)
+    unchanged = len(values) - improved - regressed
+    plural = f"{level_name}s"
     return {
-        "object_count": len(object_values),
+        f"{level_name}_count": len(values),
         "avg_improvement_total": (
-            sum(item["avg_improvement_total"] for item in object_values) / object_count
+            sum(item["avg_improvement_total"] for item in values) / level_count
         ),
         "avg_improvement_roughness": (
-            sum(item["avg_improvement_roughness"] for item in object_values) / object_count
+            sum(item["avg_improvement_roughness"] for item in values) / level_count
         ),
         "avg_improvement_metallic": (
-            sum(item["avg_improvement_metallic"] for item in object_values) / object_count
+            sum(item["avg_improvement_metallic"] for item in values) / level_count
         ),
-        "improved_objects": improved,
-        "regressed_objects": regressed,
-        "unchanged_objects": unchanged,
-        "improvement_rate": improved / object_count,
-        "regression_rate": regressed / object_count,
-        "unchanged_rate": unchanged / object_count,
+        f"improved_{plural}": improved,
+        f"regressed_{plural}": regressed,
+        f"unchanged_{plural}": unchanged,
+        "improvement_rate": improved / level_count,
+        "regression_rate": regressed / level_count,
+        "unchanged_rate": unchanged / level_count,
+        "entries": values,
     }
+
+
+def finalize_object_improvement_metrics(store: dict[str, dict[str, float]]) -> dict[str, Any]:
+    return finalize_improvement_level_metrics(store, level_name="object")
+
+
+def finalize_case_improvement_metrics(store: dict[str, dict[str, float]]) -> dict[str, Any]:
+    return finalize_improvement_level_metrics(store, level_name="case")
 
 
 def finalize_group_metrics(store: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -3517,6 +4108,7 @@ def update_render_proxy_metrics(
     if batch.get("view_uvs") is None:
         return
     view_mask = batch["view_masks"].clamp(0.0, 1.0)
+    view_mask = view_mask * view_uv_valid_mask(batch["view_uvs"]).to(view_mask.device)
     supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
     view_mask = view_mask * supervision_mask.view(-1, 1, 1, 1, 1)
     denom = float(view_mask.sum().detach().cpu().item()) * float(refined.shape[1])
@@ -3561,6 +4153,29 @@ def update_render_proxy_metrics(
     store["denom"] += denom
     store["available_batches"] += 1.0
     store["samples"] += float(refined.shape[0])
+
+
+def per_sample_view_rm_mae_delta(
+    *,
+    batch: dict[str, torch.Tensor],
+    baseline: torch.Tensor,
+    refined: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor | None:
+    if batch.get("view_uvs") is None:
+        return None
+    view_mask = batch["view_masks"].clamp(0.0, 1.0)
+    view_mask = view_mask * view_uv_valid_mask(batch["view_uvs"]).to(view_mask.device)
+    supervision_mask = batch["has_effective_view_supervision"].to(view_mask.device)
+    view_mask = view_mask * supervision_mask.view(-1, 1, 1, 1, 1)
+    denom = view_mask.flatten(1).sum(dim=1).clamp_min(1.0) * float(refined.shape[1])
+    target_views = sample_uv_maps_to_view(target, batch["view_uvs"])
+    baseline_views = sample_uv_maps_to_view(baseline, batch["view_uvs"])
+    refined_views = sample_uv_maps_to_view(refined, batch["view_uvs"])
+    baseline_mae = ((baseline_views - target_views).abs() * view_mask).flatten(1).sum(dim=1) / denom
+    refined_mae = ((refined_views - target_views).abs() * view_mask).flatten(1).sum(dim=1) / denom
+    has_support = view_mask.flatten(1).sum(dim=1) > 0.0
+    return torch.where(has_support, baseline_mae - refined_mae, torch.full_like(baseline_mae, float("nan")))
 
 
 def finalize_residual_gate_diagnostics(store: dict[str, float]) -> dict[str, Any]:
@@ -3767,9 +4382,12 @@ def evaluate(
     baseline_group_store: dict[str, dict[str, float]] = {}
     improvement_group_store: dict[str, dict[str, float]] = {}
     object_improvement_store: dict[str, dict[str, float]] = {}
+    case_improvement_store: dict[str, dict[str, float]] = {}
     steps = 0
     preview_paths: list[Path] = []
     preview_items: list[dict[str, Any]] = []
+    preview_seen_variants: set[str] = set()
+    preview_seen_effects: set[str] = set()
     render_proxy_enabled = should_compute_render_proxy_validation(args, validation_label)
     render_proxy_store: dict[str, float] = defaultdict(float)
     residual_gate_store: dict[str, float] = defaultdict(float)
@@ -3832,6 +4450,16 @@ def evaluate(
             improvement_roughness = baseline_roughness_mae - roughness_mae
             improvement_metallic = baseline_metallic_mae - metallic_mae
             improvement_total = baseline_total_mae - total_mae
+            view_rm_delta = (
+                per_sample_view_rm_mae_delta(
+                    batch=batch,
+                    baseline=baseline,
+                    refined=refined,
+                    target=target,
+                )
+                if int(args.val_preview_samples) > 0
+                else None
+            )
 
             uv_mae["roughness"] += float(roughness_mae.sum().item())
             uv_mae["metallic"] += float(metallic_mae.sum().item())
@@ -3886,6 +4514,19 @@ def evaluate(
                     roughness_improvement=improvement_metric_kwargs["roughness_mae"],
                     metallic_improvement=improvement_metric_kwargs["metallic_mae"],
                 )
+                case_key = make_material_case_key(
+                    object_id=object_id,
+                    pair_id=pair_id,
+                    prior_variant_id=prior_variant_id,
+                    prior_variant_type=prior_variant_type,
+                )
+                update_object_improvement_store(
+                    case_improvement_store,
+                    object_id=case_key,
+                    total_improvement=improvement_metric_kwargs["total_mae"],
+                    roughness_improvement=improvement_metric_kwargs["roughness_mae"],
+                    metallic_improvement=improvement_metric_kwargs["metallic_mae"],
+                )
                 update_group_metric_store(group_store, key=f"generator/{generator_id}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"source/{source_name}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"prior/{prior_name}", **metric_kwargs)
@@ -3918,7 +4559,20 @@ def evaluate(
                     margin=float(args.residual_safety_margin),
                 )
 
-                if len(preview_paths) < args.val_preview_samples:
+                view_rm_mae_delta_value = None
+                if view_rm_delta is not None:
+                    value = float(view_rm_delta[item_index].detach().cpu().item())
+                    view_rm_mae_delta_value = None if math.isnan(value) else value
+                effect_bucket = preview_effect_bucket(improvement_metric_kwargs["total_mae"])
+                if should_select_validation_preview(
+                    mode=str(getattr(args, "val_preview_selection", "effect_showcase")),
+                    selected_count=len(preview_paths),
+                    max_count=int(args.val_preview_samples),
+                    prior_variant_type=prior_variant_type,
+                    effect_bucket=effect_bucket,
+                    seen_variants=preview_seen_variants,
+                    seen_effects=preview_seen_effects,
+                ):
                     preview_slot = len(preview_paths)
                     preview_path = save_validation_preview(
                         output_dir,
@@ -3944,17 +4598,21 @@ def evaluate(
                         prior_variant_type=prior_variant_type,
                         prior_quality_bin=prior_quality_bin,
                         training_role=training_role,
+                        view_rm_mae_delta=view_rm_mae_delta_value,
                         preview_slot=preview_slot,
                         source_name=source_name,
                         material_family=material_family,
                         prior_label=prior_name,
                     )
                     preview_paths.append(preview_path)
+                    preview_seen_variants.add(prior_variant_type)
+                    preview_seen_effects.add(effect_bucket)
                     baseline_total = float(baseline_total_mae[item_index].item())
                     refined_total = float(total_mae[item_index].item())
                     preview_items.append(
                         {
                             "path": str(preview_path.resolve()),
+                            "case_id": case_key,
                             "object_id": object_id,
                             "pair_id": pair_id,
                             "target_bundle_id": target_bundle_id,
@@ -3967,11 +4625,13 @@ def evaluate(
                             "prior_quality_bin": prior_quality_bin,
                             "training_role": training_role,
                             "preview_slot": preview_slot,
+                            "effect_bucket": effect_bucket,
                             "baseline_total_mae": baseline_total,
                             "input_prior_total_mae": baseline_total,
                             "refined_total_mae": refined_total,
                             "gain_total": baseline_total - refined_total,
                             "improvement_total": baseline_total - refined_total,
+                            "view_rm_mae_delta": view_rm_mae_delta_value,
                         }
                     )
 
@@ -4009,6 +4669,7 @@ def evaluate(
         "baseline_group_metrics": finalize_group_metrics(baseline_group_store),
         "improvement_group_metrics": finalize_group_metrics(improvement_group_store),
         "object_level": finalize_object_improvement_metrics(object_improvement_store),
+        "case_level": finalize_case_improvement_metrics(case_improvement_store),
         "batches": int(steps),
         "max_validation_batches": int(args.max_validation_batches),
         "effective_view_supervision_samples": int(uv_mae.get("effective_view_supervision_samples", 0.0)),
@@ -4047,34 +4708,62 @@ def save_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
 def compute_validation_selection_metric(
     val_payload: dict[str, Any],
     args: argparse.Namespace,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, Any]]:
     uv_total = float((val_payload.get("uv_mae") or {}).get("total", 0.0) or 0.0)
+    input_prior_total = float(
+        (
+            val_payload.get("input_prior_uv_mae")
+            or val_payload.get("baseline_uv_mae")
+            or {}
+        ).get("total", 0.0)
+        or 0.0
+    )
+    uv_gain = float((val_payload.get("improvement_uv_mae") or {}).get("total", input_prior_total - uv_total) or 0.0)
     if args.validation_selection_metric == "uv_total":
-        return uv_total, {"uv_total": uv_total, "selection_metric": uv_total}
+        return uv_total, {
+            "uv_total": uv_total,
+            "input_prior_total": input_prior_total,
+            "uv_gain": uv_gain,
+            "selection_metric": uv_total,
+            "lower_is_better": True,
+        }
 
     render_proxy = val_payload.get("render_proxy_validation") or {}
     residual_diag = val_payload.get("residual_gate_diagnostics") or {}
     view_penalty = 0.0
+    mse_penalty = 0.0
     psnr_penalty = 0.0
-    if bool(render_proxy.get("available")):
+    render_guard_available = bool(render_proxy.get("available"))
+    if render_guard_available:
         view_penalty = max(0.0, -float(render_proxy.get("view_rm_mae_delta", 0.0) or 0.0))
+        mse_penalty = max(0.0, -float(render_proxy.get("proxy_rm_mse_delta", 0.0) or 0.0))
         psnr_penalty = max(0.0, -float(render_proxy.get("proxy_rm_psnr_delta", 0.0) or 0.0))
     regression_penalty = max(
         0.0,
         float(residual_diag.get("regression_rate", 0.0) or 0.0),
     )
-    selection_metric = (
-        uv_total
-        + float(args.selection_view_rm_penalty) * view_penalty
+    penalty_total = (
+        float(args.selection_view_rm_penalty) * view_penalty
+        + float(getattr(args, "selection_mse_penalty", 0.5)) * mse_penalty
         + float(args.selection_psnr_penalty) * psnr_penalty
         + float(args.selection_residual_regression_penalty) * regression_penalty
     )
+    if args.validation_selection_metric == "gain_render_guarded":
+        selection_metric = -uv_gain + penalty_total
+    else:
+        selection_metric = uv_total + penalty_total
     return selection_metric, {
         "uv_total": uv_total,
+        "input_prior_total": input_prior_total,
+        "uv_gain": uv_gain,
         "view_penalty": view_penalty,
+        "mse_penalty": mse_penalty,
         "psnr_penalty": psnr_penalty,
         "regression_penalty": regression_penalty,
+        "penalty_total": penalty_total,
+        "render_guard_available": render_guard_available,
         "selection_metric": selection_metric,
+        "lower_is_better": True,
     }
 
 
@@ -4333,6 +5022,10 @@ def run_validation_cycle(
         "mode": str(args.validation_selection_metric),
         **selection_components,
     }
+    val_payload["validation_label"] = validation_label
+    val_payload["epoch"] = int(epoch)
+    val_payload["optimizer_step"] = int(optimizer_step)
+    val_payload["global_batch_step"] = int(global_batch_step)
     save_json(output_dir / "validation" / f"{validation_label}.json", val_payload)
 
     if scheduler is not None and optimizer_step > args.warmup_steps:
@@ -4389,13 +5082,17 @@ def run_validation_cycle(
                         f"Prior -> Pred MAE "
                         f"{item.get('input_prior_total_mae', item.get('baseline_total_mae', 0.0)):.4f}"
                         f" -> {item.get('refined_total_mae', 0.0):.4f} "
-                        f"(gain={item.get('gain_total', item.get('improvement_total', 0.0)):+.4f})"
+                        f"(UV gain={item.get('gain_total', item.get('improvement_total', 0.0)):+.4f}, "
+                        f"view RM delta={format_metric(item.get('view_rm_mae_delta'), 4)}, "
+                        f"{item.get('effect_bucket', 'unknown')})"
                     ),
                 )
                 for item in preview_items[: args.wandb_val_preview_max]
             ]
         improvement_payload = val_payload.get("improvement_uv_mae") or {}
         object_level_payload = val_payload.get("object_level") or {}
+        case_level_payload = val_payload.get("case_level") or {}
+        selection_payload = val_payload.get("selection_metric") or {}
         special_metrics = val_payload.get("special_metrics") or {}
         residual_diag = val_payload.get("residual_gate_diagnostics") or {}
         log_payload = {
@@ -4410,20 +5107,38 @@ def run_validation_cycle(
             "val/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
             "val/refined_total_mae": val_payload["uv_mae"]["total"],
             "val/gain_total": improvement_payload.get("total"),
+            "val/selection/gain_render_guarded": (
+                selection_payload.get("selection_metric")
+                if selection_payload.get("mode") == "gain_render_guarded"
+                else None
+            ),
+            "val/selection/render_guard_available": selection_payload.get("render_guard_available"),
             "val/improvement_uv_total_mae": improvement_payload.get("total"),
             "val/improvement_rate": improvement_payload.get("improvement_rate"),
             "val/regression_rate": improvement_payload.get("regression_rate"),
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
             "val/sample_level/avg_improvement_total": improvement_payload.get("total"),
             "val/object_level/avg_improvement_total": object_level_payload.get("avg_improvement_total"),
+            "val/object_level/regression_rate": object_level_payload.get("regression_rate"),
+            "val/case_level/avg_improvement_total": case_level_payload.get("avg_improvement_total"),
+            "val/case_level/regression_rate": case_level_payload.get("regression_rate"),
             "eval/rm/uv_total_mae": val_payload["uv_mae"]["total"],
             "eval/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
             "eval/gain_total": improvement_payload.get("total"),
+            "eval/selection/gain_render_guarded": (
+                selection_payload.get("selection_metric")
+                if selection_payload.get("mode") == "gain_render_guarded"
+                else None
+            ),
+            "eval/selection/render_guard_available": selection_payload.get("render_guard_available"),
             "eval/improvement_rate": improvement_payload.get("improvement_rate"),
             "eval/regression_rate": improvement_payload.get("regression_rate"),
             "eval/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
             "eval/sample_level/avg_improvement_total": improvement_payload.get("total"),
             "eval/object_level/avg_improvement_total": object_level_payload.get("avg_improvement_total"),
+            "eval/object_level/regression_rate": object_level_payload.get("regression_rate"),
+            "eval/case_level/avg_improvement_total": case_level_payload.get("avg_improvement_total"),
+            "eval/case_level/regression_rate": case_level_payload.get("regression_rate"),
         }
         if val_payload.get("loss"):
             log_payload["val/loss/total"] = val_payload["loss"].get("total")
@@ -4439,14 +5154,35 @@ def run_validation_cycle(
             improvement_metrics = improvement_group_metrics.get(group_key) or {}
             log_payload[f"val/input_prior_total_mae/{variant}"] = baseline_metrics.get("total_mae")
             log_payload[f"val/improvement/{variant}"] = improvement_metrics.get("total_mae")
+            log_payload[f"val/by_variant/{variant}/uv_total_mae"] = metrics.get("total_mae")
+            log_payload[f"val/by_variant/{variant}/input_prior_total_mae"] = baseline_metrics.get("total_mae")
+            log_payload[f"val/by_variant/{variant}/gain_total"] = improvement_metrics.get("total_mae")
         render_proxy = val_payload.get("render_proxy_validation") or {}
         if bool(render_proxy.get("available")):
             log_payload["val/rm/view_total_mae"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["val/rm_proxy/view_mae/baseline"] = render_proxy.get("baseline_view_rm_mae")
+            log_payload["val/rm_proxy/view_mae/refined"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["val/rm_proxy/view_mae/delta"] = render_proxy.get("view_rm_mae_delta")
+            log_payload["val/rm_proxy/view_mse/baseline"] = render_proxy.get("baseline_proxy_rm_mse")
+            log_payload["val/rm_proxy/view_mse/refined"] = render_proxy.get("refined_proxy_rm_mse")
+            log_payload["val/rm_proxy/view_mse/delta"] = render_proxy.get("proxy_rm_mse_delta")
+            log_payload["val/rm_proxy/view_psnr/baseline"] = render_proxy.get("baseline_proxy_rm_psnr")
+            log_payload["val/rm_proxy/view_psnr/refined"] = render_proxy.get("refined_proxy_rm_psnr")
+            log_payload["val/rm_proxy/view_psnr/delta"] = render_proxy.get("proxy_rm_psnr_delta")
             log_payload["val/main/mse"] = render_proxy.get("refined_proxy_rm_mse")
             log_payload["val/main/psnr"] = render_proxy.get("refined_proxy_rm_psnr")
             log_payload["val/main/ssim"] = render_proxy.get("refined_proxy_rm_ssim")
             log_payload["val/main/lpips"] = render_proxy.get("refined_proxy_rm_lpips")
             log_payload["eval/rm/view_total_mae"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["eval/rm_proxy/view_mae/baseline"] = render_proxy.get("baseline_view_rm_mae")
+            log_payload["eval/rm_proxy/view_mae/refined"] = render_proxy.get("refined_view_rm_mae")
+            log_payload["eval/rm_proxy/view_mae/delta"] = render_proxy.get("view_rm_mae_delta")
+            log_payload["eval/rm_proxy/view_mse/baseline"] = render_proxy.get("baseline_proxy_rm_mse")
+            log_payload["eval/rm_proxy/view_mse/refined"] = render_proxy.get("refined_proxy_rm_mse")
+            log_payload["eval/rm_proxy/view_mse/delta"] = render_proxy.get("proxy_rm_mse_delta")
+            log_payload["eval/rm_proxy/view_psnr/baseline"] = render_proxy.get("baseline_proxy_rm_psnr")
+            log_payload["eval/rm_proxy/view_psnr/refined"] = render_proxy.get("refined_proxy_rm_psnr")
+            log_payload["eval/rm_proxy/view_psnr/delta"] = render_proxy.get("proxy_rm_psnr_delta")
             log_payload["eval/main/mse"] = render_proxy.get("refined_proxy_rm_mse")
             log_payload["eval/main/psnr"] = render_proxy.get("refined_proxy_rm_psnr")
             log_payload["eval/main/ssim"] = render_proxy.get("refined_proxy_rm_ssim")
@@ -4478,11 +5214,7 @@ def run_validation_cycle(
             run.log(sanitized_logs, step=optimizer_step)
         if preview_images:
             preview_log_payload: dict[str, Any] = {}
-            grouped_preview_images: dict[str, list[Any]] = defaultdict(list)
-            for item, image in zip(preview_items[: args.wandb_val_preview_max], preview_images):
-                grouped_preview_images[safe_wandb_key(item.get("source_name", "unknown"))].append(image)
-            for source_key, images in grouped_preview_images.items():
-                preview_log_payload[f"val_preview/{source_key}/comparison_panels"] = images
+            preview_log_payload[f"val_preview/{safe_wandb_key(validation_label)}/cases"] = preview_images
             if (
                 wandb is not None
                 and preview_contact_sheet is not None
@@ -5160,6 +5892,10 @@ def main() -> None:
             stale_epochs = 0 if epoch_validation_improved else stale_epochs + 1
             epoch_improved = epoch_validation_improved
 
+        epoch_payload["latest_validation"] = summarize_latest_validation(
+            history + [epoch_payload],
+            load_validation_events(output_dir),
+        )
         history.append(epoch_payload)
         save_json(history_path, history)
         visualization_paths = (
@@ -5281,6 +6017,15 @@ def main() -> None:
             if args.export_training_curves
             else {}
         )
+        validation_events = load_validation_events(output_dir)
+        training_overview_path = write_training_overview(
+            output_dir=output_dir,
+            args=args,
+            history=history,
+            train_state=train_state,
+            validation_events=validation_events,
+            visualization_paths=final_visualization_paths,
+        )
         final_artifacts = [
             history_path,
             state_path,
@@ -5288,9 +6033,20 @@ def main() -> None:
         ]
         for path_value in final_visualization_paths.values():
             final_artifacts.append(Path(path_value))
+        if training_overview_path is not None:
+            final_artifacts.append(training_overview_path)
         best_path = output_dir / "best.pt"
         if best_path.exists():
             final_artifacts.append(best_path)
+        if wandb is not None and training_overview_path is not None and training_overview_path.exists():
+            run.log(
+                {
+                    "overview/training": wandb.Html(
+                        training_overview_path.read_text(encoding="utf-8")
+                    )
+                },
+                step=optimizer_step,
+            )
         if args.wandb_log_artifacts and args.wandb_artifact_policy in {"all", "final", "best_and_final"}:
             log_path_artifact(
                 run,
@@ -5299,10 +6055,24 @@ def main() -> None:
                 paths=final_artifacts,
             )
         run.finish()
+    final_visualization_paths = (
+        save_training_visualizations(history, output_dir)
+        if args.export_training_curves
+        else {}
+    )
+    training_overview_path = write_training_overview(
+        output_dir=output_dir,
+        args=args,
+        history=history,
+        train_state=train_state,
+        validation_events=load_validation_events(output_dir),
+        visualization_paths=final_visualization_paths,
+    )
     print(
         "[final] "
         f"output_dir={output_dir} latest={output_dir / 'latest.pt'} "
-        f"best={output_dir / 'best.pt'} history={history_path}"
+        f"best={output_dir / 'best.pt'} history={history_path} "
+        f"overview={training_overview_path if training_overview_path is not None else 'n/a'}"
     )
 
 

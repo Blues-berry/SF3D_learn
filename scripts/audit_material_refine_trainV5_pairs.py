@@ -72,7 +72,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--expected-targets", type=int, default=322)
     parser.add_argument("--expected-pairs", type=int, default=1610)
-    parser.add_argument("--write-report", type=Path, default=None)
+    parser.add_argument(
+        "--write-report",
+        type=Path,
+        default=None,
+        help="Write the JSON summary to this explicit path. Does not update the canonical Markdown report.",
+    )
+    parser.add_argument(
+        "--update-report",
+        action="store_true",
+        help="Update trainV5_pair_audit_report.json and .md under --input-dir.",
+    )
     return parser.parse_args()
 
 
@@ -179,23 +189,28 @@ def main() -> None:
         "unresolved_cases": unresolved_cases,
         "forbidden_train_files": forbidden_train_files,
     }
-    report_path = args.write_report or (input_dir / "trainV5_pair_audit_report.json")
-    write_json(report_path, summary)
-    md_lines = [
-        "# TrainV5 Pair Audit Report",
-        "",
-        f"- generated_at_utc: `{summary['generated_at_utc']}`",
-        f"- audit_pass: `{str(summary['audit_pass']).lower()}`",
-        f"- target_bundles: `{summary['target_bundles']}`",
-        f"- prior_variants: `{summary['prior_variants']}`",
-        f"- training_pairs: `{summary['training_pairs']}`",
-        f"- identity_controls: `{summary['identity_controls']}`",
-        f"- split: `{json.dumps(summary['split'], ensure_ascii=False)}`",
-        f"- prior_variant_type: `{json.dumps(summary['prior_variant_type'], ensure_ascii=False)}`",
-        f"- prior_spatiality: `{json.dumps(summary['prior_spatiality'], ensure_ascii=False)}`",
-        f"- blockers: `{json.dumps(blockers, ensure_ascii=False)}`",
-    ]
-    (input_dir / "trainV5_pair_audit_report.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    if args.write_report is not None:
+        write_json(args.write_report, summary)
+    if args.update_report:
+        write_json(input_dir / "trainV5_pair_audit_report.json", summary)
+        md_lines = [
+            "# TrainV5 Pair Audit Report",
+            "",
+            f"- generated_at_utc: `{summary['generated_at_utc']}`",
+            f"- audit_pass: `{str(summary['audit_pass']).lower()}`",
+            f"- target_bundles: `{summary['target_bundles']}`",
+            f"- prior_variants: `{summary['prior_variants']}`",
+            f"- training_pairs: `{summary['training_pairs']}`",
+            f"- identity_controls: `{summary['identity_controls']}`",
+            f"- split: `{json.dumps(summary['split'], ensure_ascii=False)}`",
+            f"- prior_variant_type: `{json.dumps(summary['prior_variant_type'], ensure_ascii=False)}`",
+            f"- prior_spatiality: `{json.dumps(summary['prior_spatiality'], ensure_ascii=False)}`",
+            f"- blockers: `{json.dumps(blockers, ensure_ascii=False)}`",
+        ]
+        (input_dir / "trainV5_pair_audit_report.md").write_text(
+            "\n".join(md_lines) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if blockers:
         raise SystemExit(1)

@@ -2,8 +2,11 @@
   "generated_at_utc": "2026-04-28T01:48:23Z",
   "source_manifest": "/4T/CXY/stable-fast-3d-output/output/material_refine_v1_fixed/releases/stage1_v1_fixed_trainable_manifest.json",
   "data_contract": "trainV5_initial_r_only_v1",
+  "manifest_role": "source_intermediate",
+  "runtime_training_ready": false,
   "notes": [
     "R-only initial data. No online SF3D/SPAR3D/Hunyuan3D priors are generated.",
+    "This is not a runtime training manifest for train_material_refiner.py; use train/trainV5_plus_a_track/trainV5_training_pairs.json after pair expansion.",
     "Large images are referenced through logical/physical paths and are not copied into train/trainV5_initial."
   ],
   "records": [

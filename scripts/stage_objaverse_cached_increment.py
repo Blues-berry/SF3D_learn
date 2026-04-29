@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         default="files",
         help="GitHub Objaverse rows are repository-based; saving files keeps object-local paths usable.",
     )
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        default=None,
+        help="Existing merged/source manifest used to exclude already-staged Objaverse source_uids/fileIdentifiers.",
+    )
     parser.add_argument("--download", action="store_true")
     return parser.parse_args()
 
@@ -181,6 +187,25 @@ def load_filtered_rows(objaverse_root: Path, sources: list[str], file_types: set
     if not frames:
         return pd.DataFrame(columns=["fileIdentifier", "source", "license", "fileType", "sha256", "metadata"])
     return pd.concat(frames, axis=0, ignore_index=True)
+
+
+def load_excluded_source_uids(path: Path | None) -> set[str]:
+    if path is None or not path.exists():
+        return set()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("records", payload) if isinstance(payload, dict) else payload
+    excluded: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_name = str(row.get("source_name") or "")
+        source_uid = str(row.get("source_uid") or "")
+        object_id = str(row.get("object_id") or "")
+        if "objaverse" not in source_name.lower() and not object_id.startswith("objaverse_"):
+            continue
+        if source_uid:
+            excluded.add(source_uid)
+    return excluded
 
 
 def select_rows(
@@ -332,8 +357,12 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     priority_material_families = parse_csv(args.priority_material_families)
     target_material_family_ratios = parse_ratio_csv(args.target_material_family_ratios)
+    frame = load_filtered_rows(args.objaverse_root, sources, file_types)
+    excluded_source_uids = load_excluded_source_uids(args.exclude_manifest)
+    if excluded_source_uids and not frame.empty:
+        frame = frame[~frame["fileIdentifier"].astype(str).isin(excluded_source_uids)].copy()
     selected = select_rows(
-        load_filtered_rows(args.objaverse_root, sources, file_types),
+        frame,
         args.target,
         priority_material_families=priority_material_families,
         target_material_family_ratios=target_material_family_ratios,
@@ -352,6 +381,8 @@ def main() -> None:
             "target_material_family_ratios": target_material_family_ratios,
             "source_priority": parse_csv(args.source_priority),
         },
+        "exclude_manifest": str(args.exclude_manifest.resolve()) if args.exclude_manifest else "",
+        "excluded_existing_source_uid_count": len(excluded_source_uids),
         "file_types": sorted(file_types),
         "source_counts": selected["source"].value_counts(dropna=False).to_dict() if not selected.empty else {},
         "license_counts": selected["license"].value_counts(dropna=False).to_dict() if not selected.empty else {},
@@ -413,6 +444,8 @@ def main() -> None:
             "target_material_family_ratios": target_material_family_ratios,
             "source_priority": parse_csv(args.source_priority),
         },
+        "exclude_manifest": str(args.exclude_manifest.resolve()) if args.exclude_manifest else "",
+        "excluded_existing_source_uid_count": len(excluded_source_uids),
         "selected_count": len(rows),
         "download_requested": args.download,
         "download_error": download_error,

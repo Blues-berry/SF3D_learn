@@ -91,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-panels", type=int, default=64)
     parser.add_argument("--panel-size", type=int, default=192)
+    parser.add_argument(
+        "--selection-mode",
+        choices=["effect_showcase", "balanced", "first", "best_gain", "worst_regression"],
+        default="effect_showcase",
+    )
     parser.add_argument("--report-to", choices=["none", "wandb"], default="wandb")
     parser.add_argument("--tracker-project-name", type=str, default="stable-fast-3d-material-refine")
     parser.add_argument("--tracker-run-name", type=str, default=None)
@@ -255,6 +260,29 @@ def delta_image(path_a: str | Path | None, path_b: str | Path | None, *, size: i
     return Image.fromarray(heat, mode="RGB").resize((size, size), Image.Resampling.LANCZOS)
 
 
+def improvement_image(
+    prior_path: str | Path | None,
+    pred_path: str | Path | None,
+    target_path: str | Path | None,
+    *,
+    size: int,
+) -> Image.Image:
+    paths = [prior_path, pred_path, target_path]
+    if any(path is None or not Path(path).exists() for path in paths):
+        return Image.new("RGB", (size, size), (28, 32, 38))
+    prior = np.asarray(Image.open(prior_path).convert("L")).astype(np.float32) / 255.0
+    pred = np.asarray(Image.open(pred_path).convert("L")).astype(np.float32) / 255.0
+    target = np.asarray(Image.open(target_path).convert("L")).astype(np.float32) / 255.0
+    gain = np.clip((np.abs(prior - target) - np.abs(pred - target)) * 5.0, -1.0, 1.0)
+    heat = np.zeros((*gain.shape, 3), dtype=np.uint8)
+    positive = np.clip(gain, 0.0, 1.0)
+    negative = np.clip(-gain, 0.0, 1.0)
+    heat[..., 0] = (negative * 230.0 + 34.0).astype(np.uint8)
+    heat[..., 1] = (positive * 230.0 + 34.0).astype(np.uint8)
+    heat[..., 2] = ((1.0 - np.maximum(positive, negative)) * 70.0).astype(np.uint8)
+    return Image.fromarray(heat, mode="RGB").resize((size, size), Image.Resampling.LANCZOS)
+
+
 def view_space_tiles(paths: dict[str, Any], size: int) -> list[Image.Image]:
     keys = [
         ("reference_rgb", "Input RGB view", "RGB"),
@@ -292,7 +320,12 @@ def view_rgb_paths(manifest_path: Path, manifest_payload: dict[str, Any], record
     return paths
 
 
-def choose_object_rows(rows: list[dict[str, Any]], max_panels: int) -> list[dict[str, Any]]:
+def choose_object_rows(
+    rows: list[dict[str, Any]],
+    max_panels: int,
+    *,
+    selection_mode: str,
+) -> list[dict[str, Any]]:
     by_case: dict[str, dict[str, Any]] = {}
     for row in rows:
         case_key = row_case_key(row)
@@ -308,13 +341,27 @@ def choose_object_rows(rows: list[dict[str, Any]], max_panels: int) -> list[dict
     def gain(row: dict[str, Any]) -> float:
         return float(row.get("gain_total", row.get("improvement_total", 0.0)) or 0.0)
 
-    quota = max(1, max_panels // 3)
+    if selection_mode == "first":
+        return representatives[:max_panels]
+    if selection_mode == "best_gain":
+        return sorted(representatives, key=gain, reverse=True)[:max_panels]
+    if selection_mode == "worst_regression":
+        return sorted(representatives, key=gain)[:max_panels]
+
+    quota = max(1, max_panels // 4 if selection_mode == "effect_showcase" else max_panels // 3)
     improved = sorted([row for row in representatives if gain(row) > 0.0], key=gain, reverse=True)[:quota]
     regressed = sorted([row for row in representatives if gain(row) < 0.0], key=gain)[:quota]
     uncertain = sorted(representatives, key=lambda row: abs(gain(row)))[:quota]
+    per_variant: list[dict[str, Any]] = []
+    if selection_mode == "effect_showcase":
+        by_variant: dict[str, list[dict[str, Any]]] = {}
+        for row in representatives:
+            by_variant.setdefault(str(row.get("prior_variant_type", "unknown")), []).append(row)
+        for variant_rows in sorted(by_variant.values(), key=lambda items: str(items[0].get("prior_variant_type", "unknown"))):
+            per_variant.append(max(variant_rows, key=gain))
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for bucket in (improved, regressed, uncertain, representatives):
+    for bucket in (improved, regressed, uncertain, per_variant, representatives):
         for row in bucket:
             case_key = row_case_key(row)
             if case_key in seen:
@@ -354,9 +401,11 @@ def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_pat
         label_image(load_image(paths.get("delta_abs"), size=size, mode="L"), "|Pred-Init| delta"),
         label_image(delta_image(paths.get("baseline_roughness"), paths.get("target_roughness"), size=size), "|Prior-GT| rough"),
         label_image(delta_image(paths.get("refined_roughness"), paths.get("target_roughness"), size=size), "|Pred-GT| rough"),
+        label_image(improvement_image(paths.get("baseline_roughness"), paths.get("refined_roughness"), paths.get("target_roughness"), size=size), "Gain rough"),
         label_image(delta_image(paths.get("refined_roughness"), paths.get("baseline_roughness"), size=size), "|Pred-Prior| rough"),
         label_image(delta_image(paths.get("baseline_metallic"), paths.get("target_metallic"), size=size), "|Prior-GT| metal"),
         label_image(delta_image(paths.get("refined_metallic"), paths.get("target_metallic"), size=size), "|Pred-GT| metal"),
+        label_image(improvement_image(paths.get("baseline_metallic"), paths.get("refined_metallic"), paths.get("target_metallic"), size=size), "Gain metal"),
         label_image(delta_image(paths.get("refined_metallic"), paths.get("baseline_metallic"), size=size), "|Pred-Prior| metal"),
     ])
     tiles.extend(view_space_tiles(paths, size))
@@ -424,7 +473,11 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_payload, records = load_records(args.manifest)
     metrics_rows = json.loads(args.metrics.read_text())
-    selected_rows = choose_object_rows(metrics_rows, args.max_panels)
+    selected_rows = choose_object_rows(
+        metrics_rows,
+        args.max_panels,
+        selection_mode=str(args.selection_mode),
+    )
     panel_paths = []
     for row in selected_rows:
         object_id = str(row["object_id"])
@@ -437,6 +490,7 @@ def main() -> None:
     summary = {
         "manifest": str(args.manifest.resolve()),
         "metrics": str(args.metrics.resolve()),
+        "selection_mode": str(args.selection_mode),
         "output_dir": str(args.output_dir.resolve()),
         "panels": len(panel_paths),
         "wandb_policy": {

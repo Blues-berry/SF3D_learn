@@ -31,6 +31,13 @@ DEFAULT_SOURCES = {
         "source_dataset": "kenney_selected_local",
         "max_records": 1200,
     },
+    "Local_Quaternius_CC0_increment": {
+        "root": DEFAULT_SOURCE_ROOT / "quaternius_selected",
+        "license_bucket": "Creative Commons Zero v1.0 Universal",
+        "generator_id": "local_quaternius_cc0_increment",
+        "source_dataset": "quaternius_selected_local",
+        "max_records": 800,
+    },
     "Local_Smithsonian_selected_increment": {
         "root": DEFAULT_SOURCE_ROOT / "smithsonian_selected",
         "license_bucket": "smithsonian_open_access_pending_reconcile",

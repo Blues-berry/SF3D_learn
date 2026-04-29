@@ -1,6 +1,6 @@
 # Material Refine W&B 指标白名单说明
 
-更新时间：2026-04-26
+更新时间：2026-04-28
 
 当前 W&B 策略已从“完整工程日志”改成“论文主看板白名单”。详细 case、全量 panel、dataset/source/license 分布、baseline 对照表和 top failure 明细继续保存在本地 `summary.json`、`metrics.jsonl`、HTML report 和 `dataset_state/*.json`，默认不再上传到 W&B。
 
@@ -12,10 +12,10 @@
 | --- | --- | --- |
 | `eval/rm/uv_total_mae` | refined roughness/metallic 在 UV-space 的总 MAE。 | 越低越好 |
 | `eval/rm/view_total_mae` | refined RM 投影到可见视角后的 view-space MAE。 | 越低越好 |
-| `eval/main/mse` | refined proxy/reference render 的 MSE。 | 越低越好 |
-| `eval/main/psnr` | refined proxy/reference render 的 PSNR。 | 越高越好 |
-| `eval/main/ssim` | refined proxy/reference render 的 SSIM。 | 越高越好 |
-| `eval/main/lpips` | refined proxy/reference render 的 LPIPS。 | 越低越好 |
+| `eval/rgb_proxy/mse/refined` | eval `proxy_uv_shading` 的 refined RGB proxy MSE。 | 越低越好 |
+| `eval/rgb_proxy/psnr/refined` | eval `proxy_uv_shading` 的 refined RGB proxy PSNR。 | 越高越好 |
+| `eval/rgb_proxy/ssim/refined` | eval `proxy_uv_shading` 的 refined RGB proxy SSIM。 | 越高越好 |
+| `eval/rgb_proxy/lpips/refined` | eval `proxy_uv_shading` 的 refined RGB proxy LPIPS。 | 越低越好 |
 | `eval/special/boundary_bleed_score` | 材质边界带误差相对 interior 的增量。 | 越低越好 |
 | `eval/special/metal_confusion_rate` | metallic/non-metallic 二分类混淆率。 | 越低越好 |
 | `eval/special/highlight_localization_error` | 高光区域与材质响应不一致的误差。 | 越低越好 |
@@ -29,14 +29,19 @@
 
 | W&B key | 含义 | 趋势 |
 | --- | --- | --- |
-| `best/val_uv_total_mae` | 当前 run 内验证 UV RM MAE 的最优曲线，W&B summary 使用 min。 | 越低越好 |
+| `best/selection_metric` | 当前 run 内验证选择指标；默认 `gain_render_guarded`，越低代表 UV gain 更高且 render/residual penalty 更小。 | 越低越好 |
+| `val/gain_total` | input prior UV total MAE 减 refined UV total MAE。 | 越高越好 |
+| `val/rm_proxy/view_mae/delta` | view-projected RM proxy 中 baseline MAE 减 refined MAE。 | 越高越好 |
+| `val/rm_proxy/view_mse/delta` | view-projected RM proxy 中 baseline MSE 减 refined MSE。 | 越高越好 |
+| `val/rm_proxy/view_psnr/delta` | view-projected RM proxy 中 refined PSNR 减 baseline PSNR。 | 越高越好 |
 | `val/improvement_uv_total_mae` | baseline UV total MAE 减 refined UV total MAE。 | 越高越好 |
 | `val/improvement_rate` | 验证样本中 refined 优于 baseline 的比例。 | 越高越好 |
 | `val/regression_rate` | 验证样本中 refined 差于 baseline 的比例。 | 越低越好 |
 | `eval/effective_view_supervision_rate` | eval 样本具备有效 view supervision 的比例。 | 越高越可信 |
 | `eval/object_level/avg_improvement_total` | object-level 聚合后的平均提升。 | 越高越好 |
+| `val/case_level/regression_rate` | case-level 聚合后 refined 差于 baseline 的比例。 | 越低越好 |
 
-训练期间还保留少量横轴和效率信息：`trainer/global_step`、`trainer/epoch`、`optim/lr`、`throughput/samples_per_second`、`throughput/seconds_per_batch`。验证里程碑会记录 `val/rm/uv_total_mae`、`val/rm/view_total_mae`、`val/main/mse`、`val/main/psnr`。训练 loss 只保留总 loss 和少数与当前方法直接相关的关键 loss。
+训练期间还保留少量横轴和效率信息：`trainer/global_step`、`trainer/epoch`、`optim/lr`、`throughput/samples_per_second`、`throughput/seconds_per_batch`。验证里程碑会记录 `val/rm/uv_total_mae`、`val/rm_proxy/view_mae/*`、`val/rm_proxy/view_mse/*`、`val/rm_proxy/view_psnr/*`。`val/main/*` 仍作为 refined-only 兼容别名保留，但不作为推荐主看板指标。训练 loss 只保留总 loss 和少数与当前方法直接相关的关键 loss。
 
 ## 三、辅助分析
 
@@ -66,4 +71,4 @@
 
 ## 五、读取建议
 
-训练是否真的在进步，优先看 `trainer/global_step` 横轴下的 `best/val_uv_total_mae`、`val/main/mse`、`val/main/psnr`、`val/improvement_uv_total_mae`、`val/improvement_rate`、`val/regression_rate`。论文是否站得住，必须看 eval 阶段的 `UV RM MAE + View RM MAE + MSE/PSNR/SSIM/LPIPS + boundary/highlight/residual`，不能只看 UV-space 单项。
+训练是否真的在进步，优先看 `trainer/global_step` 横轴下的 `val/gain_total`、`val/rm_proxy/view_psnr/delta`、`val/rm_proxy/view_mse/delta`、`val/rm_proxy/view_mae/delta`、`val/case_level/regression_rate`、`val/by_variant/<variant>/gain_total`。`RM proxy` 是 UV RM map 通过 `view_uvs` 投影后的 roughness/metallic 指标；`RGB proxy` 是 eval 里的 `proxy_uv_shading`；真实 renderer/Blender 重渲染指标还未接入。论文是否站得住，必须看 eval 阶段的 `UV RM MAE + View RM MAE + RGB proxy + boundary/highlight/residual`，不能只看 UV-space 单项。

@@ -1,0 +1,162 @@
+# R-v2.1 TrainV5 Plus A-track full training config.
+#
+# Runtime training source is the pair-based TrainV5 Plus A-track manifest.
+# This keeps the current view-aware training recipe and switches the launch
+# target, selection metric, W&B policy, and preview policy for formal runs.
+
+train_manifest: train/trainV5_plus_a_track/trainV5_training_pairs.json
+val_manifest: train/trainV5_plus_a_track/trainV5_training_pairs.json
+train_split: train
+val_split: val
+split_strategy: manifest
+allow_empty_val: false
+
+epochs: 24
+max_train_steps: 0
+batch_size: 4
+val_batch_size: 4
+num_workers: 4
+grad_accumulation_steps: 8
+learning_rate: 1.0e-5
+min_learning_rate: 2.0e-6
+weight_decay: 1.0e-2
+optimizer: adamw
+lr_scheduler: plateau
+warmup_steps: 40
+plateau_factor: 0.5
+plateau_patience: 3
+plateau_threshold: 3.0e-4
+grad_clip_norm: 0.75
+
+atlas_size: 512
+buffer_resolution: 256
+train_view_sample_count: 8
+train_min_hard_views: 4
+train_randomize_view_subset: true
+val_view_sample_count: 12
+val_min_hard_views: 4
+val_balance_key: prior_variant_type
+val_records_per_balance_group: 32
+val_expected_balance_groups: near_gt_prior,mild_gap_prior,medium_gap_prior,large_gap_prior,no_prior_bootstrap
+amp_dtype: bfloat16
+cuda_device_index: 1
+matmul_precision: high
+allow_tf32: true
+
+disable_view_fusion: false
+disable_prior_inputs: false
+disable_residual_head: false
+enable_prior_source_embedding: true
+enable_no_prior_bootstrap: true
+enable_change_gate: true
+enable_boundary_safety: true
+enable_material_aux_head: false
+enable_render_proxy_loss: false
+
+enable_residual_gate: true
+residual_gate_bias: -1.75
+min_residual_gate: 0.005
+max_residual_gate: 0.44
+prior_confidence_gate_strength: 0.64
+enable_render_consistency_gate: true
+render_gate_strength: 0.40
+
+enable_dual_path_prior_init: true
+enable_domain_prior_calibration: true
+domain_feature_channels: 8
+prior_feature_channels: 16
+enable_material_sensitive_view_encoder: true
+enable_hard_view_routing: true
+enable_tri_branch_fusion: true
+enable_boundary_safety_module: true
+boundary_safety_strength: 0.62
+boundary_residual_suppression_strength: 0.56
+view_uncertainty_residual_suppression_strength: 0.42
+bleed_risk_residual_suppression_strength: 0.58
+enable_material_topology_reasoning: true
+topology_feature_channels: 16
+topology_patch_size: 32
+topology_layers: 2
+topology_heads: 2
+topology_residual_suppression_strength: 0.30
+enable_confidence_gated_trunk: true
+uncertainty_gate_strength: 0.38
+residual_delta_init_std: 1.0e-3
+trunk_uncertainty_init_bias: -1.0
+trunk_boundary_stability_init_bias: 1.0
+
+train_balance_mode: material_x_source_x_prior
+train_balance_power: 1.35
+train_samples_per_epoch: 0
+train_target_quality_weights: paper_strong=1.9,paper_pseudo=0.8,paper_weak=0.35,research_only=0.0,smoke_only=0.0
+train_failure_tag_metadata_key: failure_tags
+train_failure_tag_weights: metal_nonmetal_confusion=4.5,boundary_bleed=7.0,local_highlight_misread=4.0,over_smoothing=2.4
+prior_dropout_prob: 0.06
+prior_dropout_start_prob: 0.04
+prior_dropout_end_prob: 0.18
+prior_dropout_warmup_epochs: 4
+
+refine_weight: 0.52
+coarse_weight: 0.30
+prior_consistency_weight: 0.28
+smoothness_weight: 0.0015
+enable_sampled_view_rm_loss: true
+sampled_view_rm_loss_weight: 0.82
+view_consistency_weight: 0.82
+view_consistency_mode: required
+edge_aware_weight: 0.24
+edge_aware_epsilon: 1.0e-3
+boundary_bleed_weight: 0.34
+boundary_band_kernel: 9
+gradient_preservation_weight: 0.38
+metallic_classification_weight: 0.24
+material_context_weight: 0.0
+residual_safety_weight: 0.54
+residual_safety_margin: 0.020
+
+eval_every: 1
+validation_steps: 0
+validation_progress_milestones: 16
+render_proxy_validation_milestone_interval: 1
+render_proxy_validation_max_batches: 6
+val_enable_lpips: true
+val_lpips_max_images: 12
+max_validation_batches: 12
+save_every: 1
+checkpointing_steps: 0
+save_only_best_checkpoint: true
+keep_last_checkpoints: 3
+validation_selection_metric: gain_render_guarded
+selection_view_rm_penalty: 0.90
+selection_mse_penalty: 0.50
+selection_psnr_penalty: 0.35
+selection_residual_regression_penalty: 0.18
+
+val_preview_samples: 32
+val_preview_selection: effect_showcase
+wandb_val_preview_max: 32
+wandb_log_preview_grid: false
+save_preview_contact_sheet: false
+
+output_dir: output/material_refine_trainV5_plus_a_track_fullrun
+report_to: wandb
+tracker_project_name: stable-fast-3d-material-refine-trainv5-a-track
+tracker_run_name: r-v2-1-trainV5-plus-a-full-b4-gpu1
+tracker_group: r-v2-1-fullrun
+tracker_tags: trainV5-plus-a,r-v2.1,fullrun,prior-gap,gpu1
+wandb_mode: online
+wandb_dir: wandb
+wandb_log_artifacts: false
+wandb_artifact_policy: none
+wandb_watch: false
+export_training_curves: true
+
+startup_probe_batches: 1
+startup_probe_device_transfer: true
+dataset_distribution_topk: 12
+preflight_audit_records: -1
+target_prior_identity_warning_threshold: 0.20
+max_target_prior_identity_rate_for_paper: 0.30
+min_nontrivial_target_count_for_paper: 0
+fail_on_target_prior_identity: false
+seed: 20260428

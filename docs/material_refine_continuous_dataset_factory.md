@@ -11,42 +11,19 @@ This document records the continuous SF3D material-refine dataset expansion setu
 - Pool-E material prior: `PolyHaven_Materials`, target `1000` CC0 PBR materials.
 - Pool-B/Pool-F real benchmark sidecars: OpenIllumination and Stanford-ORB manifests remain benchmark/calibration only and are not mixed into Pool-A training manifests.
 
-## Main Config
+## Status
 
-- Config: `configs/material_refine_dataset_factory_gpu0.json`
-- Factory script: `scripts/run_material_refine_dataset_factory.py`
-- Runtime state: `output/material_refine_dataset_factory/factory_state.json`
-- Factory log: `output/material_refine_dataset_factory/logs/sf3d_material_refine_dataset_factory_gpu0.log`
+The old continuous dataset factory runner was removed from the active TrainV5 path.
+Use the TrainV5 builders and audit scripts instead:
 
-The config keeps `GPU1` empty and uses `GPU0` for render/preprocess. Current longrun defaults:
+- `scripts/build_material_refine_trainV5_initial.py`
+- `scripts/build_material_refine_trainV5_plus_a_track.py`
+- `scripts/audit_material_refine_trainV5_pairs.py`
 
-- `9700` records per longrun.
-- `production_32`: `8` camera poses x `4` HDRIs per object.
-- `HDRI >= 900`.
-- `atlas=1024`, `render=320`, `cycles=8`.
-- `12` shards x `1` worker on GPU0.
+The active runtime manifest is:
 
-## Running
-
-Start or restart the factory loop:
-
-```bash
-tmux new-session -d -s sf3d_material_refine_dataset_factory_gpu0 \
-  'cd /home/ubuntu/ssd_work/projects/stable-fast-3d && /home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/run_material_refine_dataset_factory.py --loop --start-downloads --start-render --audit --state-json output/material_refine_dataset_factory/factory_state.json > output/material_refine_dataset_factory/logs/sf3d_material_refine_dataset_factory_gpu0.log 2>&1'
-```
-
-Run one scheduling pass:
-
-```bash
-/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/run_material_refine_dataset_factory.py \
-  --once --start-downloads --start-render --audit
-```
-
-Dry-run:
-
-```bash
-/home/ubuntu/ssd_work/conda_envs/sf3d/bin/python scripts/run_material_refine_dataset_factory.py \
-  --once --start-downloads --start-render --audit --dry-run
+```text
+train/trainV5_plus_a_track/trainV5_training_pairs.json
 ```
 
 ## Active Sessions
