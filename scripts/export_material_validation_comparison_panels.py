@@ -20,6 +20,7 @@ from sf3d.material_refine.experiment import (  # noqa: E402
     maybe_init_wandb,
     wandb,
 )
+from sf3d.material_refine.training.preview import select_variant_balanced_records  # noqa: E402
 
 DEFAULT_VIEWS = ["front_studio", "three_quarter_indoor", "side_neon"]
 
@@ -93,8 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--panel-size", type=int, default=192)
     parser.add_argument(
         "--selection-mode",
-        choices=["effect_showcase", "balanced", "first", "best_gain", "worst_regression"],
-        default="effect_showcase",
+        choices=["balanced_by_variant", "effect_showcase", "balanced", "first", "best_gain", "worst_regression"],
+        default="balanced_by_variant",
     )
     parser.add_argument("--report-to", choices=["none", "wandb"], default="wandb")
     parser.add_argument("--tracker-project-name", type=str, default="stable-fast-3d-material-refine")
@@ -347,30 +348,11 @@ def choose_object_rows(
         return sorted(representatives, key=gain, reverse=True)[:max_panels]
     if selection_mode == "worst_regression":
         return sorted(representatives, key=gain)[:max_panels]
-
-    quota = max(1, max_panels // 4 if selection_mode == "effect_showcase" else max_panels // 3)
-    improved = sorted([row for row in representatives if gain(row) > 0.0], key=gain, reverse=True)[:quota]
-    regressed = sorted([row for row in representatives if gain(row) < 0.0], key=gain)[:quota]
-    uncertain = sorted(representatives, key=lambda row: abs(gain(row)))[:quota]
-    per_variant: list[dict[str, Any]] = []
-    if selection_mode == "effect_showcase":
-        by_variant: dict[str, list[dict[str, Any]]] = {}
-        for row in representatives:
-            by_variant.setdefault(str(row.get("prior_variant_type", "unknown")), []).append(row)
-        for variant_rows in sorted(by_variant.values(), key=lambda items: str(items[0].get("prior_variant_type", "unknown"))):
-            per_variant.append(max(variant_rows, key=gain))
-    selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for bucket in (improved, regressed, uncertain, per_variant, representatives):
-        for row in bucket:
-            case_key = row_case_key(row)
-            if case_key in seen:
-                continue
-            selected.append(row)
-            seen.add(case_key)
-            if len(selected) >= max_panels:
-                return selected
-    return selected
+    return select_variant_balanced_records(
+        representatives,
+        max_count=max_panels,
+        mode=selection_mode,
+    )
 
 
 def build_panel(row: dict[str, Any], record: dict[str, Any] | None, manifest_path: Path, manifest_payload: dict[str, Any], size: int) -> Image.Image:

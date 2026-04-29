@@ -9,8 +9,14 @@ LOG_DIR="${LOG_DIR:-${AUTO_ROOT}/logs}"
 STATUS_DIR="${STATUS_DIR:-${AUTO_ROOT}/status}"
 LOCK_FILE="${LOCK_FILE:-${AUTO_ROOT}/material_priority_cycle.lock}"
 LAST_CYCLE_JSON="${LAST_CYCLE_JSON:-${AUTO_ROOT}/last_cycle_state.json}"
+STAGE_SUMMARY_JSON="${STAGE_SUMMARY_JSON:-output/material_refine_expansion_candidates/material_priority_stage/material_priority_stage_summary.json}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-1800}"
-DOWNLOAD_FLAG="${DOWNLOAD_FLAG:---download-objaverse}"
+DOWNLOAD_PROBE_SIZE="${DOWNLOAD_PROBE_SIZE:-100}"
+MIN_DOWNLOAD_SUCCESS_RATE="${MIN_DOWNLOAD_SUCCESS_RATE:-0.20}"
+B_PARALLEL_WORKERS_DRAFT="${B_PARALLEL_WORKERS_DRAFT:-1}"
+B_RENDER_RESOLUTION_DRAFT="${B_RENDER_RESOLUTION_DRAFT:-320}"
+B_CYCLES_SAMPLES_DRAFT="${B_CYCLES_SAMPLES_DRAFT:-8}"
+B_VIEW_LIGHT_PROTOCOL_DRAFT="${B_VIEW_LIGHT_PROTOCOL_DRAFT:-production_32}"
 
 mkdir -p "${LOG_DIR}" "${STATUS_DIR}" "$(dirname "${LOCK_FILE}")"
 
@@ -28,7 +34,8 @@ write_cycle_state() {
   local batch256_rc="$7"
   local batch512_rc="$8"
   local batch1000_rc="$9"
-  python - <<'PY' "${LAST_CYCLE_JSON}" "${cycle_started}" "${cycle_finished}" "${cycle_log}" "${outcome}" "${stage_rc}" "${batch64_rc}" "${batch256_rc}" "${batch512_rc}" "${batch1000_rc}"
+  local download_mode="${10}"
+  python - <<'PY' "${LAST_CYCLE_JSON}" "${cycle_started}" "${cycle_finished}" "${cycle_log}" "${outcome}" "${stage_rc}" "${batch64_rc}" "${batch256_rc}" "${batch512_rc}" "${batch1000_rc}" "${download_mode}"
 import json
 import sys
 from pathlib import Path
@@ -44,6 +51,7 @@ payload = {
     "batch_1_256_preflight_returncode": int(sys.argv[8]),
     "batch_1_512_preflight_returncode": int(sys.argv[9]),
     "batch_2_1000_preflight_returncode": int(sys.argv[10]),
+    "download_mode": sys.argv[11],
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -61,6 +69,43 @@ stage_process_running() {
   pgrep -af "python scripts/stage_material_refine_material_priority_sources.py" >/dev/null 2>&1
 }
 
+next_download_mode() {
+  python - <<'PY' "${STAGE_SUMMARY_JSON}" "${MIN_DOWNLOAD_SUCCESS_RATE}"
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+threshold = float(sys.argv[2])
+if not path.exists():
+    print("direct")
+    raise SystemExit(0)
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("direct")
+    raise SystemExit(0)
+summary = payload.get("summary", payload) if isinstance(payload, dict) else {}
+mode = str(summary.get("download_mode") or "direct")
+attempted = int(summary.get("download_attempted") or 0)
+success_rate = float(summary.get("download_success_rate") or 0.0)
+reason = str(summary.get("download_failure_reason") or "").lower()
+network_tokens = ("ssl", "max retries", "connection", "timeout", "proxy", "tls", "http")
+network_like = any(token in reason for token in network_tokens)
+if attempted > 0 and success_rate >= threshold:
+    print("direct")
+elif network_like and attempted > 0 and success_rate < threshold:
+    if mode == "direct":
+        print("proxy-probe")
+    elif mode == "proxy-probe":
+        print("mirror-probe")
+    else:
+        print("off")
+else:
+    print("direct")
+PY
+}
+
 while true; do
   cycle_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   cycle_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -71,23 +116,35 @@ while true; do
   batch256_rc=0
   batch512_rc=0
   batch1000_rc=0
+  download_mode="$(next_download_mode)"
 
   if stage_process_running; then
     outcome="skipped_existing_stage_process"
     log "skip cycle: existing material-priority stage process is already running"
-    write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" 0 0 0 0 0
+    write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" 0 0 0 0 0 "${download_mode}"
     run_status_snapshot
     sleep "${INTERVAL_SECONDS}"
     continue
   fi
 
-  log "starting material-priority cycle -> ${cycle_log}"
+  log "starting material-priority cycle mode=${download_mode} -> ${cycle_log}"
   set +e
   (
     flock -n 9 || exit 90
     {
-      echo "[cycle ${cycle_stamp}] stage_material_refine_material_priority_sources.py start"
-      python scripts/stage_material_refine_material_priority_sources.py ${DOWNLOAD_FLAG}
+      echo "[cycle ${cycle_stamp}] stage_material_refine_material_priority_sources.py start mode=${download_mode}"
+      if [[ "${download_mode}" == "off" ]]; then
+        python scripts/stage_material_refine_material_priority_sources.py \
+          --download-mode "${download_mode}" \
+          --download-probe-size "${DOWNLOAD_PROBE_SIZE}" \
+          --min-download-success-rate "${MIN_DOWNLOAD_SUCCESS_RATE}"
+      else
+        python scripts/stage_material_refine_material_priority_sources.py \
+          --download-objaverse \
+          --download-mode "${download_mode}" \
+          --download-probe-size "${DOWNLOAD_PROBE_SIZE}" \
+          --min-download-success-rate "${MIN_DOWNLOAD_SUCCESS_RATE}"
+      fi
       echo "[cycle ${cycle_stamp}] stage_material_refine_material_priority_sources.py done"
     } >>"${cycle_log}" 2>&1
   ) 9>"${LOCK_FILE}"
@@ -97,7 +154,7 @@ while true; do
   if [[ "${stage_rc}" -eq 90 ]]; then
     outcome="skipped_lock_busy"
     log "skip cycle: lock busy"
-    write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" "${stage_rc}" 0 0 0 0
+    write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" "${stage_rc}" 0 0 0 0 "${download_mode}"
     run_status_snapshot
     sleep "${INTERVAL_SECONDS}"
     continue
@@ -115,6 +172,10 @@ while true; do
       --b-batch-name batch_0_64_material_first \
       --b-batch-size 64 \
       --b-expected-record-count 64 \
+      --b-parallel-workers "${B_PARALLEL_WORKERS_DRAFT}" \
+      --b-render-resolution "${B_RENDER_RESOLUTION_DRAFT}" \
+      --b-cycles-samples "${B_CYCLES_SAMPLES_DRAFT}" \
+      --b-view-light-protocol "${B_VIEW_LIGHT_PROTOCOL_DRAFT}" \
       >>"${cycle_log}" 2>&1
     batch64_rc=$?
 
@@ -124,6 +185,10 @@ while true; do
       --b-batch-name batch_1_256_material_first \
       --b-batch-size 256 \
       --b-expected-record-count 256 \
+      --b-parallel-workers "${B_PARALLEL_WORKERS_DRAFT}" \
+      --b-render-resolution "${B_RENDER_RESOLUTION_DRAFT}" \
+      --b-cycles-samples "${B_CYCLES_SAMPLES_DRAFT}" \
+      --b-view-light-protocol "${B_VIEW_LIGHT_PROTOCOL_DRAFT}" \
       >>"${cycle_log}" 2>&1
     batch256_rc=$?
 
@@ -133,6 +198,10 @@ while true; do
       --b-batch-name batch_1_512_material_first \
       --b-batch-size 512 \
       --b-expected-record-count 512 \
+      --b-parallel-workers "${B_PARALLEL_WORKERS_DRAFT}" \
+      --b-render-resolution "${B_RENDER_RESOLUTION_DRAFT}" \
+      --b-cycles-samples "${B_CYCLES_SAMPLES_DRAFT}" \
+      --b-view-light-protocol "${B_VIEW_LIGHT_PROTOCOL_DRAFT}" \
       >>"${cycle_log}" 2>&1
     batch512_rc=$?
 
@@ -142,6 +211,10 @@ while true; do
       --b-batch-name batch_2_1000_material_first \
       --b-batch-size 1000 \
       --b-expected-record-count 1000 \
+      --b-parallel-workers "${B_PARALLEL_WORKERS_DRAFT}" \
+      --b-render-resolution "${B_RENDER_RESOLUTION_DRAFT}" \
+      --b-cycles-samples "${B_CYCLES_SAMPLES_DRAFT}" \
+      --b-view-light-protocol "${B_VIEW_LIGHT_PROTOCOL_DRAFT}" \
       >>"${cycle_log}" 2>&1
     batch1000_rc=$?
     set -e
@@ -154,7 +227,7 @@ while true; do
     fi
   fi
 
-  write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" "${stage_rc}" "${batch64_rc}" "${batch256_rc}" "${batch512_rc}" "${batch1000_rc}"
+  write_cycle_state "${cycle_started}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cycle_log}" "${outcome}" "${stage_rc}" "${batch64_rc}" "${batch256_rc}" "${batch512_rc}" "${batch1000_rc}" "${download_mode}"
   run_status_snapshot
   sleep "${INTERVAL_SECONDS}"
 done

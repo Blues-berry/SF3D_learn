@@ -587,6 +587,10 @@ def b_preflight(
     batch_name: str,
     batch_size: int,
     expected_record_count: int,
+    parallel_workers: int,
+    render_resolution: int,
+    cycles_samples: int,
+    view_light_protocol: str,
 ) -> dict[str, Any]:
     b_root = abc_root / "B_track"
     batch_slug = slugify_batch_name(batch_name)
@@ -619,6 +623,10 @@ def b_preflight(
         "batch_slug": batch_slug,
         "batch_size_limit": batch_size,
         "expected_record_count": expected_record_count,
+        "parallel_workers": parallel_workers,
+        "render_resolution": render_resolution,
+        "cycles_samples": cycles_samples,
+        "view_light_protocol": view_light_protocol,
         "summary": summarize(records, ["material_family", "source_name", "license_bucket", "prior_mode"]),
         "path_counts": dict(path_counts),
         "suffix_counts": dict(suffix_counts),
@@ -669,11 +677,11 @@ def b_preflight(
         "--atlas-resolution",
         "1024",
         "--render-resolution",
-        "320",
+        str(render_resolution),
         "--cycles-samples",
-        "8",
+        str(cycles_samples),
         "--view-light-protocol",
-        "production_32",
+        str(view_light_protocol),
         "--hdri-bank-json",
         "output/highlight_pool_a_8k/aux_sources/polyhaven_hdri_bank.json",
         "--min-hdri-count",
@@ -683,7 +691,7 @@ def b_preflight(
         "--cuda-device-index",
         "0",
         "--parallel-workers",
-        "1",
+        str(parallel_workers),
         "--rebake-version",
         "rebake_v2",
         "--disable-render-cache",
@@ -732,6 +740,10 @@ def b_preflight(
         "batch_slug": batch_slug,
         "batch_size_limit": batch_size,
         "expected_record_count": expected_record_count,
+        "parallel_workers": parallel_workers,
+        "render_resolution": render_resolution,
+        "cycles_samples": cycles_samples,
+        "view_light_protocol": view_light_protocol,
     }
     write_json(rebake_root / f"{batch_slug}_decision.json", decision)
     write_text(
@@ -748,6 +760,10 @@ def b_preflight(
                 f"- batch_name: `{batch_name}`",
                 f"- batch_size_limit: `{batch_size}`",
                 f"- expected_record_count: `{expected_record_count}`",
+                f"- parallel_workers: `{parallel_workers}`",
+                f"- render_resolution: `{render_resolution}`",
+                f"- cycles_samples: `{cycles_samples}`",
+                f"- view_light_protocol: `{view_light_protocol}`",
                 f"- blockers: `{json.dumps(blockers, ensure_ascii=False)}`",
                 f"- command_draft: `{command_path}`",
                 "",
@@ -1130,6 +1146,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b-batch-name", type=str, default="material_first_rebake_batch")
     parser.add_argument("--b-batch-size", type=int, default=0)
     parser.add_argument("--b-expected-record-count", type=int, default=0)
+    parser.add_argument("--b-parallel-workers", type=int, default=1)
+    parser.add_argument("--b-render-resolution", type=int, default=320)
+    parser.add_argument("--b-cycles-samples", type=int, default=8)
+    parser.add_argument("--b-view-light-protocol", type=str, default="production_32")
     parser.add_argument("--audit-atlas-size", type=int, default=64)
     parser.add_argument("--audit-buffer-resolution", type=int, default=32)
     parser.add_argument("--min-ssd-free-gb", type=float, default=20.0)
@@ -1161,6 +1181,10 @@ def main() -> None:
             args.b_batch_name,
             args.b_batch_size,
             args.b_expected_record_count,
+            args.b_parallel_workers,
+            args.b_render_resolution,
+            args.b_cycles_samples,
+            args.b_view_light_protocol,
         )
         pending_repair_snapshot(args.abc_root)
     if args.run_c_plans:

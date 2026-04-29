@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -45,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--source-priority", type=str, default="smithsonian,thingiverse,sketchfab")
     parser.add_argument("--download-objaverse", action="store_true")
+    parser.add_argument("--download-mode", choices=("direct", "proxy-probe", "mirror-probe", "off"), default="direct")
+    parser.add_argument("--download-probe-size", type=int, default=100)
+    parser.add_argument("--min-download-success-rate", type=float, default=0.20)
     parser.add_argument("--skip-merge", action="store_true")
     parser.add_argument("--skip-second-pass", action="store_true")
     parser.add_argument("--skip-repair", action="store_true")
@@ -77,6 +81,13 @@ def run_cmd(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+
+
+def file_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 def summarize_source_candidate_manifest(path: Path) -> dict[str, Any]:
@@ -139,58 +150,81 @@ def main() -> None:
     args.objaverse_stage_root.mkdir(parents=True, exist_ok=True)
     args.objaverse_source_dir.mkdir(parents=True, exist_ok=True)
     command_log: list[dict[str, Any]] = []
+    effective_download_mode = str(args.download_mode)
+    proxy_env_present = any(os.environ.get(key) for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
+    effective_target = int(args.objaverse_target)
+    if effective_download_mode in {"proxy-probe", "mirror-probe"}:
+        effective_target = min(int(args.objaverse_target), max(int(args.download_probe_size), 1))
+    if effective_download_mode == "off":
+        effective_target = 0
+    should_download = bool(args.download_objaverse) and effective_download_mode != "off"
+    objaverse_increment_manifest = args.objaverse_stage_root / "objaverse_cached_increment_manifest.json"
+    download_attempted = 0
+    download_succeeded = 0
+    download_failure_reason = ""
+    download_success_rate = 0.0
+    source_summary = {"records": 0, "source_name": {}, "license_bucket": {}, "material_family": {}}
 
-    objaverse_stage = run_cmd(
-        [
-            sys.executable,
-            "scripts/stage_objaverse_cached_increment.py",
-            "--objaverse-root",
-            str(args.objaverse_root),
-            "--output-root",
-            str(args.objaverse_stage_root),
-            "--sources",
-            args.objaverse_sources,
-            "--target",
-            str(args.objaverse_target),
-            "--priority-material-families",
-            args.priority_material_families,
-            "--target-material-family-ratios",
-            args.target_material_family_ratios,
-            "--source-priority",
-            args.source_priority,
-            "--exclude-manifest",
-            str(args.merged_manifest),
-            *(["--download"] if args.download_objaverse else []),
-        ],
-        cwd=REPO_ROOT,
-    )
-    command_log.append(objaverse_stage)
-    if objaverse_stage["returncode"] != 0:
-        raise SystemExit(objaverse_stage["stderr"] or objaverse_stage["stdout"] or "objaverse_stage_failed")
+    if effective_target > 0:
+        objaverse_stage = run_cmd(
+            [
+                sys.executable,
+                "scripts/stage_objaverse_cached_increment.py",
+                "--objaverse-root",
+                str(args.objaverse_root),
+                "--output-root",
+                str(args.objaverse_stage_root),
+                "--sources",
+                args.objaverse_sources,
+                "--target",
+                str(effective_target),
+                "--priority-material-families",
+                args.priority_material_families,
+                "--target-material-family-ratios",
+                args.target_material_family_ratios,
+                "--source-priority",
+                args.source_priority,
+                "--exclude-manifest",
+                str(args.merged_manifest),
+                *(["--download"] if should_download else []),
+            ],
+            cwd=REPO_ROOT,
+        )
+        command_log.append(objaverse_stage)
+        if objaverse_stage["returncode"] != 0:
+            raise SystemExit(objaverse_stage["stderr"] or objaverse_stage["stdout"] or "objaverse_stage_failed")
 
-    objaverse_manifest_build = run_cmd(
-        [
-            sys.executable,
-            "scripts/build_objaverse_increment_manifest.py",
-            "--input-json",
-            str(args.objaverse_stage_root / "objaverse_cached_increment_manifest.json"),
-            "--output-root",
-            str(args.objaverse_source_dir),
-            "--output-json",
-            str(args.objaverse_source_dir / "source_candidate_manifest.json"),
-            "--output-csv",
-            str(args.objaverse_source_dir / "source_candidate_manifest.csv"),
-            "--output-md",
-            str(args.objaverse_source_dir / "source_candidate_manifest_summary.md"),
-        ],
-        cwd=REPO_ROOT,
-    )
-    command_log.append(objaverse_manifest_build)
-    if objaverse_manifest_build["returncode"] != 0:
-        raise SystemExit(objaverse_manifest_build["stderr"] or objaverse_manifest_build["stdout"] or "objaverse_manifest_build_failed")
+        if file_exists(objaverse_increment_manifest):
+            increment_payload = read_json(objaverse_increment_manifest)
+            download_attempted = int(increment_payload.get("selected_count") or 0) if should_download else 0
+            download_succeeded = int(increment_payload.get("downloaded_count") or 0)
+            download_failure_reason = str(increment_payload.get("download_error") or "")
+            if download_attempted > 0:
+                download_success_rate = float(download_succeeded) / float(download_attempted)
 
-    source_summary = summarize_source_candidate_manifest(args.objaverse_source_dir / "source_candidate_manifest.json")
-    write_source_sidecars(args.objaverse_source_dir, source_summary)
+        objaverse_manifest_build = run_cmd(
+            [
+                sys.executable,
+                "scripts/build_objaverse_increment_manifest.py",
+                "--input-json",
+                str(objaverse_increment_manifest),
+                "--output-root",
+                str(args.objaverse_source_dir),
+                "--output-json",
+                str(args.objaverse_source_dir / "source_candidate_manifest.json"),
+                "--output-csv",
+                str(args.objaverse_source_dir / "source_candidate_manifest.csv"),
+                "--output-md",
+                str(args.objaverse_source_dir / "source_candidate_manifest_summary.md"),
+            ],
+            cwd=REPO_ROOT,
+        )
+        command_log.append(objaverse_manifest_build)
+        if objaverse_manifest_build["returncode"] != 0:
+            raise SystemExit(objaverse_manifest_build["stderr"] or objaverse_manifest_build["stdout"] or "objaverse_manifest_build_failed")
+
+        source_summary = summarize_source_candidate_manifest(args.objaverse_source_dir / "source_candidate_manifest.json")
+        write_source_sidecars(args.objaverse_source_dir, source_summary)
 
     merge_result = None
     if not args.skip_merge:
@@ -242,10 +276,22 @@ def main() -> None:
     summary = {
         "generated_at_utc": utc_now(),
         "objaverse_target": args.objaverse_target,
+        "effective_objaverse_target": effective_target,
         "objaverse_sources": [item.strip() for item in args.objaverse_sources.split(",") if item.strip()],
         "priority_material_families": [item.strip() for item in args.priority_material_families.split(",") if item.strip()],
         "target_material_family_rats": args.target_material_family_ratios,
-        "download_objaverse": args.download_objaverse,
+        "download_objaverse": should_download,
+        "download_mode": effective_download_mode,
+        "download_probe_size": int(args.download_probe_size),
+        "min_download_success_rate": float(args.min_download_success_rate),
+        "proxy_env_present": proxy_env_present,
+        "download_attempted": int(download_attempted),
+        "download_succeeded": int(download_succeeded),
+        "download_success_rate": float(download_success_rate),
+        "download_failure_reason": download_failure_reason,
+        "download_below_threshold": bool(
+            should_download and download_attempted > 0 and download_success_rate < float(args.min_download_success_rate)
+        ),
         "source_candidate_manifest": str((args.objaverse_source_dir / "source_candidate_manifest.json").resolve()),
         "merged_manifest": str(args.merged_manifest.resolve()),
         "queue_latest": str((REPO_ROOT / "output/material_refine_trainV5/expansion_second_pass/trainV5_plus_rebake_queue_latest.json").resolve()),
@@ -261,8 +307,17 @@ def main() -> None:
                 "",
                 f"- generated_at_utc: `{summary['generated_at_utc']}`",
                 f"- objaverse_target: `{summary['objaverse_target']}`",
+                f"- effective_objaverse_target: `{summary['effective_objaverse_target']}`",
                 f"- objaverse_sources: `{json.dumps(summary['objaverse_sources'], ensure_ascii=False)}`",
                 f"- priority_material_families: `{json.dumps(summary['priority_material_families'], ensure_ascii=False)}`",
+                f"- download_objaverse: `{str(summary['download_objaverse']).lower()}`",
+                f"- download_mode: `{summary['download_mode']}`",
+                f"- proxy_env_present: `{str(summary['proxy_env_present']).lower()}`",
+                f"- download_attempted: `{summary['download_attempted']}`",
+                f"- download_succeeded: `{summary['download_succeeded']}`",
+                f"- download_success_rate: `{summary['download_success_rate']}`",
+                f"- download_failure_reason: `{summary['download_failure_reason']}`",
+                f"- download_below_threshold: `{str(summary['download_below_threshold']).lower()}`",
                 f"- source_candidate_manifest: `{summary['source_candidate_manifest']}`",
                 f"- merged_manifest: `{summary['merged_manifest']}`",
                 f"- queue_latest: `{summary['queue_latest']}`",

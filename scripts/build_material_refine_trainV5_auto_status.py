@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shlex
 import subprocess
 from collections import Counter
 from datetime import datetime, timezone
@@ -79,6 +81,76 @@ def pgrep_lines(pattern: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def parse_etime_to_hours(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    parts = text.split(":")
+    try:
+        nums = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        hours, minutes, seconds = nums
+    elif len(nums) == 2:
+        hours = 0
+        minutes, seconds = nums
+    else:
+        return None
+    total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    return total_seconds / 3600.0
+
+
+def current_prepare_runtime(input_manifest: str) -> dict[str, Any]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,etime=,args="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or "prepare_material_refine_dataset.py" not in line:
+            continue
+        if input_manifest and input_manifest not in line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, etime, cmd = parts
+        runtime_hours = parse_etime_to_hours(etime)
+        config = {
+            "pid": int(pid),
+            "elapsed": etime,
+            "runtime_hours": runtime_hours,
+            "command": cmd,
+        }
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            argv = []
+        mapping: dict[str, str] = {}
+        for index, token in enumerate(argv):
+            if token.startswith("--") and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                mapping[token] = argv[index + 1]
+        config["parallel_workers"] = mapping.get("--parallel-workers")
+        config["render_resolution"] = mapping.get("--render-resolution")
+        config["cycles_samples"] = mapping.get("--cycles-samples")
+        config["view_light_protocol"] = mapping.get("--view-light-protocol")
+        return config
+    return {}
+
+
 def batch_summary(path: Path) -> dict[str, Any]:
     payload = read_json(path, {})
     return {
@@ -109,6 +181,17 @@ def main() -> None:
     b1 = read_json(args.b1_progress_path, {})
     stage_summary = read_json(args.stage_summary_path, {})
     sessions = tmux_sessions()
+    prepare_runtime = current_prepare_runtime(str(b1.get("input_manifest") or ""))
+    processed = b1.get("processed")
+    total = b1.get("total")
+    runtime_hours = prepare_runtime.get("runtime_hours")
+    records_per_hour = None
+    estimated_hours_remaining = None
+    if isinstance(processed, (int, float)) and runtime_hours and runtime_hours > 0:
+        records_per_hour = float(processed) / float(runtime_hours)
+        remaining = max(float(total or 0) - float(processed), 0.0)
+        if records_per_hour > 0:
+            estimated_hours_remaining = remaining / records_per_hour
 
     payload = {
         "generated_at_utc": utc_now(),
@@ -129,6 +212,13 @@ def main() -> None:
             "target_truth_gate_pass": b1.get("target_truth_gate_pass"),
             "target_truth_gate_fail": b1.get("target_truth_gate_fail"),
             "pass_rate": b1.get("pass_rate"),
+            "records_per_hour": records_per_hour,
+            "estimated_hours_remaining": estimated_hours_remaining,
+            "current_parallel_workers": prepare_runtime.get("parallel_workers"),
+            "current_render_protocol": prepare_runtime.get("view_light_protocol"),
+            "current_render_resolution": prepare_runtime.get("render_resolution"),
+            "current_cycles_samples": prepare_runtime.get("cycles_samples"),
+            "prepare_runtime": prepare_runtime,
             "material_family": b1.get("material_family", {}),
             "source_name": b1.get("source_name", {}),
         },
@@ -156,6 +246,12 @@ def main() -> None:
                 f"- pending_material_probe_by_source: `{json.dumps((payload['pending_material_probe'] or {}).get('source_name', {}), ensure_ascii=False)}`",
                 f"- b1_progress: `{payload['b1_progress'].get('processed')}/{payload['b1_progress'].get('total')}`",
                 f"- b1_pass_rate: `{payload['b1_progress'].get('pass_rate')}`",
+                f"- b1_records_per_hour: `{payload['b1_progress'].get('records_per_hour')}`",
+                f"- b1_estimated_hours_remaining: `{payload['b1_progress'].get('estimated_hours_remaining')}`",
+                f"- b1_parallel_workers: `{payload['b1_progress'].get('current_parallel_workers')}`",
+                f"- b1_render_protocol: `{payload['b1_progress'].get('current_render_protocol')}`",
+                f"- b1_render_resolution: `{payload['b1_progress'].get('current_render_resolution')}`",
+                f"- b1_cycles_samples: `{payload['b1_progress'].get('current_cycles_samples')}`",
                 f"- batch_0_64_materials: `{json.dumps(payload['quota_batches']['batch_0_64']['summary'].get('material_family', {}), ensure_ascii=False)}`",
                 f"- batch_1_256_materials: `{json.dumps(payload['quota_batches']['batch_1_256']['summary'].get('material_family', {}), ensure_ascii=False)}`",
                 f"- batch_1_512_materials: `{json.dumps(payload['quota_batches']['batch_1_512']['summary'].get('material_family', {}), ensure_ascii=False)}`",
