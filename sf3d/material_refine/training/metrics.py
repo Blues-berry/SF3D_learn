@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from typing import Any
 
@@ -73,17 +74,28 @@ def gradient_preservation_loss(
     refined: torch.Tensor,
     target: torch.Tensor,
     confidence: torch.Tensor,
+    *,
+    sample_weights: torch.Tensor | None = None,
+    channel_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     refined_dx = refined[:, :, :, 1:] - refined[:, :, :, :-1]
     target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
-    weight_dx = torch.minimum(confidence[:, :, :, 1:], confidence[:, :, :, :-1])
+    weight_dx = torch.minimum(confidence[:, :, :, 1:], confidence[:, :, :, :-1]).expand_as(refined_dx)
     refined_dy = refined[:, :, 1:, :] - refined[:, :, :-1, :]
     target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
-    weight_dy = torch.minimum(confidence[:, :, 1:, :], confidence[:, :, :-1, :])
-    loss_dx = ((refined_dx - target_dx).abs() * weight_dx).sum()
-    loss_dy = ((refined_dy - target_dy).abs() * weight_dy).sum()
-    weight = weight_dx.sum() + weight_dy.sum()
-    return (loss_dx + loss_dy) / weight.clamp_min(1.0)
+    weight_dy = torch.minimum(confidence[:, :, 1:, :], confidence[:, :, :-1, :]).expand_as(refined_dy)
+    if channel_weights is not None:
+        weight_dx = weight_dx * channel_weights
+        weight_dy = weight_dy * channel_weights
+    if sample_weights is None:
+        loss_dx = ((refined_dx - target_dx).abs() * weight_dx).sum()
+        loss_dy = ((refined_dy - target_dy).abs() * weight_dy).sum()
+        weight = weight_dx.sum() + weight_dy.sum()
+        return (loss_dx + loss_dy) / weight.clamp_min(1.0)
+    per_sample_dx = ((refined_dx - target_dx).abs() * weight_dx).flatten(1).sum(dim=1) / weight_dx.flatten(1).sum(dim=1).clamp_min(1.0)
+    per_sample_dy = ((refined_dy - target_dy).abs() * weight_dy).flatten(1).sum(dim=1) / weight_dy.flatten(1).sum(dim=1).clamp_min(1.0)
+    per_sample = 0.5 * (per_sample_dx + per_sample_dy)
+    return (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1.0)
 
 
 def metallic_classification_loss(
@@ -197,6 +209,53 @@ def extract_metadata_labels(value: Any) -> list[str]:
     return [text]
 
 
+def rm_channel_weight_tensor(
+    args: argparse.Namespace,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    return like.new_tensor(
+        [
+            float(getattr(args, "roughness_channel_weight", 1.0)),
+            float(getattr(args, "metallic_channel_weight", 1.0)),
+        ]
+    ).view(1, 2, 1, 1)
+
+
+def variant_loss_weight_tensor(
+    batch: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    device: str | torch.device,
+) -> torch.Tensor:
+    weights = getattr(args, "train_variant_loss_weights", {}) or {}
+    variants = list(batch.get("prior_variant_type") or [])
+    if not weights or not variants:
+        size = int(batch["uv_albedo"].shape[0])
+        return torch.ones(size, device=device, dtype=torch.float32)
+    values = [float(weights.get(str(variant or "unknown"), 1.0)) for variant in variants]
+    return torch.tensor(values, device=device, dtype=torch.float32).clamp_min(1.0e-6)
+
+
+def weighted_total_variation_loss(
+    tensor: torch.Tensor,
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    loss_x = (tensor[:, :, :, 1:] - tensor[:, :, :, :-1]).abs().mean(dim=(1, 2, 3))
+    loss_y = (tensor[:, :, 1:, :] - tensor[:, :, :-1, :]).abs().mean(dim=(1, 2, 3))
+    per_sample = loss_x + loss_y
+    return (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1.0)
+
+
+def weighted_masked_channel_mean(
+    error: torch.Tensor,
+    weight: torch.Tensor,
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    per_sample = (error * weight).flatten(1).sum(dim=1) / weight.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1.0)
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -211,25 +270,36 @@ def compute_losses(
     coarse = outputs["coarse"]
     baseline = outputs.get("input_prior", outputs["baseline"])
     prior_confidence = batch.get("input_prior_confidence", batch["uv_prior_confidence"]).clamp(0.0, 1.0)
+    sample_weights = variant_loss_weight_tensor(batch, args, device=refined.device).to(refined.dtype)
+    channel_weights = rm_channel_weight_tensor(args, like=refined)
+    channel_confidence = confidence.expand_as(target) * channel_weights
 
-    refine_l1 = ((refined - target).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
-    coarse_l1 = ((coarse - target).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
+    refine_l1 = weighted_masked_channel_mean((refined - target).abs(), channel_confidence, sample_weights)
+    coarse_l1 = weighted_masked_channel_mean((coarse - target).abs(), channel_confidence, sample_weights)
     target_prior_delta = (target - baseline).abs().mean(dim=1, keepdim=True)
     prior_safe_mask = (
         confidence
         * prior_confidence
         * (target_prior_delta <= float(args.residual_safety_margin)).to(refined.dtype)
     )
-    prior_consistency = (
-        (refined - baseline).abs() * prior_safe_mask
-    ).sum() / prior_safe_mask.sum().clamp_min(1.0)
-    smoothness = total_variation_loss(refined)
+    prior_consistency = weighted_masked_channel_mean(
+        (refined - baseline).abs(),
+        prior_safe_mask.expand_as(target),
+        sample_weights,
+    )
+    smoothness = weighted_total_variation_loss(refined, sample_weights)
     edge_aware = (
-        edge_aware_l1_loss(
-            refined,
-            target,
-            confidence,
-            epsilon=args.edge_aware_epsilon,
+        weighted_masked_channel_mean(
+            (refined - target).abs(),
+            (
+                (
+                    rm_gradient_magnitude(target).detach()
+                    / rm_gradient_magnitude(target).detach().flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(args.edge_aware_epsilon)
+                ).clamp(0.0, 1.0)
+                * confidence
+            ).expand_as(target)
+            * channel_weights,
+            sample_weights,
         )
         if args.edge_aware_weight > 0.0
         else refined.new_zeros(())
@@ -246,7 +316,13 @@ def compute_losses(
         else refined.new_zeros(())
     )
     gradient_preservation = (
-        gradient_preservation_loss(refined, target, confidence)
+        gradient_preservation_loss(
+            refined,
+            target,
+            confidence,
+            sample_weights=sample_weights,
+            channel_weights=channel_weights,
+        )
         if args.gradient_preservation_weight > 0.0
         else refined.new_zeros(())
     )
@@ -261,12 +337,13 @@ def compute_losses(
         else refined.new_zeros(())
     )
     residual_safety = (
-        residual_safety_loss(
-            refined,
-            baseline,
-            target,
-            confidence,
-            margin=args.residual_safety_margin,
+        weighted_masked_channel_mean(
+            (refined - baseline).abs(),
+            (
+                (target - baseline).abs().detach().mean(dim=1, keepdim=True) < float(args.residual_safety_margin)
+            ).to(refined.dtype).expand_as(target)
+            * confidence.expand_as(target),
+            sample_weights,
         )
         if args.residual_safety_weight > 0.0
         else refined.new_zeros(())
@@ -364,9 +441,14 @@ def compute_losses(
         # with 0/1 byte RGB values, which become nearly black after normalization.
         # The reliable supervision source is the UV target plus UV correspondence.
         view_targets = sample_uv_maps_to_view(target, batch["view_uvs"])
-        view_consistency = (
-            (sampled_refined - view_targets).abs() * view_mask
-        ).sum() / view_mask.sum().clamp_min(1.0)
+        view_channel_weights = channel_weights.view(1, 1, 2, 1, 1)
+        view_consistency = weighted_masked_channel_mean(
+            (sampled_refined - view_targets).abs().reshape(refined.shape[0], -1, sampled_refined.shape[-2], sampled_refined.shape[-1]),
+            (
+                view_mask.expand_as(sampled_refined) * view_channel_weights
+            ).reshape(refined.shape[0], -1, sampled_refined.shape[-2], sampled_refined.shape[-1]),
+            sample_weights,
+        )
     else:
         view_consistency = refined.new_zeros(())
 
@@ -422,8 +504,6 @@ def compute_losses(
 
 def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
     allowed_exact = {
-        "trainer/global_step",
-        "trainer/epoch",
         "optim/lr",
         "throughput/samples_per_second",
         "throughput/seconds_per_batch",
@@ -444,28 +524,22 @@ def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
 
 def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
     allowed_exact = {
-        "trainer/global_step",
-        "trainer/epoch",
-        "optim/lr",
         "best/selection_metric",
         "best/epoch",
-        "val/input_prior_total_mae",
-        "val/refined_total_mae",
         "val/gain_total",
-        "val/effective_view_supervision_rate",
-        "val/object_level/avg_improvement_total",
         "val/object_level/regression_rate",
-        "val/case_level/avg_improvement_total",
         "val/case_level/regression_rate",
     }
-    allowed_prefixes = (
-        "val/rm_proxy/",
-        "val/by_variant/",
-    )
     return {
         key: value
         for key, value in logs.items()
-        if key in allowed_exact or key.startswith(allowed_prefixes)
+        if key in allowed_exact
+        or key in {
+            "val/rm_proxy/view_mae/delta",
+            "val/rm_proxy/view_mse/delta",
+            "val/rm_proxy/view_psnr/delta",
+        }
+        or (key.startswith("val/by_variant/") and key.endswith("/gain_total"))
     }
 
 
@@ -479,16 +553,8 @@ def add_step_context(
     progress_fraction: float | None = None,
 ) -> dict[str, Any]:
     enriched = dict(logs)
-    enriched["trainer/global_step"] = int(optimizer_step)
-    enriched["trainer/epoch"] = int(epoch)
-    enriched["trainer/optimizer_step"] = int(optimizer_step)
-    if global_batch_step is not None:
-        enriched["trainer/global_batch_step"] = int(global_batch_step)
     if learning_rate is not None:
         enriched["optim/lr"] = float(learning_rate)
-        enriched["trainer/lr"] = float(learning_rate)
-    if progress_fraction is not None:
-        enriched["trainer/progress_fraction"] = float(progress_fraction)
     return enriched
 
 
@@ -496,8 +562,6 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
     if run is None or wandb is None:
         return
     try:
-        wandb.define_metric("trainer/global_step")
-        wandb.define_metric("trainer/epoch")
         for metric_key in (
             "optim/lr",
             "throughput/samples_per_second",
@@ -528,7 +592,7 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "best/selection_metric",
             "best/epoch",
         ):
-            wandb.define_metric(metric_key, step_metric="trainer/global_step")
+            wandb.define_metric(metric_key)
     except Exception as exc:  # noqa: BLE001 - W&B metric setup should not block training.
         print(f"[wandb:warning] define_metric_failed={type(exc).__name__}: {exc}")
 
@@ -952,13 +1016,63 @@ def compute_validation_selection_metric(
         0.0,
         float(residual_diag.get("regression_rate", 0.0) or 0.0),
     )
+    variant_gain_rows = {}
+    for group_key, metrics in (val_payload.get("improvement_group_metrics") or {}).items():
+        if not str(group_key).startswith("prior_variant_type/"):
+            continue
+        variant_name = str(group_key).split("/", 1)[1]
+        variant_gain_rows[variant_name] = float((metrics or {}).get("total_mae", 0.0) or 0.0)
+    variant_order = [
+        "near_gt_prior",
+        "mild_gap_prior",
+        "medium_gap_prior",
+        "large_gap_prior",
+        "no_prior_bootstrap",
+    ]
+    available_variant_gains = [variant_gain_rows[name] for name in variant_order if name in variant_gain_rows]
+    variant_balanced_uv_gain = (
+        float(sum(available_variant_gains) / max(len(available_variant_gains), 1))
+        if available_variant_gains
+        else uv_gain
+    )
+    case_entries = list(((val_payload.get("case_level") or {}).get("entries") or []))
+    near_gt_entries = []
+    withprior_entries = []
+    for entry in case_entries:
+        case_id = str(entry.get("case_id") or "")
+        variant_name = case_id.rsplit("|", 1)[-1] if "|" in case_id else "unknown"
+        avg_gain = float(entry.get("avg_improvement_total", 0.0) or 0.0)
+        if variant_name == "near_gt_prior":
+            near_gt_entries.append(avg_gain)
+        if variant_name != "no_prior_bootstrap":
+            withprior_entries.append(avg_gain)
+    near_gt_regression_rate = (
+        sum(1 for value in near_gt_entries if value < -1.0e-6) / max(len(near_gt_entries), 1)
+        if near_gt_entries
+        else 0.0
+    )
+    withprior_regression_rate = (
+        sum(1 for value in withprior_entries if value < -1.0e-6) / max(len(withprior_entries), 1)
+        if withprior_entries
+        else 0.0
+    )
+    near_gt_penalty = (
+        float(getattr(args, "selection_metric_near_gt_regression_multiplier", 2.0))
+        * near_gt_regression_rate
+    )
+    withprior_penalty = (
+        float(getattr(args, "selection_metric_withprior_regression_multiplier", 1.5))
+        * withprior_regression_rate
+    )
     penalty_total = (
         float(args.selection_view_rm_penalty) * view_penalty
         + float(getattr(args, "selection_mse_penalty", 0.5)) * mse_penalty
         + float(args.selection_psnr_penalty) * psnr_penalty
         + float(args.selection_residual_regression_penalty) * regression_penalty
     )
-    if args.validation_selection_metric == "gain_render_guarded":
+    if args.validation_selection_metric == "variant_balanced_gain_render_guarded":
+        selection_metric = -variant_balanced_uv_gain + penalty_total + near_gt_penalty + withprior_penalty
+    elif args.validation_selection_metric == "gain_render_guarded":
         selection_metric = -uv_gain + penalty_total
     else:
         selection_metric = uv_total + penalty_total
@@ -966,10 +1080,16 @@ def compute_validation_selection_metric(
         "uv_total": uv_total,
         "input_prior_total": input_prior_total,
         "uv_gain": uv_gain,
+        "variant_balanced_uv_gain": variant_balanced_uv_gain,
+        "by_variant_gain": {name: variant_gain_rows.get(name) for name in variant_order},
         "view_penalty": view_penalty,
         "mse_penalty": mse_penalty,
         "psnr_penalty": psnr_penalty,
         "regression_penalty": regression_penalty,
+        "near_gt_regression_rate": near_gt_regression_rate,
+        "withprior_regression_rate": withprior_regression_rate,
+        "near_gt_penalty": near_gt_penalty,
+        "withprior_penalty": withprior_penalty,
         "penalty_total": penalty_total,
         "render_guard_available": render_guard_available,
         "selection_metric": selection_metric,

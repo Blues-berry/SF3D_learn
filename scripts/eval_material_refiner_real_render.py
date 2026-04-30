@@ -40,7 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--split", type=str, required=True)
-    parser.add_argument("--selection-mode", choices=["balanced_by_variant", "first"], default="balanced_by_variant")
+    parser.add_argument(
+        "--selection-mode",
+        choices=["balanced_by_variant", "random_balanced_by_variant", "first"],
+        default="balanced_by_variant",
+    )
     parser.add_argument("--max-cases", type=int, default=30)
     parser.add_argument("--hdri-preset", choices=sorted(HDRI_PRESETS), default="hdri1")
     parser.add_argument("--blender-bin", type=str, default=DEFAULT_BLENDER_BIN)

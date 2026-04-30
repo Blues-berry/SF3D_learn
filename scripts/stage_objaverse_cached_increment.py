@@ -58,6 +58,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Existing merged/source manifest used to exclude already-staged Objaverse source_uids/fileIdentifiers.",
     )
+    parser.add_argument(
+        "--exclude-selection-manifest",
+        type=Path,
+        default=None,
+        help="Existing increment manifest used to exclude already-selected source_uids/fileIdentifiers during topup selection.",
+    )
+    parser.add_argument(
+        "--selected-parquet",
+        type=Path,
+        default=None,
+        help="Reuse an existing selected parquet instead of computing a fresh selection.",
+    )
+    parser.add_argument(
+        "--existing-manifest",
+        type=Path,
+        default=None,
+        help="Existing increment manifest used to preserve already-downloaded local paths and retry only missing rows.",
+    )
+    parser.add_argument(
+        "--selection-mode",
+        type=str,
+        default="auto",
+        choices=("auto", "initial_selection", "retry_missing", "topup_selection"),
+    )
+    parser.add_argument("--selection-pool-id", type=str, default="")
     parser.add_argument("--download", action="store_true")
     return parser.parse_args()
 
@@ -189,23 +214,36 @@ def load_filtered_rows(objaverse_root: Path, sources: list[str], file_types: set
     return pd.concat(frames, axis=0, ignore_index=True)
 
 
-def load_excluded_source_uids(path: Path | None) -> set[str]:
+def manifest_rows(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.exists():
-        return set()
+        return []
     payload = json.loads(path.read_text(encoding="utf-8"))
     rows = payload.get("records", payload) if isinstance(payload, dict) else payload
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def load_excluded_source_uids(*paths: Path | None) -> set[str]:
     excluded: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        source_name = str(row.get("source_name") or "")
-        source_uid = str(row.get("source_uid") or "")
-        object_id = str(row.get("object_id") or "")
-        if "objaverse" not in source_name.lower() and not object_id.startswith("objaverse_"):
-            continue
-        if source_uid:
-            excluded.add(source_uid)
+    for path in paths:
+        for row in manifest_rows(path):
+            source_name = str(row.get("source_name") or "")
+            source_uid = str(row.get("source_uid") or "")
+            object_id = str(row.get("object_id") or "")
+            if "objaverse" not in source_name.lower() and not object_id.startswith("objaverse_"):
+                continue
+            if source_uid:
+                excluded.add(source_uid)
     return excluded
+
+
+def existing_local_paths(path: Path | None) -> dict[str, str]:
+    local_paths: dict[str, str] = {}
+    for row in manifest_rows(path):
+        source_uid = str(row.get("source_uid") or "")
+        local_path = str(row.get("local_path") or "")
+        if source_uid and local_path and Path(local_path).exists():
+            local_paths[source_uid] = local_path
+    return local_paths
 
 
 def select_rows(
@@ -357,19 +395,35 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     priority_material_families = parse_csv(args.priority_material_families)
     target_material_family_ratios = parse_ratio_csv(args.target_material_family_ratios)
-    frame = load_filtered_rows(args.objaverse_root, sources, file_types)
-    excluded_source_uids = load_excluded_source_uids(args.exclude_manifest)
-    if excluded_source_uids and not frame.empty:
-        frame = frame[~frame["fileIdentifier"].astype(str).isin(excluded_source_uids)].copy()
-    selected = select_rows(
-        frame,
-        args.target,
-        priority_material_families=priority_material_families,
-        target_material_family_ratios=target_material_family_ratios,
-        source_priority=parse_csv(args.source_priority),
-    )
-    selected_parquet = args.output_root / "objaverse_cached_selected.parquet"
-    selected.to_parquet(selected_parquet)
+    previous_payload = json.loads(args.existing_manifest.read_text(encoding="utf-8")) if args.existing_manifest and args.existing_manifest.exists() else {}
+    previous_retry_round = int(previous_payload.get("retry_round") or 0) if isinstance(previous_payload, dict) else 0
+    previous_local_paths = existing_local_paths(args.existing_manifest)
+    excluded_source_uids = load_excluded_source_uids(args.exclude_manifest, args.exclude_selection_manifest)
+
+    selected_parquet = args.selected_parquet or (args.output_root / "objaverse_cached_selected.parquet")
+    if args.selected_parquet and args.selected_parquet.exists():
+        selected = pd.read_parquet(args.selected_parquet)
+    else:
+        frame = load_filtered_rows(args.objaverse_root, sources, file_types)
+        if excluded_source_uids and not frame.empty:
+            frame = frame[~frame["fileIdentifier"].astype(str).isin(excluded_source_uids)].copy()
+        selected = select_rows(
+            frame,
+            args.target,
+            priority_material_families=priority_material_families,
+            target_material_family_ratios=target_material_family_ratios,
+            source_priority=parse_csv(args.source_priority),
+        )
+        selected.to_parquet(selected_parquet)
+
+    if args.selection_mode != "auto":
+        selection_mode = args.selection_mode
+    elif args.selected_parquet and args.existing_manifest:
+        selection_mode = "retry_missing"
+    elif args.exclude_selection_manifest:
+        selection_mode = "topup_selection"
+    else:
+        selection_mode = "initial_selection"
 
     selection_preview = {
         "generated_at_utc": utc_now(),
@@ -394,15 +448,24 @@ def main() -> None:
 
     download_results: dict[str, str] = {}
     download_error = ""
-    if args.download and not selected.empty:
+    download_selected = selected
+    if previous_local_paths and not selected.empty:
+        missing_ids = {
+            str(row["fileIdentifier"])
+            for _index, row in selected.iterrows()
+            if str(row["fileIdentifier"]) not in previous_local_paths
+        }
+        download_selected = selected[selected["fileIdentifier"].astype(str).isin(missing_ids)].copy()
+
+    if args.download and not download_selected.empty:
         import objaverse.xl as oxl
 
         try:
             download_kwargs: dict[str, Any] = {}
-            if "github" in set(selected["source"].astype(str).str.lower()):
+            if "github" in set(download_selected["source"].astype(str).str.lower()):
                 download_kwargs["save_repo_format"] = args.github_save_repo_format
             download_results = oxl.download_objects(
-                selected[["fileIdentifier", "source", "license", "fileType", "sha256", "metadata"]],
+                download_selected[["fileIdentifier", "source", "license", "fileType", "sha256", "metadata"]],
                 download_dir=str(args.objaverse_root.parent),
                 processes=args.processes,
                 **download_kwargs,
@@ -411,13 +474,12 @@ def main() -> None:
             download_error = f"{type(exc).__name__}: {exc}"
 
     recovered_results = reconcile_cached_downloads(args.objaverse_root.parent, selected)
-    if recovered_results:
-        download_results = {**recovered_results, **download_results}
+    combined_local_paths = {**recovered_results, **previous_local_paths, **download_results}
 
     rows: list[dict[str, Any]] = []
     for _index, row in selected.iterrows():
         identifier = str(row["fileIdentifier"])
-        local_path = download_results.get(identifier, "")
+        local_path = combined_local_paths.get(identifier, "")
         rows.append(
             {
                 "source_name": "Objaverse-XL_cached_strict_increment",
@@ -439,17 +501,27 @@ def main() -> None:
         "generated_at_utc": utc_now(),
         "sources": sources,
         "target": args.target,
+        "selection_mode": selection_mode,
+        "selection_pool_id": args.selection_pool_id,
         "selection_policy": {
             "priority_material_families": priority_material_families,
             "target_material_family_ratios": target_material_family_ratios,
             "source_priority": parse_csv(args.source_priority),
         },
         "exclude_manifest": str(args.exclude_manifest.resolve()) if args.exclude_manifest else "",
+        "exclude_selection_manifest": str(args.exclude_selection_manifest.resolve()) if args.exclude_selection_manifest else "",
         "excluded_existing_source_uid_count": len(excluded_source_uids),
         "selected_count": len(rows),
+        "selected_total": len(rows),
         "download_requested": args.download,
+        "download_attempted_count": int(len(download_selected)),
         "download_error": download_error,
+        "retry_round": previous_retry_round + 1 if selection_mode == "retry_missing" else 0,
         "downloaded_count": sum(row["download_status"] == "downloaded" for row in rows),
+        "downloaded_total": sum(row["download_status"] == "downloaded" for row in rows),
+        "missing_count": sum(row["download_status"] != "downloaded" for row in rows),
+        "missing_total": sum(row["download_status"] != "downloaded" for row in rows),
+        "topup_selected_total": len(rows) if selection_mode == "topup_selection" else 0,
         "source_counts": dict(Counter(row["source"] for row in rows)),
         "license_counts": dict(Counter(row["license_bucket"] for row in rows)),
         "material_counts": dict(Counter(row["highlight_material_class"] for row in rows)),

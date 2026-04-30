@@ -346,6 +346,12 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         help="Compute LPIPS when the optional lpips package is installed.",
     )
     parser.add_argument(
+        "--lpips-max-images",
+        type=int,
+        default=64,
+        help="Maximum proxy-render views queued for LPIPS across the run. 0 disables LPIPS queueing.",
+    )
+    parser.add_argument(
         "--diagnostic-min-group-count",
         type=int,
         default=GROUP_DIAGNOSTIC_MIN_COUNT,
@@ -2476,7 +2482,7 @@ def main() -> None:
                     refined_psnr = compute_masked_psnr(refined_proxy, reference_rgb_hwc, mask_np)
                     baseline_ssim = compute_masked_ssim(baseline_proxy, reference_rgb_hwc, mask_np)
                     refined_ssim = compute_masked_ssim(refined_proxy, reference_rgb_hwc, mask_np)
-                    if lpips_model is not None:
+                    if lpips_model is not None and int(args.lpips_max_images) != 0 and len(pending_lpips_rows) < max(int(args.lpips_max_images), 0):
                         pending_lpips_rows.append(
                             (
                                 len(rows),
@@ -2949,6 +2955,14 @@ def main() -> None:
         "refined_total_mae": uv_refined_total_mae,
         "gain_total": uv_improvement_total,
         "avg_improvement_total": uv_improvement_total,
+        "avg_improvement_roughness": uv_baseline_roughness_mae - uv_refined_roughness_mae,
+        "avg_improvement_metallic": uv_baseline_metallic_mae - uv_refined_metallic_mae,
+        "roughness_to_metallic_gain_ratio": (
+            None
+            if abs(uv_baseline_metallic_mae - uv_refined_metallic_mae) <= 1.0e-9
+            else (uv_baseline_roughness_mae - uv_refined_roughness_mae)
+            / (uv_baseline_metallic_mae - uv_refined_metallic_mae)
+        ),
         "improvement_rate": uv_direction_rates["improvement_rate"],
         "regression_rate": uv_direction_rates["regression_rate"],
         "tie_rate": uv_direction_rates["tie_rate"],

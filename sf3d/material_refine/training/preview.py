@@ -331,6 +331,38 @@ def select_variant_balanced_records(
         return unique_records[:max_count]
     if mode == "effect_showcase":
         mode = "balanced_by_variant"
+    if mode == "random_balanced_by_variant":
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in unique_records:
+            grouped[str(record.get("prior_variant_type", "unknown") or "unknown")].append(record)
+        ordered_variants = sorted(grouped)
+        variant_count = max(len(ordered_variants), 1)
+        base_quota = max_count // variant_count
+        remainder = max_count % variant_count
+        rng = np.random.default_rng(42)
+        per_variant_selected: dict[str, list[dict[str, Any]]] = {}
+        leftovers: dict[str, list[dict[str, Any]]] = {}
+        for index, variant in enumerate(ordered_variants):
+            quota = base_quota + (1 if index < remainder else 0)
+            rows = list(grouped[variant])
+            rng.shuffle(rows)
+            per_variant_selected[variant] = rows[:quota]
+            leftovers[variant] = rows[quota:]
+        ordered_selection: list[dict[str, Any]] = []
+        max_depth = max((len(items) for items in per_variant_selected.values()), default=0)
+        for depth in range(max_depth):
+            for variant in ordered_variants:
+                items = per_variant_selected[variant]
+                if depth < len(items):
+                    ordered_selection.append(items[depth])
+                    if len(ordered_selection) >= max_count:
+                        return ordered_selection
+        for variant in ordered_variants:
+            for item in leftovers[variant]:
+                ordered_selection.append(item)
+                if len(ordered_selection) >= max_count:
+                    return ordered_selection
+        return ordered_selection
 
     if mode != "balanced_by_variant":
         if mode == "balanced":

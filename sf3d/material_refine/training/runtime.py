@@ -311,6 +311,7 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         type=str,
         default="near_gt_prior=1.0,mild_gap_prior=1.0,medium_gap_prior=1.0,large_gap_prior=1.0,no_prior_bootstrap=0.75",
     )
+    parser.add_argument("--train-variant-loss-weights", type=str, default=None)
     parser.add_argument("--train-target-quality-weights", type=str, default=None)
     parser.add_argument("--train-difficulty-metadata-key", type=str, default=None)
     parser.add_argument("--train-difficulty-weights", type=str, default=None)
@@ -326,6 +327,8 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--prior-consistency-weight", type=float, default=0.10)
     parser.add_argument("--smoothness-weight", type=float, default=0.02)
     parser.add_argument("--view-consistency-weight", type=float, default=0.15)
+    parser.add_argument("--roughness-channel-weight", type=float, default=1.0)
+    parser.add_argument("--metallic-channel-weight", type=float, default=1.0)
     parser.add_argument(
         "--enable-sampled-view-rm-loss",
         type=parse_bool,
@@ -393,9 +396,14 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--val-preview-samples", type=int, default=4)
     parser.add_argument(
         "--val-preview-selection",
-        choices=["effect_showcase", "first", "balanced"],
+        choices=["effect_showcase", "first", "balanced", "balanced_by_variant"],
         default="effect_showcase",
         help="How validation preview examples are selected from each validation pass.",
+    )
+    parser.add_argument(
+        "--realrender-upload-policy",
+        choices=["grouped_30_case", "summary_only", "disabled"],
+        default="grouped_30_case",
     )
     parser.add_argument("--wandb-val-preview-max", type=int, default=8)
     parser.add_argument("--wandb-log-preview-grid", type=parse_bool, default=False)
@@ -405,13 +413,15 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
     parser.add_argument(
         "--validation-selection-metric",
-        choices=["uv_total", "uv_render_guarded", "gain_render_guarded"],
+        choices=["uv_total", "uv_render_guarded", "gain_render_guarded", "variant_balanced_gain_render_guarded"],
         default="gain_render_guarded",
     )
     parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
     parser.add_argument("--selection-mse-penalty", type=float, default=0.5)
     parser.add_argument("--selection-psnr-penalty", type=float, default=0.25)
     parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
+    parser.add_argument("--selection-metric-near-gt-regression-multiplier", type=float, default=1.0)
+    parser.add_argument("--selection-metric-withprior-regression-multiplier", type=float, default=1.0)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--init-from-checkpoint",
@@ -613,10 +623,21 @@ def parse_args() -> argparse.Namespace:
     args.torch_num_threads = max(int(args.torch_num_threads), 0)
     args.torch_num_interop_threads = max(int(args.torch_num_interop_threads), 0)
     args.min_nontrivial_target_count_for_paper = max(int(args.min_nontrivial_target_count_for_paper), 0)
+    args.roughness_channel_weight = max(float(args.roughness_channel_weight), 0.1)
+    args.metallic_channel_weight = max(float(args.metallic_channel_weight), 0.1)
+    args.selection_metric_near_gt_regression_multiplier = max(
+        float(args.selection_metric_near_gt_regression_multiplier),
+        1.0,
+    )
+    args.selection_metric_withprior_regression_multiplier = max(
+        float(args.selection_metric_withprior_regression_multiplier),
+        1.0,
+    )
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
     args.train_failure_tag_weights = parse_weight_map(args.train_failure_tag_weights)
     args.train_prior_variant_weights = parse_weight_map(args.train_prior_variant_weights)
+    args.train_variant_loss_weights = parse_weight_map(args.train_variant_loss_weights)
     return args
 
 
@@ -871,6 +892,47 @@ def extract_metadata_labels(value: Any) -> list[str]:
     if "," in text:
         return [part.strip() for part in text.split(",") if part.strip()]
     return [text]
+
+
+def rm_channel_weight_tensor(
+    args: argparse.Namespace,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    return like.new_tensor(
+        [
+            float(getattr(args, "roughness_channel_weight", 1.0)),
+            float(getattr(args, "metallic_channel_weight", 1.0)),
+        ]
+    ).view(1, 2, 1, 1)
+
+
+def variant_loss_weight_tensor(
+    batch: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    device: str | torch.device,
+) -> torch.Tensor:
+    weights = getattr(args, "train_variant_loss_weights", {}) or {}
+    variants = list(batch.get("prior_variant_type") or [])
+    if not weights or not variants:
+        size = int(batch["uv_albedo"].shape[0])
+        return torch.ones(size, device=device, dtype=torch.float32)
+    values = [
+        float(weights.get(str(variant or "unknown"), 1.0))
+        for variant in variants
+    ]
+    return torch.tensor(values, device=device, dtype=torch.float32).clamp_min(1.0e-6)
+
+
+def weighted_total_variation_loss(
+    tensor: torch.Tensor,
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    loss_x = (tensor[:, :, :, 1:] - tensor[:, :, :, :-1]).abs().mean(dim=(1, 2, 3))
+    loss_y = (tensor[:, :, 1:, :] - tensor[:, :, :-1, :]).abs().mean(dim=(1, 2, 3))
+    per_sample = loss_x + loss_y
+    return (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1.0)
 
 
 def compute_losses(
@@ -1322,15 +1384,6 @@ def compact_dataset_wandb_logs(data_state: dict[str, Any]) -> dict[str, Any]:
 
 def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
     allowed_exact = {
-        "epoch",
-        "optimizer_step",
-        "global_batch_step",
-        "lr",
-        "trainer/global_step",
-        "trainer/epoch",
-        "trainer/optimizer_step",
-        "trainer/global_batch_step",
-        "trainer/progress_fraction",
         "optim/lr",
         "throughput/samples_per_second",
         "throughput/seconds_per_batch",
@@ -1351,34 +1404,22 @@ def filter_train_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
 
 def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
     allowed_exact = {
-        "epoch",
-        "optimizer_step",
-        "global_batch_step",
-        "lr",
-        "trainer/global_step",
-        "trainer/epoch",
-        "trainer/optimizer_step",
-        "trainer/global_batch_step",
-        "optim/lr",
         "best/selection_metric",
         "best/epoch",
-        "val/input_prior_total_mae",
-        "val/refined_total_mae",
         "val/gain_total",
-        "val/effective_view_supervision_rate",
-        "val/object_level/avg_improvement_total",
         "val/object_level/regression_rate",
-        "val/case_level/avg_improvement_total",
         "val/case_level/regression_rate",
     }
-    allowed_prefixes = (
-        "val/rm_proxy/",
-        "val/by_variant/",
-    )
     return {
         key: value
         for key, value in logs.items()
-        if key in allowed_exact or key.startswith(allowed_prefixes)
+        if key in allowed_exact
+        or key in {
+            "val/rm_proxy/view_mae/delta",
+            "val/rm_proxy/view_mse/delta",
+            "val/rm_proxy/view_psnr/delta",
+        }
+        or (key.startswith("val/by_variant/") and key.endswith("/gain_total"))
     }
 
 
@@ -1392,16 +1433,8 @@ def add_step_context(
     progress_fraction: float | None = None,
 ) -> dict[str, Any]:
     enriched = dict(logs)
-    enriched["trainer/global_step"] = int(optimizer_step)
-    enriched["trainer/epoch"] = int(epoch)
-    enriched["trainer/optimizer_step"] = int(optimizer_step)
-    if global_batch_step is not None:
-        enriched["trainer/global_batch_step"] = int(global_batch_step)
     if learning_rate is not None:
         enriched["optim/lr"] = float(learning_rate)
-        enriched["trainer/lr"] = float(learning_rate)
-    if progress_fraction is not None:
-        enriched["trainer/progress_fraction"] = float(progress_fraction)
     return enriched
 
 
@@ -1409,8 +1442,6 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
     if run is None or wandb is None:
         return
     try:
-        wandb.define_metric("trainer/global_step")
-        wandb.define_metric("trainer/epoch")
         for metric_key in (
             "optim/lr",
             "throughput/samples_per_second",
@@ -1441,7 +1472,7 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "best/selection_metric",
             "best/epoch",
         ):
-            wandb.define_metric(metric_key, step_metric="trainer/global_step")
+            wandb.define_metric(metric_key)
     except Exception as exc:  # noqa: BLE001 - W&B metric setup should not block training.
         print(f"[wandb:warning] define_metric_failed={type(exc).__name__}: {exc}")
 
@@ -4270,6 +4301,7 @@ def evaluate(
     improvement_group_store: dict[str, dict[str, float]] = {}
     object_improvement_store: dict[str, dict[str, float]] = {}
     case_improvement_store: dict[str, dict[str, float]] = {}
+    variant_view_store: dict[str, dict[str, float]] = {}
     steps = 0
     preview_candidates: list[dict[str, Any]] = []
     render_proxy_enabled = should_compute_render_proxy_validation(args, validation_label)
@@ -4448,6 +4480,22 @@ def evaluate(
                     value = float(view_rm_delta[item_index].detach().cpu().item())
                     view_rm_mae_delta_value = None if math.isnan(value) else value
                 effect_bucket = preview_effect_bucket(improvement_metric_kwargs["total_mae"])
+                variant_view_bucket = variant_view_store.setdefault(
+                    prior_variant_type,
+                    {
+                        "count": 0.0,
+                        "effective_view_supervision_samples": 0.0,
+                        "view_rm_delta_sum": 0.0,
+                        "view_rm_delta_count": 0.0,
+                    },
+                )
+                variant_view_bucket["count"] += 1.0
+                variant_view_bucket["effective_view_supervision_samples"] += float(
+                    bool(batch["has_effective_view_supervision"][item_index].item())
+                )
+                if view_rm_mae_delta_value is not None:
+                    variant_view_bucket["view_rm_delta_sum"] += float(view_rm_mae_delta_value)
+                    variant_view_bucket["view_rm_delta_count"] += 1.0
                 if int(args.val_preview_samples) > 0:
                     preview_path = save_validation_preview(
                         output_dir,
@@ -4538,6 +4586,20 @@ def evaluate(
         "improvement_rate": improvement["improved_samples"] / sample_count,
         "regression_rate": improvement["regressed_samples"] / sample_count,
     }
+    view_stats_by_variant = {
+        variant: {
+            "count": int(bucket.get("count", 0.0)),
+            "effective_view_supervision_rate": float(
+                bucket.get("effective_view_supervision_samples", 0.0) / max(bucket.get("count", 0.0), 1.0)
+            ),
+            "sampled_view_rm_proxy_delta": (
+                float(bucket.get("view_rm_delta_sum", 0.0) / max(bucket.get("view_rm_delta_count", 0.0), 1.0))
+                if bucket.get("view_rm_delta_count", 0.0) > 0.0
+                else None
+            ),
+        }
+        for variant, bucket in sorted(variant_view_store.items())
+    }
     return {
         "loss": mean_losses,
         "uv_mae": mean_uv_mae,
@@ -4553,6 +4615,7 @@ def evaluate(
         "max_validation_batches": int(args.max_validation_batches),
         "effective_view_supervision_samples": int(uv_mae.get("effective_view_supervision_samples", 0.0)),
         "effective_view_supervision_rate": float(uv_mae.get("effective_view_supervision_samples", 0.0) / max(uv_mae["count"], 1.0)),
+        "view_stats_by_variant": view_stats_by_variant,
         "view_consistency_enabled": bool(
             (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
             and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
@@ -5023,13 +5086,6 @@ def run_validation_cycle(
         if preview_images:
             preview_log_payload: dict[str, Any] = {}
             preview_log_payload[f"val_preview/{safe_wandb_key(validation_label)}/cases"] = preview_images
-            preview_log_payload = add_step_context(
-                preview_log_payload,
-                epoch=epoch,
-                optimizer_step=optimizer_step,
-                global_batch_step=global_batch_step,
-                learning_rate=learning_rate,
-            )
             run.log(preview_log_payload, step=optimizer_step)
 
     return val_payload, float(best_val_metric), int(best_epoch), improved
@@ -5484,9 +5540,6 @@ def main() -> None:
                     "progress/val_records": val_records,
                     "progress/planned_samples": epoch_planned_samples,
                 }
-                interval_logs["trainer/global_step_total"] = interval_logs["progress/global_step_total"]
-                interval_logs["trainer/epoch_step"] = epoch_optimizer_step
-                interval_logs["trainer/epoch_steps_total"] = epoch_optimizer_steps_total
                 if interval_examples > 0:
                     interval_logs["train/effective_view_supervision_rate"] = interval["effective_view_supervision_samples"] / interval_examples
                 interval_logs = add_step_context(

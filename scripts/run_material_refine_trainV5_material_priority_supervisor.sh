@@ -129,6 +129,7 @@ while true; do
   batch256_rc=0
   batch512_rc=0
   batch1000_rc=0
+  serial_launch_rc=0
   download_mode="$(next_download_mode)"
 
   if stage_process_running; then
@@ -236,6 +237,14 @@ while true; do
       outcome="preflight_failed"
       log "preflight refresh failed rc64=${batch64_rc} rc256=${batch256_rc} rc512=${batch512_rc} rc1000=${batch1000_rc}"
     else
+      set +e
+      python scripts/maybe_launch_objaverse_1200_serial_after_b1.py >>"${cycle_log}" 2>&1
+      serial_launch_rc=$?
+      set -e
+      if [[ "${serial_launch_rc}" -ne 0 ]]; then
+        outcome="serial_launch_gate_failed"
+        log "serial launch gate failed rc=${serial_launch_rc}"
+      fi
       log "preflight refresh done"
     fi
   fi

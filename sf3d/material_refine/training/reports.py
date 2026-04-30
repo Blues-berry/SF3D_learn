@@ -192,11 +192,13 @@ def build_variant_summary_rows(
     group_metrics = validation_payload.get("group_metrics") or {}
     baseline_group_metrics = validation_payload.get("baseline_group_metrics") or {}
     improvement_group_metrics = validation_payload.get("improvement_group_metrics") or {}
+    view_stats_by_variant = validation_payload.get("view_stats_by_variant") or {}
     rows = []
     for group_key, metrics in sorted(group_metrics.items()):
         if not str(group_key).startswith("prior_variant_type/"):
             continue
         variant = str(group_key).split("/", 1)[1]
+        view_stats = view_stats_by_variant.get(variant) or {}
         rows.append(
             {
                 "variant": variant,
@@ -207,6 +209,8 @@ def build_variant_summary_rows(
                 "gain_total": (
                     (improvement_group_metrics.get(group_key) or {}).get("total_mae")
                 ),
+                "effective_view_supervision_rate": view_stats.get("effective_view_supervision_rate"),
+                "sampled_view_rm_proxy_delta": view_stats.get("sampled_view_rm_proxy_delta"),
             }
         )
     return rows
@@ -255,6 +259,8 @@ def write_training_overview(
         f"<td>{format_metric(row.get('input_prior_total_mae'))}</td>"
         f"<td>{format_metric(row.get('refined_total_mae'))}</td>"
         f"<td>{format_metric(row.get('gain_total'))}</td>"
+        f"<td>{format_metric(row.get('effective_view_supervision_rate'), 4)}</td>"
+        f"<td>{format_metric(row.get('sampled_view_rm_proxy_delta'), 4)}</td>"
         "</tr>"
         for row in variant_rows
     ]
@@ -330,7 +336,7 @@ def write_training_overview(
                 else "",
                 (
                     "<div class='card'><h2>By Variant</h2><table><thead><tr>"
-                    "<th>variant</th><th>input prior total MAE</th><th>refined total MAE</th><th>UV gain</th>"
+                    "<th>variant</th><th>input prior total MAE</th><th>refined total MAE</th><th>UV gain</th><th>view supervision rate</th><th>view RM delta</th>"
                     "</tr></thead><tbody>"
                     + "".join(variant_rows_html)
                     + "</tbody></table></div>"

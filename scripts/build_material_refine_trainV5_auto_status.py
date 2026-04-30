@@ -19,6 +19,9 @@ DEFAULT_QUEUE = REPO_ROOT / "output/material_refine_trainV5/expansion_second_pas
 DEFAULT_PENDING = REPO_ROOT / "output/material_refine_trainV5/expansion_second_pass/pending_material_probe_by_source.json"
 DEFAULT_B1_PROGRESS = REPO_ROOT / "output/material_refine_trainV5_abc/B_track/full_1155_rebake/progress_live.json"
 DEFAULT_STAGE_SUMMARY = REPO_ROOT / "output/material_refine_expansion_candidates/material_priority_stage/material_priority_stage_summary.json"
+DEFAULT_OBJ1200_STATUS = REPO_ROOT / "output/material_refine_expansion_candidates/material_priority_stage/objaverse_1200_serial/objaverse_1200_download_status.json"
+DEFAULT_OBJ1200_SERIAL_DECISION = REPO_ROOT / "output/material_refine_trainV5/expansion_second_pass/objaverse_1200_serial/objaverse_1200_serial_decision.json"
+DEFAULT_OBJ1200_LAUNCH_GATE = REPO_ROOT / "output/material_refine_trainV5/expansion_second_pass/objaverse_1200_serial/objaverse_1200_launch_gate_status.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pending-probe-path", type=Path, default=DEFAULT_PENDING)
     parser.add_argument("--b1-progress-path", type=Path, default=DEFAULT_B1_PROGRESS)
     parser.add_argument("--stage-summary-path", type=Path, default=DEFAULT_STAGE_SUMMARY)
+    parser.add_argument("--obj1200-status-path", type=Path, default=DEFAULT_OBJ1200_STATUS)
+    parser.add_argument("--obj1200-serial-decision-path", type=Path, default=DEFAULT_OBJ1200_SERIAL_DECISION)
+    parser.add_argument("--obj1200-launch-gate-path", type=Path, default=DEFAULT_OBJ1200_LAUNCH_GATE)
     return parser.parse_args()
 
 
@@ -180,6 +186,9 @@ def main() -> None:
     pending = read_json(args.pending_probe_path, {})
     b1 = read_json(args.b1_progress_path, {})
     stage_summary = read_json(args.stage_summary_path, {})
+    obj1200_status = read_json(args.obj1200_status_path, {})
+    obj1200_serial = read_json(args.obj1200_serial_decision_path, {})
+    obj1200_launch_gate = read_json(args.obj1200_launch_gate_path, {})
     sessions = tmux_sessions()
     prepare_runtime = current_prepare_runtime(str(b1.get("input_manifest") or ""))
     processed = b1.get("processed")
@@ -203,6 +212,9 @@ def main() -> None:
         "active_objaverse_download_processes": pgrep_lines("stage_objaverse_cached_increment.py"),
         "last_cycle_state": last_cycle,
         "stage_summary": stage_summary.get("summary", {}) if isinstance(stage_summary, dict) else {},
+        "objaverse_1200_download_status": obj1200_status,
+        "objaverse_1200_serial_decision": obj1200_serial,
+        "objaverse_1200_launch_gate": obj1200_launch_gate,
         "latest_queue": queue_summary(args.queue_path),
         "pending_material_probe": pending,
         "b1_progress": {
@@ -246,6 +258,12 @@ def main() -> None:
                 f"- stage_download_mode: `{payload['stage_summary'].get('download_mode')}`",
                 f"- stage_download_success_rate: `{payload['stage_summary'].get('download_success_rate')}`",
                 f"- stage_download_failure_reason: `{payload['stage_summary'].get('download_failure_reason')}`",
+                f"- obj1200_downloaded_total: `{(payload['objaverse_1200_download_status'] or {}).get('downloaded_total')}`",
+                f"- obj1200_missing_total: `{(payload['objaverse_1200_download_status'] or {}).get('missing_total')}`",
+                f"- obj1200_retry_round: `{(payload['objaverse_1200_download_status'] or {}).get('retry_round')}`",
+                f"- obj1200_ready_exact_1200: `{(payload['objaverse_1200_download_status'] or {}).get('ready_exact_1200')}`",
+                f"- obj1200_queue_ready_exact_1200: `{(payload['objaverse_1200_serial_decision'] or {}).get('queue_ready_exact_1200')}`",
+                f"- obj1200_launch_reason: `{(payload['objaverse_1200_launch_gate'] or {}).get('reason')}`",
                 f"- pending_material_probe_by_source: `{json.dumps((payload['pending_material_probe'] or {}).get('source_name', {}), ensure_ascii=False)}`",
                 f"- b1_progress: `{payload['b1_progress'].get('processed')}/{payload['b1_progress'].get('total')}`",
                 f"- b1_pass_rate: `{payload['b1_progress'].get('pass_rate')}`",
