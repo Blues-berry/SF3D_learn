@@ -257,6 +257,7 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         type=str,
         default="near_gt_prior=1.0,mild_gap_prior=1.0,medium_gap_prior=1.0,large_gap_prior=1.0,no_prior_bootstrap=0.75",
     )
+    parser.add_argument("--train-variant-loss-weights", type=str, default=None)
     parser.add_argument("--train-target-quality-weights", type=str, default=None)
     parser.add_argument("--train-difficulty-metadata-key", type=str, default=None)
     parser.add_argument("--train-difficulty-weights", type=str, default=None)
@@ -293,6 +294,8 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--material-context-weight", type=float, default=0.0)
     parser.add_argument("--residual-safety-weight", type=float, default=0.0)
     parser.add_argument("--residual-safety-margin", type=float, default=0.03)
+    parser.add_argument("--roughness-channel-weight", type=float, default=1.0)
+    parser.add_argument("--metallic-channel-weight", type=float, default=1.0)
     parser.add_argument("--view-consistency-mode", choices=["auto", "required", "disabled"], default="auto")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--validation-steps", type=int, default=0)
@@ -351,13 +354,15 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
     parser.add_argument(
         "--validation-selection-metric",
-        choices=["uv_total", "uv_render_guarded", "gain_render_guarded"],
+        choices=["uv_total", "uv_render_guarded", "gain_render_guarded", "variant_balanced_gain_render_guarded"],
         default="gain_render_guarded",
     )
     parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
     parser.add_argument("--selection-mse-penalty", type=float, default=0.5)
     parser.add_argument("--selection-psnr-penalty", type=float, default=0.25)
     parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
+    parser.add_argument("--selection-metric-near-gt-regression-multiplier", type=float, default=2.0)
+    parser.add_argument("--selection-metric-withprior-regression-multiplier", type=float, default=1.5)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--init-from-checkpoint",
@@ -559,10 +564,21 @@ def parse_args() -> argparse.Namespace:
     args.torch_num_threads = max(int(args.torch_num_threads), 0)
     args.torch_num_interop_threads = max(int(args.torch_num_interop_threads), 0)
     args.min_nontrivial_target_count_for_paper = max(int(args.min_nontrivial_target_count_for_paper), 0)
+    args.roughness_channel_weight = max(float(args.roughness_channel_weight), 0.1)
+    args.metallic_channel_weight = max(float(args.metallic_channel_weight), 0.1)
+    args.selection_metric_near_gt_regression_multiplier = max(
+        float(args.selection_metric_near_gt_regression_multiplier),
+        1.0,
+    )
+    args.selection_metric_withprior_regression_multiplier = max(
+        float(args.selection_metric_withprior_regression_multiplier),
+        1.0,
+    )
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
     args.train_failure_tag_weights = parse_weight_map(args.train_failure_tag_weights)
     args.train_prior_variant_weights = parse_weight_map(args.train_prior_variant_weights)
+    args.train_variant_loss_weights = parse_weight_map(args.train_variant_loss_weights)
     return args
 
 

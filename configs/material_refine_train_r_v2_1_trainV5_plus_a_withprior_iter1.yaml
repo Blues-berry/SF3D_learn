@@ -6,10 +6,10 @@ split_strategy: manifest
 allow_empty_val: false
 epochs: 24
 max_train_steps: 0
-batch_size: 4
-val_batch_size: 4
+batch_size: 2
+val_batch_size: 2
 num_workers: 4
-grad_accumulation_steps: 8
+grad_accumulation_steps: 16
 learning_rate: 1.0e-05
 min_learning_rate: 2.0e-06
 weight_decay: 0.01
@@ -107,7 +107,7 @@ render_proxy_validation_milestone_interval: 1
 render_proxy_validation_max_batches: 6
 val_enable_lpips: true
 val_lpips_max_images: 12
-max_validation_batches: 40
+max_validation_batches: 80
 save_every: 1
 checkpointing_steps: 0
 save_only_best_checkpoint: true
@@ -125,7 +125,7 @@ save_preview_contact_sheet: false
 output_dir: output/material_refine_trainV5_plus_a_track_withprior_iter1
 report_to: wandb
 tracker_project_name: stable-fast-3d-material-refine-trainv5-a-track
-tracker_run_name: material_refine_train_r_v2_1_trainV5_plus_a_withprior_iter1
+tracker_run_name: material_refine_train_r_v2_1_trainV5_plus_a_withprior_iter1_b2v160
 tracker_group: r-v2-1-withprior-iter1
 tracker_tags: trainV5-plus-a,r-v2.1,fullrun,prior-gap,gpu1
 wandb_mode: online
