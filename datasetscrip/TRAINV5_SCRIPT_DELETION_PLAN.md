@@ -6,6 +6,19 @@
 The old `scripts/` files are now split into four groups so deletion can proceed
 without interrupting running rebake or finalize sessions.
 
+## Current Migration State
+
+- First one-off script deletion batch is complete.
+- `datasetscrip/internal/` now owns the TrainV5 dataset command orchestration
+  layer used by `datasetscrip/trainv5_dataset.py`.
+- `datasetscrip/internal/` has been split by responsibility:
+  `common.py`, `ingest.py`, `queue.py`, `status.py`, `launch.py`, and
+  `finalize.py`.
+- The remaining `scripts/` files in `keep_active` are internal implementation
+  helpers or live rebake/finalize dependencies. Delete them only after their
+  behavior has moved into `datasetscrip/internal/` and one rolling batch has
+  completed through the new path.
+
 ## keep_active
 
 These files are still used by `datasetscrip`, the running B-track rebake, monitor,
@@ -37,6 +50,18 @@ their original `scripts/` versions.
 | `scripts/stage_objaverse_cached_increment.py` | Internal source staging function/module. |
 | `scripts/build_objaverse_increment_manifest.py` | Internal source manifest conversion helper. |
 | `scripts/merge_material_refine_expansion_candidates.py` | Internal ingest helper. |
+
+## next_delete_candidates_after_migration
+
+These should become wrappers first, then be deleted after dry-run and one
+supervisor cycle pass.
+
+| file | prerequisite |
+|---|---|
+| `scripts/stage_material_refine_material_priority_sources.py` | Move source staging implementation into `datasetscrip/internal/ingest.py`. |
+| `scripts/build_material_refine_trainV5_expansion_second_pass.py` | Move second-pass implementation into `datasetscrip/internal/queue.py`. |
+| `scripts/build_material_refine_trainV5_repair_and_expansion_plan.py` | Move repair/ready-deferred implementation into `datasetscrip/internal/queue.py`. |
+| `scripts/resolve_next_trainv5_b_batch.py` | Move next-batch decision into `datasetscrip/internal/launch.py`. |
 
 ## deleted_first_batch
 

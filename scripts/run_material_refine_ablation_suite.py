@@ -392,6 +392,18 @@ def _build_disagreement_html(summary: dict[str, Any], *, title: str) -> Any | No
     return wandb.Html(html_doc)
 
 
+def _safe_wandb_component(value: Any) -> str:
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value or "unknown"))
+
+
+def _metric_delta(prior_metrics: dict[str, Any], ours_metrics: dict[str, Any], name: str, *, higher_is_better: bool) -> float | None:
+    prior_value = prior_metrics.get(name)
+    ours_value = ours_metrics.get(name)
+    if prior_value is None or ours_value is None:
+        return None
+    return float(ours_value - prior_value) if higher_is_better else float(prior_value - ours_value)
+
+
 def init_benchmark_wandb(args: argparse.Namespace, *, run_dir: Path) -> Any | None:
     if not parse_bool(args.wandb_benchmark_upload):
         return None
@@ -443,27 +455,87 @@ def upload_benchmark_outputs(run: Any | None, *, suite_dir: Path) -> None:
         if realrender_stage.exists():
             summary = load_json(realrender_stage)
             metrics = summary.get("real_render_metrics") or {}
+            prior_distribution = summary.get("selected_prior_distribution") or {}
+            selected_distribution_total = max(sum(int(count or 0) for count in prior_distribution.values()), 1)
             for metric_name in ("psnr", "mse", "ssim", "lpips"):
                 scalar_logs[f"benchmark/{split}_realrender_30/{metric_name}_delta"] = summary.get(
                     f"{metric_name}_delta",
                     ((metrics.get(metric_name) or {}).get("delta")),
                 )
+            for variant, count in prior_distribution.items():
+                safe_variant = _safe_wandb_component(variant)
+                scalar_logs[f"benchmark/{split}_realrender_30/prior_distribution/{safe_variant}_count"] = count
+                scalar_logs[f"benchmark/{split}_realrender_30/prior_distribution/{safe_variant}_rate"] = float(count) / float(selected_distribution_total)
             if str(summary.get("selection_mode")) == "random_balanced_by_variant" and parse_bool(True):
                 grouped_images: dict[str, list[Any]] = {}
+                comparison_table = wandb.Table(
+                    columns=[
+                        "slot",
+                        "object_id",
+                        "pair_id",
+                        "prior_variant_type",
+                        "prior_quality_bin",
+                        "case_gain_total",
+                        "psnr_delta",
+                        "ssim_delta",
+                        "mse_delta",
+                        "lpips_delta",
+                        "prior_distribution",
+                        "comparison_panel",
+                        "gt",
+                        "prior",
+                        "ours",
+                        "prior_error",
+                        "ours_error",
+                    ]
+                )
                 for case in summary.get("cases") or []:
-                    variant = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(case.get("prior_variant_type") or "unknown"))
+                    variant = _safe_wandb_component(case.get("prior_variant_type") or "unknown")
+                    paths = case.get("paths") or {}
+                    distribution_text = str(
+                        case.get("selected_prior_distribution_text")
+                        or summary.get("selected_prior_distribution_text")
+                        or "unknown"
+                    )
+                    prior_metrics = case.get("prior_metrics") or {}
+                    ours_metrics = case.get("ours_metrics") or {}
+                    psnr_delta = _metric_delta(prior_metrics, ours_metrics, "psnr", higher_is_better=True)
+                    ssim_delta = _metric_delta(prior_metrics, ours_metrics, "ssim", higher_is_better=True)
+                    mse_delta = _metric_delta(prior_metrics, ours_metrics, "mse", higher_is_better=False)
+                    lpips_delta = _metric_delta(prior_metrics, ours_metrics, "lpips", higher_is_better=False)
+                    comparison_table.add_data(
+                        case.get("selection_slot"),
+                        case.get("object_id"),
+                        case.get("pair_id"),
+                        case.get("prior_variant_type"),
+                        case.get("prior_quality_bin"),
+                        case.get("case_gain_total"),
+                        psnr_delta,
+                        ssim_delta,
+                        mse_delta,
+                        lpips_delta,
+                        distribution_text,
+                        wandb.Image(paths["comparison_panel"]) if paths.get("comparison_panel") else None,
+                        wandb.Image(paths["gt"]) if paths.get("gt") else None,
+                        wandb.Image(paths["prior"]) if paths.get("prior") else None,
+                        wandb.Image(paths["ours"]) if paths.get("ours") else None,
+                        wandb.Image(paths["prior_error"]) if paths.get("prior_error") else None,
+                        wandb.Image(paths["ours_error"]) if paths.get("ours_error") else None,
+                    )
                     caption = (
                         f"{case.get('object_id')} | {case.get('pair_id')} | "
-                        f"gain={float(case.get('case_gain_total') or 0.0):+.4f}"
+                        f"gain={float(case.get('case_gain_total') or 0.0):+.4f} | "
+                        f"selected prior distribution: {distribution_text}"
                     )
-                    for label in ("gt", "prior", "ours", "prior_error", "ours_error"):
-                        image_path = ((case.get("paths") or {}).get(label))
+                    for label in ("comparison_panel", "gt", "prior", "ours", "prior_error", "ours_error"):
+                        image_path = paths.get(label)
                         if not image_path:
                             continue
                         grouped_images.setdefault(
                             f"benchmark/{split}_realrender_30/{variant}/{label}",
                             [],
                         ).append(wandb.Image(image_path, caption=caption))
+                run.log({f"benchmark/{split}_realrender_30/blender_rgb_comparisons": comparison_table})
                 for key, images in grouped_images.items():
                     run.log({key: images})
     scalar_logs, skipped = sanitize_log_dict(scalar_logs)

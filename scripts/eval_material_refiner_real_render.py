@@ -12,13 +12,17 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sf3d.material_refine.training.preview import select_variant_balanced_records
+from sf3d.material_refine.training.preview import (
+    format_prior_distribution,
+    prior_variant_distribution,
+    select_variant_balanced_records,
+)
 
 
 HDRI_PRESETS = {
@@ -246,6 +250,119 @@ def save_error_heatmap(prediction: torch.Tensor, target: torch.Tensor, mask: tor
     Image.fromarray(heat, mode="RGB").save(output_path)
 
 
+def render_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+    font_names = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for font_name in font_names:
+        try:
+            return ImageFont.truetype(font_name, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def image_tile(path: Path, label: str, *, size: int = 196) -> Image.Image:
+    image = Image.open(path).convert("RGB")
+    image.thumbnail((size, size), Image.Resampling.LANCZOS)
+    tile = Image.new("RGB", (size, size + 30), (246, 248, 251))
+    x0 = (size - image.width) // 2
+    y0 = 30 + (size - image.height) // 2
+    tile.paste(image, (x0, y0))
+    draw = ImageDraw.Draw(tile)
+    draw.rectangle((0, 0, size - 1, 29), fill=(232, 237, 244))
+    draw.text((8, 7), label, font=render_font(14, bold=True), fill=(18, 24, 32))
+    return tile
+
+
+def fit_text(draw: ImageDraw.ImageDraw, text: str, *, font: ImageFont.ImageFont, max_width: int) -> str:
+    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+        return text
+    suffix = "..."
+    candidate = text
+    while candidate and draw.textbbox((0, 0), candidate + suffix, font=font)[2] > max_width:
+        candidate = candidate[:-1]
+    return candidate.rstrip() + suffix if candidate else suffix
+
+
+def metric_delta(prior_metrics: dict[str, Any], ours_metrics: dict[str, Any], name: str, *, higher_is_better: bool) -> float | None:
+    prior_value = prior_metrics.get(name)
+    ours_value = ours_metrics.get(name)
+    if prior_value is None or ours_value is None:
+        return None
+    return float(ours_value - prior_value) if higher_is_better else float(prior_value - ours_value)
+
+
+def format_optional(value: Any, precision: int = 4) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{precision}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def save_comparison_panel(
+    *,
+    case: dict[str, Any],
+    case_dir: Path,
+    view_spec: dict[str, Any],
+    prior_metrics: dict[str, Any],
+    ours_metrics: dict[str, Any],
+    hdri_preset: str,
+    prior_distribution_text: str,
+) -> Path:
+    tile_size = 196
+    gutter = 10
+    header_height = 112
+    footer_height = 34
+    labels = [
+        ("gt.png", "GT RGB"),
+        ("prior.png", "Input Prior RGB"),
+        ("ours.png", "Ours RGB"),
+        ("prior_error.png", "Prior Error"),
+        ("ours_error.png", "Ours Error"),
+    ]
+    tiles = [image_tile(case_dir / filename, label, size=tile_size) for filename, label in labels]
+    width = gutter + len(tiles) * tile_size + (len(tiles) - 1) * gutter + gutter
+    height = header_height + tiles[0].height + gutter + footer_height
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    title_font = render_font(20, bold=True)
+    detail_font = render_font(13)
+    object_id = str(case.get("object_id") or "unknown")
+    pair_id = str(case.get("pair_id") or "unknown")
+    variant = str(case.get("prior_variant_type") or "unknown")
+    quality = str(case.get("prior_quality_bin") or "unknown")
+    draw.text((12, 10), fit_text(draw, object_id, font=title_font, max_width=width - 24), font=title_font, fill=(8, 12, 18))
+    metric_line = (
+        f"variant={variant} | quality={quality} | gain={float(case.get('gain_total') or 0.0):+.4f} | "
+        f"PSNR d={format_optional(metric_delta(prior_metrics, ours_metrics, 'psnr', higher_is_better=True))} | "
+        f"SSIM d={format_optional(metric_delta(prior_metrics, ours_metrics, 'ssim', higher_is_better=True))} | "
+        f"MSE d={format_optional(metric_delta(prior_metrics, ours_metrics, 'mse', higher_is_better=False))} | "
+        f"LPIPS d={format_optional(metric_delta(prior_metrics, ours_metrics, 'lpips', higher_is_better=False))}"
+    )
+    view_line = f"pair={pair_id} | hdri={hdri_preset} | view={view_spec.get('name') or 'unknown'}"
+    distribution_line = f"selected prior distribution: {prior_distribution_text}"
+    for y0, text in ((38, metric_line), (58, view_line), (78, distribution_line)):
+        draw.text((12, y0), fit_text(draw, text, font=detail_font, max_width=width - 24), font=detail_font, fill=(68, 76, 88))
+    y_tile = header_height
+    for index, tile in enumerate(tiles):
+        x0 = gutter + index * (tile_size + gutter)
+        canvas.paste(tile, (x0, y_tile))
+    draw.rectangle((0, height - footer_height, width, height), fill=(239, 243, 248))
+    draw.text(
+        (12, height - footer_height + 9),
+        fit_text(draw, distribution_line, font=detail_font, max_width=width - 24),
+        font=detail_font,
+        fill=(54, 63, 78),
+    )
+    output_path = case_dir / "comparison.png"
+    canvas.save(output_path)
+    return output_path
+
+
 def metric_pair(values: list[float], refined_values: list[float], *, higher_is_better: bool) -> dict[str, Any]:
     baseline = float(np.mean(values)) if values else None
     refined = float(np.mean(refined_values)) if refined_values else None
@@ -362,6 +479,8 @@ def main() -> None:
         max_count=int(args.max_cases),
         mode=str(args.selection_mode),
     )
+    selected_prior_distribution = prior_variant_distribution(selected_cases)
+    selected_prior_distribution_text = format_prior_distribution(selected_prior_distribution)
     hdri_path = HDRI_PRESETS[args.hdri_preset]
     lpips_device = args.lpips_device or (f"cuda:{args.cuda_device_index}" if torch.cuda.is_available() else "cpu")
     case_rows: list[dict[str, Any]] = []
@@ -425,7 +544,29 @@ def main() -> None:
             ours_lpips = compute_lpips(ours_rgb, gt_rgb, mask, device=lpips_device) if parse_bool(args.enable_lpips) else None
             save_error_heatmap(prior_rgb, gt_rgb, mask, case_dir / "prior_error.png")
             save_error_heatmap(ours_rgb, gt_rgb, mask, case_dir / "ours_error.png")
+            prior_metrics = {
+                "mse": prior_mse,
+                "psnr": psnr_from_mse(prior_mse),
+                "ssim": prior_ssim,
+                "lpips": prior_lpips,
+            }
+            ours_metrics = {
+                "mse": ours_mse,
+                "psnr": psnr_from_mse(ours_mse),
+                "ssim": ours_ssim,
+                "lpips": ours_lpips,
+            }
+            comparison_path = save_comparison_panel(
+                case=case,
+                case_dir=case_dir,
+                view_spec=view_spec,
+                prior_metrics=prior_metrics,
+                ours_metrics=ours_metrics,
+                hdri_preset=args.hdri_preset,
+                prior_distribution_text=selected_prior_distribution_text,
+            )
             case_row = {
+                "selection_slot": index,
                 "case_key": case.get("case_key"),
                 "object_id": case.get("object_id"),
                 "pair_id": case.get("pair_id"),
@@ -436,25 +577,19 @@ def main() -> None:
                 "hdri_preset": args.hdri_preset,
                 "view_name": view_spec.get("name"),
                 "case_gain_total": case.get("gain_total"),
-                "prior_metrics": {
-                    "mse": prior_mse,
-                    "psnr": psnr_from_mse(prior_mse),
-                    "ssim": prior_ssim,
-                    "lpips": prior_lpips,
-                },
-                "ours_metrics": {
-                    "mse": ours_mse,
-                    "psnr": psnr_from_mse(ours_mse),
-                    "ssim": ours_ssim,
-                    "lpips": ours_lpips,
-                },
+                "selected_prior_distribution": selected_prior_distribution,
+                "selected_prior_distribution_text": selected_prior_distribution_text,
+                "prior_metrics": prior_metrics,
+                "ours_metrics": ours_metrics,
                 "paths": {
                     "gt": str((case_dir / "gt.png").resolve()),
                     "prior": str((case_dir / "prior.png").resolve()),
                     "ours": str((case_dir / "ours.png").resolve()),
                     "prior_error": str((case_dir / "prior_error.png").resolve()),
                     "ours_error": str((case_dir / "ours_error.png").resolve()),
+                    "comparison_panel": str(comparison_path.resolve()),
                 },
+                "comparison_panel": str(comparison_path.resolve()),
             }
             save_json(case_dir / "case.json", case_row)
             case_rows.append(case_row)
@@ -491,6 +626,8 @@ def main() -> None:
         "selected_cases": len(selected_cases),
         "completed_cases": len(case_rows),
         "failed_cases": len(failures),
+        "selected_prior_distribution": selected_prior_distribution,
+        "selected_prior_distribution_text": selected_prior_distribution_text,
         "hdri_preset": args.hdri_preset,
         "hdri_path": str(hdri_path.resolve()),
         "real_render_metrics": real_render_metrics,

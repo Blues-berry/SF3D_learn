@@ -4753,6 +4753,8 @@ def evaluate(
         max_count=int(args.val_preview_samples),
     )
     preview_paths = [Path(str(item.get("path") or "")) for item in preview_items if item.get("path")]
+    preview_prior_distribution = prior_variant_distribution(preview_items)
+    preview_prior_distribution_text = format_prior_distribution(preview_prior_distribution)
     mean_losses = {key: value / max(steps, 1) for key, value in totals.items()}
     mean_uv_mae = {
         "roughness": uv_mae["roughness"] / max(uv_mae["count"], 1.0),
@@ -4843,6 +4845,8 @@ def evaluate(
         "residual_gate_cases": residual_gate_cases,
         "preview_paths": [str(path.resolve()) for path in preview_paths],
         "preview_items": preview_items,
+        "preview_prior_distribution": preview_prior_distribution,
+        "preview_prior_distribution_text": preview_prior_distribution_text,
         "preview_integrity": build_preview_integrity_report(preview_items),
     }
 
@@ -5243,8 +5247,19 @@ def run_validation_cycle(
 
     if run is not None:
         preview_items = list(val_payload.get("preview_items", []))
+        preview_distribution_text = str(val_payload.get("preview_prior_distribution_text") or "unknown")
         preview_images = []
         if wandb is not None:
+            wandb_preview_limit = int(args.wandb_val_preview_max)
+            wandb_preview_items = (
+                select_variant_balanced_records(
+                    preview_items,
+                    max_count=wandb_preview_limit,
+                    mode=str(getattr(args, "val_preview_selection", "balanced_by_variant")),
+                )
+                if wandb_preview_limit > 0
+                else []
+            )
             preview_images = [
                 wandb.Image(
                     item["path"],
@@ -5258,10 +5273,11 @@ def run_validation_cycle(
                         f" -> {item.get('refined_total_mae', 0.0):.4f} "
                         f"(UV gain={item.get('gain_total', item.get('improvement_total', 0.0)):+.4f}, "
                         f"view RM delta={format_metric(item.get('view_rm_mae_delta'), 4)}, "
-                        f"{item.get('effect_bucket', 'unknown')})"
+                        f"{item.get('effect_bucket', 'unknown')}) | "
+                        f"selected prior distribution: {item.get('selected_prior_distribution_text') or preview_distribution_text}"
                     ),
                 )
-                for item in preview_items[: args.wandb_val_preview_max]
+                for item in wandb_preview_items
             ]
         improvement_payload = val_payload.get("improvement_uv_mae") or {}
         object_level_payload = val_payload.get("object_level") or {}
@@ -6219,10 +6235,13 @@ from .metrics import (
 )
 from .preview import (
     build_preview_integrity_report,
+    format_prior_distribution,
     finalize_selected_preview_items,
+    prior_variant_distribution,
     preview_effect_bucket,
     save_validation_preview,
     should_select_validation_preview,
+    select_variant_balanced_records,
 )
 from .reports import (
     build_variant_summary_rows,

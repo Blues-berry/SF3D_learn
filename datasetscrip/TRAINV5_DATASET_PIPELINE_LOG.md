@@ -102,6 +102,17 @@ edited with independent business logic again.
   current status/brief tools, but the active path is no longer tied to the old
   batch-specific manager script.
 
+## Phase 3 Replacement Status
+
+- `datasetscrip/internal/` is now the internal orchestration layer behind the
+  public `datasetscrip/trainv5_dataset.py` CLI.
+- The public CLI no longer embeds long command-construction logic directly.
+- Internal orchestration is split into responsibility modules:
+  `common`, `ingest`, `queue`, `status`, `launch`, and `finalize`.
+- Remaining `scripts/` calls are internal compatibility helpers and live
+  rebake/finalize dependencies. They must be migrated behind `datasetscrip/internal/`
+  before deletion.
+
 ## Calling Principles
 
 - Prefer `datasetscrip/trainv5_dataset.py` over adding new one-off scripts.

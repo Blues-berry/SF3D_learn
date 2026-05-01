@@ -236,6 +236,69 @@ def first_preview_identity(*values: Any) -> str:
     return "unknown"
 
 
+PRIOR_VARIANT_DISPLAY_ORDER = [
+    "large_gap_prior",
+    "medium_gap_prior",
+    "mild_gap_prior",
+    "near_gt_prior",
+    "no_prior_bootstrap",
+]
+
+
+def prior_variant_distribution(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(str(item.get("prior_variant_type") or "unknown") for item in items)
+    ordered: dict[str, int] = {}
+    for variant in PRIOR_VARIANT_DISPLAY_ORDER:
+        if counts.get(variant):
+            ordered[variant] = int(counts[variant])
+    for variant in sorted(counts):
+        if variant not in ordered:
+            ordered[variant] = int(counts[variant])
+    return ordered
+
+
+def format_prior_distribution(distribution: dict[str, int] | None) -> str:
+    if not distribution:
+        return "unknown"
+    return ", ".join(f"{variant}={count}" for variant, count in distribution.items())
+
+
+def _fit_text_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> str:
+    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+        return text
+    suffix = "..."
+    candidate = text
+    while candidate and draw.textbbox((0, 0), candidate + suffix, font=font)[2] > max_width:
+        candidate = candidate[:-1]
+    return (candidate.rstrip() + suffix) if candidate else suffix
+
+
+def append_prior_distribution_footer(image_path: Path, distribution_text: str) -> None:
+    if not distribution_text:
+        return
+    image = Image.open(image_path).convert("RGB")
+    footer_height = 28
+    canvas = Image.new("RGB", (image.width, image.height + footer_height), (255, 255, 255))
+    canvas.paste(image, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, image.height, image.width, image.height + footer_height), fill=(239, 243, 248))
+    footer_font = preview_font(13)
+    text = _fit_text_to_width(
+        draw,
+        f"selected prior distribution: {distribution_text}",
+        font=footer_font,
+        max_width=image.width - 24,
+    )
+    draw.text((12, image.height + 7), text, font=footer_font, fill=(54, 63, 78))
+    canvas.save(image_path)
+
+
 def preview_effect_bucket(gain_total: float) -> str:
     if gain_total > 0.02:
         return "positive_gain"
@@ -494,9 +557,13 @@ def finalize_selected_preview_items(
         max_count=max_count,
         mode=mode,
     )
+    distribution = prior_variant_distribution(selected_items)
+    distribution_text = format_prior_distribution(distribution)
     preview_dir = output_dir / "validation_previews" / validation_label
     candidate_dir = preview_dir / "_candidates"
     for slot, item in enumerate(selected_items):
+        item["selected_prior_distribution"] = dict(distribution)
+        item["selected_prior_distribution_text"] = distribution_text
         source_path = Path(str(item.get("path") or ""))
         if not source_path.exists():
             continue
@@ -512,6 +579,7 @@ def finalize_selected_preview_items(
         if target_path.exists():
             target_path.unlink()
         source_path.replace(target_path)
+        append_prior_distribution_footer(target_path, distribution_text)
         item["path"] = str(target_path.resolve())
         item["preview_slot"] = slot
     if candidate_dir.exists():
