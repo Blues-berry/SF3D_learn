@@ -320,6 +320,12 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--val-enable-lpips", type=parse_bool, default=True)
     parser.add_argument("--val-lpips-max-images", type=int, default=12)
     parser.add_argument("--max-validation-batches", type=int, default=0, help="0 evaluates the full validation loader.")
+    parser.add_argument(
+        "--monitor-val-target-records",
+        type=int,
+        default=0,
+        help="When >0, cap validation by approximate record count instead of only by max batches.",
+    )
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--checkpointing-steps", type=int, default=0)
     parser.add_argument("--save-only-best-checkpoint", type=parse_bool, default=False)
@@ -354,8 +360,14 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
     parser.add_argument(
         "--validation-selection-metric",
-        choices=["uv_total", "uv_render_guarded", "gain_render_guarded", "variant_balanced_gain_render_guarded"],
-        default="gain_render_guarded",
+        choices=[
+            "uv_total",
+            "uv_render_guarded",
+            "gain_render_guarded",
+            "variant_balanced_gain_render_guarded",
+            "hybrid_potential_gain_render_guarded",
+        ],
+        default="hybrid_potential_gain_render_guarded",
     )
     parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
     parser.add_argument("--selection-mse-penalty", type=float, default=0.5)
@@ -363,6 +375,21 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
     parser.add_argument("--selection-metric-near-gt-regression-multiplier", type=float, default=2.0)
     parser.add_argument("--selection-metric-withprior-regression-multiplier", type=float, default=1.5)
+    parser.add_argument("--previous-baseline-uv-total", type=float, default=None)
+    parser.add_argument("--previous-baseline-uv-gain", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mae-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mse-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-psnr-delta", type=float, default=None)
+    parser.add_argument("--hybrid-prior-percentile-fixed-weight", type=float, default=0.7)
+    parser.add_argument("--hybrid-prior-percentile-empirical-weight", type=float, default=0.3)
+    parser.add_argument("--hybrid-prior-min-potential", type=float, default=0.10)
+    parser.add_argument("--prior-confidence-gate-strength-roughness", type=float, default=None)
+    parser.add_argument("--prior-confidence-gate-strength-metallic", type=float, default=None)
+    parser.add_argument("--roughness-suppression-scale", type=float, default=1.0)
+    parser.add_argument("--withprior-gate-floor", type=float, default=0.0)
+    parser.add_argument("--withprior-roughness-gate-floor", type=float, default=0.0)
+    parser.add_argument("--near-gt-gate-floor", type=float, default=0.0)
+    parser.add_argument("--render-gate-blend-floor", type=float, default=0.0)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--init-from-checkpoint",
@@ -532,7 +559,19 @@ def parse_args() -> argparse.Namespace:
     if args.disable_prior_safe_loss:
         args.prior_consistency_weight = 0.0
         args.residual_safety_weight = 0.0
+    if args.prior_confidence_gate_strength_roughness is None:
+        args.prior_confidence_gate_strength_roughness = float(args.prior_confidence_gate_strength)
+    if args.prior_confidence_gate_strength_metallic is None:
+        args.prior_confidence_gate_strength_metallic = float(args.prior_confidence_gate_strength)
     args.max_residual_gate = max(0.0, min(1.0, float(args.max_residual_gate)))
+    args.prior_confidence_gate_strength_roughness = max(
+        0.0,
+        min(1.0, float(args.prior_confidence_gate_strength_roughness)),
+    )
+    args.prior_confidence_gate_strength_metallic = max(
+        0.0,
+        min(1.0, float(args.prior_confidence_gate_strength_metallic)),
+    )
     args.boundary_safety_strength = max(0.0, min(1.0, float(args.boundary_safety_strength)))
     args.boundary_residual_suppression_strength = max(
         0.0,
@@ -566,6 +605,7 @@ def parse_args() -> argparse.Namespace:
     args.min_nontrivial_target_count_for_paper = max(int(args.min_nontrivial_target_count_for_paper), 0)
     args.roughness_channel_weight = max(float(args.roughness_channel_weight), 0.1)
     args.metallic_channel_weight = max(float(args.metallic_channel_weight), 0.1)
+    args.monitor_val_target_records = max(int(args.monitor_val_target_records), 0)
     args.selection_metric_near_gt_regression_multiplier = max(
         float(args.selection_metric_near_gt_regression_multiplier),
         1.0,
@@ -574,6 +614,20 @@ def parse_args() -> argparse.Namespace:
         float(args.selection_metric_withprior_regression_multiplier),
         1.0,
     )
+    fixed_weight = max(float(args.hybrid_prior_percentile_fixed_weight), 0.0)
+    empirical_weight = max(float(args.hybrid_prior_percentile_empirical_weight), 0.0)
+    total_weight = fixed_weight + empirical_weight
+    if total_weight <= 1.0e-8:
+        fixed_weight, empirical_weight = 0.7, 0.3
+        total_weight = 1.0
+    args.hybrid_prior_percentile_fixed_weight = fixed_weight / total_weight
+    args.hybrid_prior_percentile_empirical_weight = empirical_weight / total_weight
+    args.hybrid_prior_min_potential = max(0.01, min(0.5, float(args.hybrid_prior_min_potential)))
+    args.roughness_suppression_scale = max(0.0, min(2.0, float(args.roughness_suppression_scale)))
+    args.withprior_gate_floor = max(0.0, min(1.0, float(args.withprior_gate_floor)))
+    args.withprior_roughness_gate_floor = max(0.0, min(1.0, float(args.withprior_roughness_gate_floor)))
+    args.near_gt_gate_floor = max(0.0, min(1.0, float(args.near_gt_gate_floor)))
+    args.render_gate_blend_floor = max(0.0, min(1.0, float(args.render_gate_blend_floor)))
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
     args.train_failure_tag_weights = parse_weight_map(args.train_failure_tag_weights)

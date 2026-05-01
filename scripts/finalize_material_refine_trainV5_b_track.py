@@ -38,6 +38,10 @@ DEFAULT_MERGED_DIR = REPO_ROOT / "train/trainV5_merged_ab"
 VARIANT_ORDER = list(VARIANT_SPECS)
 
 
+def batch_slug_from_root(path: Path) -> str:
+    return path.name
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -178,6 +182,7 @@ def write_problem_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                 "target_source_type",
                 "blockers",
             ],
+            extrasaction="ignore",
         )
         writer.writeheader()
         for row in rows:
@@ -186,10 +191,46 @@ def write_problem_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(item)
 
 
+def remove_blocked_markers(path: Path) -> None:
+    if not path.exists():
+        return
+    for marker in path.glob("BLOCKED_*.md"):
+        try:
+            marker.unlink()
+        except OSError:
+            continue
+
+
+def load_manifest_records(path: Path) -> list[dict[str, Any]]:
+    return records(read_json(path, []))
+
+
+def dedup_by_object(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        oid = str(row.get("object_id") or row.get("canonical_object_id") or "")
+        if not oid:
+            continue
+        selected.setdefault(oid, row)
+    return list(selected.values())
+
+
+def dedup_by_key(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        value = str(row.get(key) or "")
+        if not value:
+            continue
+        selected.setdefault(value, row)
+    return list(selected.values())
+
+
 def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, Any]], skipped_rows: list[dict[str, Any]], gate_pass_rows: list[dict[str, Any]], gate_fail_rows: list[dict[str, Any]], contract_audit: dict[str, Any]) -> None:
+    batch_slug = batch_slug_from_root(b_root)
     diagnostic = {
         "generated_at_utc": utc_now(),
         "source_manifest": str(manifest),
+        "batch_name": batch_slug,
         "records": prepared,
         "skipped_records": skipped_rows,
         "summary": {
@@ -211,22 +252,23 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         },
         "contract_audit": contract_audit,
     }
-    write_json(b_root / "full_1155_diagnostic_manifest.json", diagnostic)
+    write_json(b_root / f"{batch_slug}_diagnostic_manifest.json", diagnostic)
     target_truth_manifest = {
         "generated_at_utc": utc_now(),
         "source_manifest": str(manifest),
+        "batch_name": batch_slug,
         "target_gate_version": TARGET_GATE_VERSION,
         "records": gate_pass_rows,
         "summary": summarize(gate_pass_rows),
     }
-    write_json(b_root / "full_1155_target_truth_gate_pass_manifest.json", target_truth_manifest)
-    write_problem_csv(b_root / "full_1155_problem_cases.csv", gate_fail_rows + skipped_rows)
+    write_json(b_root / f"{batch_slug}_target_truth_gate_pass_manifest.json", target_truth_manifest)
+    write_problem_csv(b_root / f"{batch_slug}_problem_cases.csv", gate_fail_rows + skipped_rows)
     summary = diagnostic["summary"]
     write_text(
-        b_root / "full_1155_path_audit.md",
+        b_root / f"{batch_slug}_path_audit.md",
         "\n".join(
             [
-                "# Full 1155 Path Audit",
+                f"# {batch_slug} Path Audit",
                 "",
                 f"- generated_at_utc: `{utc_now()}`",
                 f"- prepared_records: `{len(prepared)}`",
@@ -241,10 +283,10 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         ),
     )
     write_text(
-        b_root / "full_1155_decision.md",
+        b_root / f"{batch_slug}_decision.md",
         "\n".join(
             [
-                "# Full 1155 Rebake Decision",
+                f"# {batch_slug} Rebake Decision",
                 "",
                 f"- generated_at_utc: `{utc_now()}`",
                 "- status: `completed`",
@@ -267,9 +309,10 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         ),
     )
     write_json(
-        b_root / "full_1155_decision.json",
+        b_root / f"{batch_slug}_decision.json",
         {
             "generated_at_utc": utc_now(),
+            "batch_name": batch_slug,
             "status": "completed",
             "full_rebake_launched": True,
             "prepared_records": len(prepared),
@@ -286,7 +329,7 @@ def write_rebake_reports(b_root: Path, manifest: Path, prepared: list[dict[str, 
         b_root / "progress_final.md",
         "\n".join(
             [
-                "# Full 1155 Progress Final",
+                f"# {batch_slug} Progress Final",
                 "",
                 f"- generated_at_utc: `{utc_now()}`",
                 "- status: `completed`",
@@ -328,11 +371,7 @@ def finalize_rebake(args: argparse.Namespace) -> tuple[list[dict[str, Any]], lis
     return gate_pass_rows, gate_fail_rows
 
 
-def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    args.b_train_dir.mkdir(parents=True, exist_ok=True)
-    blocked = args.b_train_dir / "BLOCKED_full_1155_rebake_not_completed.md"
-    if blocked.exists():
-        blocked.unlink()
+def build_plus_full_records(full_manifest: Path, gate_pass_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     bundles: list[dict[str, Any]] = []
     variants: list[dict[str, Any]] = []
     pairs: list[dict[str, Any]] = []
@@ -356,17 +395,31 @@ def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any
             pairs.append(build_pair(bundle, variant))
             if identity is not None:
                 identity_controls.append(identity)
+    return bundles, variants, pairs, identity_controls
+
+
+def write_plus_full_outputs(
+    out_dir: Path,
+    *,
+    source_manifest: Path,
+    bundles: list[dict[str, Any]],
+    variants: list[dict[str, Any]],
+    pairs: list[dict[str, Any]],
+    identity_controls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    remove_blocked_markers(out_dir)
     write_json(
-        args.b_train_dir / "trainV5_plus_target_bundles.json",
-        {"generated_at_utc": utc_now(), "source_manifest": str(args.full_manifest), "records": bundles, "summary": summarize(bundles)},
+        out_dir / "trainV5_plus_target_bundles.json",
+        {"generated_at_utc": utc_now(), "source_manifest": str(source_manifest), "records": bundles, "summary": summarize(bundles)},
     )
     write_json(
-        args.b_train_dir / "trainV5_plus_prior_variants.json",
-        {"generated_at_utc": utc_now(), "source_manifest": str(args.full_manifest), "records": variants, "identity_controls": identity_controls, "summary": summarize(variants)},
+        out_dir / "trainV5_plus_prior_variants.json",
+        {"generated_at_utc": utc_now(), "source_manifest": str(source_manifest), "records": variants, "identity_controls": identity_controls, "summary": summarize(variants)},
     )
     write_json(
-        args.b_train_dir / "trainV5_plus_training_pairs.json",
-        {"generated_at_utc": utc_now(), "source_manifest": str(args.full_manifest), "records": pairs, "summary": summarize(pairs)},
+        out_dir / "trainV5_plus_training_pairs.json",
+        {"generated_at_utc": utc_now(), "source_manifest": str(source_manifest), "records": pairs, "summary": summarize(pairs)},
     )
     sampler = {
         "generated_at_utc": utc_now(),
@@ -380,7 +433,7 @@ def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any
         },
         "balance_axes": ["material_family", "source_name", "prior_variant_type", "prior_quality_bin"],
     }
-    write_json(args.b_train_dir / "trainV5_plus_sampler_config.json", sampler)
+    write_json(out_dir / "trainV5_plus_sampler_config.json", sampler)
     split_counts = Counter(str(pair.get("split")) for pair in pairs)
     target_counts = Counter(str(pair.get("target_bundle_id")) for pair in pairs)
     readiness = {
@@ -397,9 +450,9 @@ def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any
         "summary": summarize(pairs),
         "recommend_mixed_train": bool(pairs),
     }
-    write_json(args.b_train_dir / "trainV5_plus_readiness_report.json", readiness)
+    write_json(out_dir / "trainV5_plus_readiness_report.json", readiness)
     write_text(
-        args.b_train_dir / "trainV5_plus_inventory.md",
+        out_dir / "trainV5_plus_inventory.md",
         "\n".join(
             [
                 "# TrainV5 Plus Full Inventory",
@@ -418,7 +471,7 @@ def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any
         ),
     )
     write_text(
-        args.b_train_dir / "trainV5_plus_readiness_report.md",
+        out_dir / "trainV5_plus_readiness_report.md",
         "\n".join(
             [
                 "# TrainV5 Plus Full Readiness",
@@ -432,18 +485,49 @@ def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any
             ]
         ),
     )
-    return bundles, variants, pairs
+    return readiness
 
 
-def load_manifest_records(path: Path) -> list[dict[str, Any]]:
-    return records(read_json(path, []))
+def build_plus_full(args: argparse.Namespace, gate_pass_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    batch_local_dir = args.b_root / "trainV5_plus_full_batch_local"
+    bundles, variants, pairs, identity_controls = build_plus_full_records(args.full_manifest, gate_pass_rows)
+    write_plus_full_outputs(
+        batch_local_dir,
+        source_manifest=args.full_manifest,
+        bundles=bundles,
+        variants=variants,
+        pairs=pairs,
+        identity_controls=identity_controls,
+    )
+
+    cumulative_bundles = load_manifest_records(args.b_train_dir / "trainV5_plus_target_bundles.json")
+    cumulative_variants = load_manifest_records(args.b_train_dir / "trainV5_plus_prior_variants.json")
+    cumulative_pairs = load_manifest_records(args.b_train_dir / "trainV5_plus_training_pairs.json")
+    existing_objects = {str(row.get("object_id") or "") for row in cumulative_bundles}
+
+    new_bundles = [row for row in bundles if str(row.get("object_id") or "") not in existing_objects]
+    new_objects = {str(row.get("object_id") or "") for row in new_bundles}
+    new_variants = [row for row in variants if str(row.get("object_id") or "") in new_objects]
+    new_pairs = [row for row in pairs if str(row.get("object_id") or "") in new_objects]
+
+    merged_bundles = dedup_by_object(cumulative_bundles + new_bundles)
+    merged_variants = dedup_by_key(cumulative_variants + new_variants, "prior_variant_id")
+    merged_pairs = dedup_by_key(cumulative_pairs + new_pairs, "pair_id")
+    merged_identity_controls = [row for row in identity_controls if str(row.get("object_id") or "") in new_objects]
+    write_plus_full_outputs(
+        args.b_train_dir,
+        source_manifest=args.full_manifest,
+        bundles=merged_bundles,
+        variants=merged_variants,
+        pairs=merged_pairs,
+        identity_controls=merged_identity_controls,
+    )
+    return merged_bundles, merged_variants, merged_pairs
 
 
 def merge_ab(args: argparse.Namespace, b_bundles: list[dict[str, Any]], b_variants: list[dict[str, Any]], b_pairs: list[dict[str, Any]]) -> None:
     args.merged_dir.mkdir(parents=True, exist_ok=True)
-    blocked = args.merged_dir / "BLOCKED_b_track_full_not_available.md"
-    if blocked.exists():
-        blocked.unlink()
+    remove_blocked_markers(args.merged_dir)
     a_bundles = load_manifest_records(args.a_dir / "trainV5_target_bundles.json")
     a_variants = load_manifest_records(args.a_dir / "trainV5_prior_variants.json")
     a_pairs = load_manifest_records(args.a_dir / "trainV5_training_pairs.json")
@@ -452,6 +536,9 @@ def merge_ab(args: argparse.Namespace, b_bundles: list[dict[str, Any]], b_varian
     merged_bundles = a_bundles + [row for row in b_bundles if str(row.get("object_id")) in allowed_b_objects]
     merged_variants = a_variants + [row for row in b_variants if str(row.get("object_id")) in allowed_b_objects]
     merged_pairs = a_pairs + [row for row in b_pairs if str(row.get("object_id")) in allowed_b_objects]
+    merged_bundles = dedup_by_object(merged_bundles)
+    merged_variants = dedup_by_key(merged_variants, "prior_variant_id")
+    merged_pairs = dedup_by_key(merged_pairs, "pair_id")
     pair_ids = Counter(str(row.get("pair_id")) for row in merged_pairs)
     target_ids = Counter(str(row.get("target_bundle_id")) for row in merged_bundles)
     split_by_object: dict[str, set[str]] = defaultdict(set)
@@ -549,7 +636,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_material_refiner.py \\
 
 
 def update_final_report(args: argparse.Namespace) -> None:
-    decision = read_json(args.b_root / "full_1155_decision.json", {})
+    batch_slug = batch_slug_from_root(args.b_root)
+    decision = read_json(args.b_root / f"{batch_slug}_decision.json", {})
     plus = read_json(args.b_train_dir / "trainV5_plus_readiness_report.json", {})
     merged = read_json(args.merged_dir / "trainV5_merged_readiness_report.json", {})
     pending = read_json(REPO_ROOT / "output/material_refine_trainV5_abc/B_track/pending_repair/pending_repair_manifest.json", {"records": []})
@@ -560,7 +648,8 @@ def update_final_report(args: argparse.Namespace) -> None:
         "",
         "## B Track Update",
         "",
-        f"- full_1155_rebake_completed: `{decision.get('status') == 'completed'}`",
+        f"- batch_name: `{batch_slug}`",
+        f"- batch_rebake_completed: `{decision.get('status') == 'completed'}`",
         f"- full_rebake_launched: `{decision.get('full_rebake_launched')}`",
         f"- prepared_records: `{decision.get('prepared_records')}`",
         f"- skipped_records: `{decision.get('skipped_records')}`",

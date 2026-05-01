@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    print(
+        "DEPRECATED: use `python datasetscrip/trainv5_dataset.py launch` for rolling TrainV5 B-track launch.",
+        file=sys.stderr,
+    )
     args = parse_args()
     b1 = read_json(args.b1_status, {})
     obj = read_json(args.obj1200_decision, {})
@@ -50,6 +54,10 @@ def main() -> None:
         "b1_complete": str(b1.get("status") or "") == "complete",
         "obj1200_ready_exact_1200": bool(obj.get("ready_exact_1200")),
         "obj1200_queue_ready_exact_1200": bool(obj.get("queue_ready_exact_1200")),
+        "obj1200_launchable_now": bool(obj.get("launchable_now")),
+        "frozen_launch_record_count": int(obj.get("frozen_launch_record_count") or 0),
+        "deferred_record_count": int(obj.get("deferred_records") or 0),
+        "predicted_fail_rate": obj.get("predicted_fail_rate"),
         "obj1200_preflight_returncode": (obj.get("preflight_result") or {}).get("returncode"),
         "launched": False,
         "reason": "",
@@ -58,8 +66,12 @@ def main() -> None:
         status["reason"] = "waiting_for_full_1155_finalize_complete"
         write_json(args.output_json, status)
         return
-    if not status["obj1200_ready_exact_1200"] or not status["obj1200_queue_ready_exact_1200"]:
-        status["reason"] = "waiting_for_objaverse_1200_ready_and_queue_ready_exact_1200"
+    if not status["obj1200_ready_exact_1200"]:
+        status["reason"] = "waiting_for_objaverse_1200_download_stage_complete"
+        write_json(args.output_json, status)
+        return
+    if not status["obj1200_launchable_now"]:
+        status["reason"] = "waiting_for_launchable_ready_subset"
         write_json(args.output_json, status)
         return
     if int(status["obj1200_preflight_returncode"] or 1) != 0:

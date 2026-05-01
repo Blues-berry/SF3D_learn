@@ -353,6 +353,16 @@ def compute_losses(
     residual_gate_mean = (
         residual_gate.mean() if residual_gate is not None else refined.new_zeros(())
     )
+    roughness_gate_mean = (
+        residual_gate[:, 0:1].mean()
+        if isinstance(residual_gate, torch.Tensor) and residual_gate.ndim == 4 and residual_gate.shape[1] >= 1
+        else residual_gate_mean
+    )
+    metallic_gate_mean = (
+        residual_gate[:, 1:2].mean()
+        if isinstance(residual_gate, torch.Tensor) and residual_gate.ndim == 4 and residual_gate.shape[1] >= 2
+        else residual_gate_mean
+    )
     residual_delta_abs = (
         residual_delta.abs().mean() if residual_delta is not None else refined.new_zeros(())
     )
@@ -417,6 +427,8 @@ def compute_losses(
         return fallback
 
     change_gate_mean = diagnostic_mean("change_gate_mean", residual_gate_mean)
+    roughness_gate_mean = diagnostic_mean("roughness_gate_mean", roughness_gate_mean)
+    metallic_gate_mean = diagnostic_mean("metallic_gate_mean", metallic_gate_mean)
     mean_abs_delta = diagnostic_mean("mean_abs_delta", residual_delta_abs)
     prior_reliability_tensor = outputs.get("prior_reliability")
     prior_reliability_mean = diagnostic_mean(
@@ -483,6 +495,8 @@ def compute_losses(
         "material_context": material_context.detach(),
         "residual_safety": residual_safety.detach(),
         "residual_gate_mean": residual_gate_mean.detach(),
+        "roughness_gate_mean": roughness_gate_mean.detach(),
+        "metallic_gate_mean": metallic_gate_mean.detach(),
         "residual_delta_abs": residual_delta_abs.detach(),
         "change_gate_mean": change_gate_mean.detach(),
         "mean_abs_delta": mean_abs_delta.detach(),
@@ -527,6 +541,7 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
         "best/selection_metric",
         "best/epoch",
         "val/gain_total",
+        "val/prior_aware/score",
         "val/object_level/regression_rate",
         "val/case_level/regression_rate",
     }
@@ -540,6 +555,8 @@ def filter_validation_wandb_logs(logs: dict[str, Any]) -> dict[str, Any]:
             "val/rm_proxy/view_psnr/delta",
         }
         or (key.startswith("val/by_variant/") and key.endswith("/gain_total"))
+        or (key.startswith("val/by_variant/") and key.endswith("/gain_relative"))
+        or (key.startswith("val/by_variant/") and key.endswith("/gain_potential_normalized"))
     }
 
 
@@ -576,6 +593,7 @@ def configure_wandb_step_metrics(run: Any | None) -> None:
             "val/input_prior_total_mae",
             "val/refined_total_mae",
             "val/gain_total",
+            "val/prior_aware/score",
             "val/rm_proxy/view_mae/baseline",
             "val/rm_proxy/view_mae/refined",
             "val/rm_proxy/view_mae/delta",
@@ -845,6 +863,61 @@ def finalize_residual_gate_diagnostics(store: dict[str, float]) -> dict[str, Any
     }
 
 
+def update_gate_mean_diagnostics(
+    store: dict[str, dict[str, float]],
+    *,
+    prior_variant_type: str,
+    outputs: dict[str, torch.Tensor],
+    item_index: int,
+    confidence: torch.Tensor,
+) -> None:
+    gate = outputs.get("change_gate", outputs.get("residual_gate"))
+    if not isinstance(gate, torch.Tensor):
+        return
+    if gate.ndim != 4 or item_index >= gate.shape[0]:
+        return
+    sample_confidence = confidence[item_index : item_index + 1].float().clamp(0.0, 1.0)
+    denom = sample_confidence.flatten(1).sum().clamp_min(1.0)
+    sample_gate = gate[item_index : item_index + 1].float()
+    if sample_gate.shape[1] == 1:
+        roughness_gate = sample_gate
+        metallic_gate = sample_gate
+    else:
+        roughness_gate = sample_gate[:, 0:1]
+        metallic_gate = sample_gate[:, 1:2]
+    total_gate = sample_gate.mean(dim=1, keepdim=True)
+    bucket = store.setdefault(
+        str(prior_variant_type or "unknown"),
+        {
+            "count": 0.0,
+            "gate_mean": 0.0,
+            "roughness_gate_mean": 0.0,
+            "metallic_gate_mean": 0.0,
+        },
+    )
+    bucket["count"] += 1.0
+    bucket["gate_mean"] += float((total_gate * sample_confidence).flatten(1).sum().detach().cpu().item() / denom.item())
+    bucket["roughness_gate_mean"] += float(
+        (roughness_gate * sample_confidence).flatten(1).sum().detach().cpu().item() / denom.item()
+    )
+    bucket["metallic_gate_mean"] += float(
+        (metallic_gate * sample_confidence).flatten(1).sum().detach().cpu().item() / denom.item()
+    )
+
+
+def finalize_gate_mean_diagnostics(store: dict[str, dict[str, float]]) -> dict[str, Any]:
+    rows = {}
+    for variant, bucket in sorted(store.items()):
+        count = max(float(bucket.get("count", 0.0)), 1.0)
+        rows[variant] = {
+            "count": int(bucket.get("count", 0.0)),
+            "gate_mean": float(bucket.get("gate_mean", 0.0) / count),
+            "roughness_gate_mean": float(bucket.get("roughness_gate_mean", 0.0) / count),
+            "metallic_gate_mean": float(bucket.get("metallic_gate_mean", 0.0) / count),
+        }
+    return rows
+
+
 def update_residual_gate_diagnostics(
     store: dict[str, float],
     cases: list[dict[str, Any]],
@@ -983,6 +1056,20 @@ def compute_validation_selection_metric(
     val_payload: dict[str, Any],
     args: argparse.Namespace,
 ) -> tuple[float, dict[str, Any]]:
+    variant_order = [
+        "near_gt_prior",
+        "mild_gap_prior",
+        "medium_gap_prior",
+        "large_gap_prior",
+        "no_prior_bootstrap",
+    ]
+    fixed_percentiles = {
+        "near_gt_prior": 0.95,
+        "mild_gap_prior": 0.75,
+        "medium_gap_prior": 0.50,
+        "large_gap_prior": 0.25,
+        "no_prior_bootstrap": 0.05,
+    }
     uv_total = float((val_payload.get("uv_mae") or {}).get("total", 0.0) or 0.0)
     input_prior_total = float(
         (
@@ -1022,13 +1109,6 @@ def compute_validation_selection_metric(
             continue
         variant_name = str(group_key).split("/", 1)[1]
         variant_gain_rows[variant_name] = float((metrics or {}).get("total_mae", 0.0) or 0.0)
-    variant_order = [
-        "near_gt_prior",
-        "mild_gap_prior",
-        "medium_gap_prior",
-        "large_gap_prior",
-        "no_prior_bootstrap",
-    ]
     available_variant_gains = [variant_gain_rows[name] for name in variant_order if name in variant_gain_rows]
     variant_balanced_uv_gain = (
         float(sum(available_variant_gains) / max(len(available_variant_gains), 1))
@@ -1038,14 +1118,56 @@ def compute_validation_selection_metric(
     case_entries = list(((val_payload.get("case_level") or {}).get("entries") or []))
     near_gt_entries = []
     withprior_entries = []
+    potential_rows_by_variant: dict[str, list[float]] = {name: [] for name in variant_order}
+    baseline_values = []
+    for entry in case_entries:
+        baseline_value = float(entry.get("baseline_total_mae", 0.0) or 0.0)
+        baseline_values.append(baseline_value)
+    sorted_baselines = sorted(baseline_values)
+    case_prior_aware_rows = []
     for entry in case_entries:
         case_id = str(entry.get("case_id") or "")
         variant_name = case_id.rsplit("|", 1)[-1] if "|" in case_id else "unknown"
         avg_gain = float(entry.get("avg_improvement_total", 0.0) or 0.0)
+        baseline_value = float(entry.get("baseline_total_mae", 0.0) or 0.0)
+        relative_error_reduction = avg_gain / max(baseline_value, 1.0e-6)
+        if sorted_baselines:
+            empirical_percentile = (
+                sum(1 for value in sorted_baselines if value >= baseline_value) / max(len(sorted_baselines), 1)
+            )
+        else:
+            empirical_percentile = 0.5
+        fixed_weight = float(getattr(args, "hybrid_prior_percentile_fixed_weight", 0.7))
+        empirical_weight = float(getattr(args, "hybrid_prior_percentile_empirical_weight", 0.3))
+        hybrid_prior_quality_percentile = (
+            fixed_weight * fixed_percentiles.get(variant_name, 0.5)
+            + empirical_weight * empirical_percentile
+        )
+        potential_weight = 1.0 / max(
+            1.0 - hybrid_prior_quality_percentile,
+            float(getattr(args, "hybrid_prior_min_potential", 0.10)),
+        )
+        potential_normalized_gain = relative_error_reduction * potential_weight
+        case_prior_aware_rows.append(
+            {
+                "case_id": case_id,
+                "prior_variant_type": variant_name,
+                "absolute_gain": avg_gain,
+                "baseline_total_mae": baseline_value,
+                "relative_error_reduction": relative_error_reduction,
+                "fixed_prior_quality_percentile": fixed_percentiles.get(variant_name, 0.5),
+                "empirical_prior_quality_percentile": empirical_percentile,
+                "hybrid_prior_quality_percentile": hybrid_prior_quality_percentile,
+                "potential_weight": potential_weight,
+                "potential_normalized_gain": potential_normalized_gain,
+            }
+        )
         if variant_name == "near_gt_prior":
             near_gt_entries.append(avg_gain)
         if variant_name != "no_prior_bootstrap":
             withprior_entries.append(avg_gain)
+        if variant_name in potential_rows_by_variant:
+            potential_rows_by_variant[variant_name].append(potential_normalized_gain)
     near_gt_regression_rate = (
         sum(1 for value in near_gt_entries if value < -1.0e-6) / max(len(near_gt_entries), 1)
         if near_gt_entries
@@ -1064,13 +1186,29 @@ def compute_validation_selection_metric(
         float(getattr(args, "selection_metric_withprior_regression_multiplier", 1.5))
         * withprior_regression_rate
     )
+    variant_potential_rows = {
+        name: (
+            float(sum(values) / max(len(values), 1))
+            if values
+            else None
+        )
+        for name, values in potential_rows_by_variant.items()
+    }
+    available_variant_potential = [value for value in variant_potential_rows.values() if value is not None]
+    variant_balanced_potential_gain = (
+        float(sum(available_variant_potential) / max(len(available_variant_potential), 1))
+        if available_variant_potential
+        else 0.0
+    )
     penalty_total = (
         float(args.selection_view_rm_penalty) * view_penalty
         + float(getattr(args, "selection_mse_penalty", 0.5)) * mse_penalty
         + float(args.selection_psnr_penalty) * psnr_penalty
         + float(args.selection_residual_regression_penalty) * regression_penalty
     )
-    if args.validation_selection_metric == "variant_balanced_gain_render_guarded":
+    if args.validation_selection_metric == "hybrid_potential_gain_render_guarded":
+        selection_metric = -variant_balanced_potential_gain + penalty_total + near_gt_penalty + withprior_penalty
+    elif args.validation_selection_metric == "variant_balanced_gain_render_guarded":
         selection_metric = -variant_balanced_uv_gain + penalty_total + near_gt_penalty + withprior_penalty
     elif args.validation_selection_metric == "gain_render_guarded":
         selection_metric = -uv_gain + penalty_total
@@ -1082,6 +1220,9 @@ def compute_validation_selection_metric(
         "uv_gain": uv_gain,
         "variant_balanced_uv_gain": variant_balanced_uv_gain,
         "by_variant_gain": {name: variant_gain_rows.get(name) for name in variant_order},
+        "by_variant_potential_normalized_gain": variant_potential_rows,
+        "case_prior_aware": case_prior_aware_rows,
+        "variant_balanced_potential_gain": variant_balanced_potential_gain,
         "view_penalty": view_penalty,
         "mse_penalty": mse_penalty,
         "psnr_penalty": psnr_penalty,

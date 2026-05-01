@@ -42,6 +42,8 @@ def load_validation_events(output_dir: Path) -> list[dict[str, Any]]:
         improvement = payload.get("improvement_uv_mae") or {}
         case_level = payload.get("case_level") or {}
         selection = payload.get("selection_metric") or {}
+        comparison = payload.get("comparison") or {}
+        prior_aware = payload.get("prior_aware") or {}
         events.append(
             {
                 "label": payload.get("validation_label", path.stem),
@@ -65,6 +67,12 @@ def load_validation_events(output_dir: Path) -> list[dict[str, Any]]:
                 "rm_proxy_view_mae_delta": render_proxy.get("view_rm_mae_delta"),
                 "rm_proxy_view_mse_delta": render_proxy.get("proxy_rm_mse_delta"),
                 "rm_proxy_view_psnr_delta": render_proxy.get("proxy_rm_psnr_delta"),
+                "prior_aware_score": prior_aware.get("score"),
+                "comparison": comparison,
+                "delta_vs_prior": comparison.get("delta_vs_prior"),
+                "delta_vs_previous_baseline_run": comparison.get("delta_vs_previous_baseline_run"),
+                "vs_prior": comparison.get("vs_prior"),
+                "vs_baseline_run": comparison.get("vs_baseline_run"),
                 "selection_metric": selection.get("selection_metric"),
                 "selection_mode": selection.get("mode"),
                 "path": str(path.resolve()),
@@ -231,6 +239,9 @@ def write_training_overview(
     latest_validation = summarize_latest_validation(history, validation_events)
     latest_validation_payload = load_latest_validation_payload(validation_events)
     latest_render_proxy = (latest_validation_payload or {}).get("render_proxy_validation") or {}
+    latest_comparison = (latest_validation_payload or {}).get("comparison") or {}
+    latest_delta_vs_prior = latest_comparison.get("delta_vs_prior") or {}
+    latest_delta_vs_previous = latest_comparison.get("delta_vs_previous_baseline_run") or {}
     latest_object_level = (latest_validation_payload or {}).get("object_level") or {}
     latest_case_level = (latest_validation_payload or {}).get("case_level") or {}
     benchmark_summary = load_benchmark_summary(output_dir) or {}
@@ -304,9 +315,13 @@ def write_training_overview(
                 f"<div><div class='metric'>Latest UV Total</div><div><code>{format_metric(latest_validation.get('val_total'))}</code></div></div>",
                 f"<div><div class='metric'>Latest Input Prior Total</div><div><code>{format_metric(latest_validation.get('input_prior_total'))}</code></div></div>",
                 f"<div><div class='metric'>Latest UV Gain</div><div><code>{format_metric(latest_validation.get('improvement_total'))}</code></div></div>",
+                f"<div><div class='metric'>Delta vs Prior UV Total</div><div><code>{format_metric(latest_delta_vs_prior.get('uv_total'))}</code></div></div>",
+                f"<div><div class='metric'>Delta vs Previous Baseline UV Total</div><div><code>{format_metric(latest_delta_vs_previous.get('uv_total'))}</code></div></div>",
+                f"<div><div class='metric'>Delta vs Previous Baseline UV Gain</div><div><code>{format_metric(latest_delta_vs_previous.get('uv_gain'))}</code></div></div>",
                 f"<div><div class='metric'>Latest RM Proxy View MAE Delta</div><div><code>{format_metric(latest_render_proxy.get('view_rm_mae_delta'))}</code></div></div>",
                 f"<div><div class='metric'>Latest RM Proxy View MSE Delta</div><div><code>{format_metric(latest_render_proxy.get('proxy_rm_mse_delta'))}</code></div></div>",
                 f"<div><div class='metric'>Latest RM Proxy View PSNR Delta</div><div><code>{format_metric(latest_render_proxy.get('proxy_rm_psnr_delta'))}</code></div></div>",
+                f"<div><div class='metric'>Delta vs Previous Baseline RM PSNR</div><div><code>{format_metric(latest_delta_vs_previous.get('rm_proxy_view_psnr_delta'))}</code></div></div>",
                 f"<div><div class='metric'>Object Regression Rate</div><div><code>{format_metric(latest_object_level.get('regression_rate'), 4)}</code></div></div>",
                 f"<div><div class='metric'>Case Regression Rate</div><div><code>{format_metric(latest_case_level.get('regression_rate'), 4)}</code></div></div>",
                 f"<div><div class='metric'>Validation Events</div><div><code>{len(validation_events)}</code></div></div>",
@@ -404,6 +419,12 @@ def write_training_evidence_report(
             "rm_proxy_view_mae_delta": latest.get("rm_proxy_view_mae_delta"),
             "rm_proxy_view_mse_delta": latest.get("rm_proxy_view_mse_delta"),
             "rm_proxy_view_psnr_delta": latest.get("rm_proxy_view_psnr_delta"),
+            "prior_aware_score": latest.get("prior_aware_score"),
+            "comparison": latest.get("comparison"),
+            "delta_vs_prior": latest.get("delta_vs_prior"),
+            "delta_vs_previous_baseline_run": latest.get("delta_vs_previous_baseline_run"),
+            "vs_prior": latest.get("vs_prior"),
+            "vs_baseline_run": latest.get("vs_baseline_run"),
             "case_regression_rate": latest.get("case_regression_rate"),
             "selection_metric": latest.get("selection_metric"),
         },
@@ -438,6 +459,7 @@ def write_training_evidence_report(
                 "<div><b>RGB proxy</b>: eval proxy_uv_shading diagnostics. <b>Real render</b>: independent Blender re-render benchmark.</div>",
                 f"<div>Selection basis: <code>{html.escape(str(latest.get('evaluation_basis') or 'unknown'))}</code>; record count: <code>{html.escape(str(latest.get('record_count') or 'unknown'))}</code> / dataset <code>{html.escape(str(latest.get('dataset_record_count') or 'unknown'))}</code></div>",
                 f"<div>Latest UV gain: <code>{format_metric(latest.get('uv_gain'))}</code>; RM proxy PSNR delta: <code>{format_metric(latest.get('rm_proxy_view_psnr_delta'))}</code>; case regression: <code>{format_metric(latest.get('case_regression_rate'), 4)}</code></div>",
+                f"<div>Delta vs prior UV total: <code>{format_metric((latest.get('delta_vs_prior') or {}).get('uv_total'))}</code>; delta vs previous baseline UV total: <code>{format_metric((latest.get('delta_vs_previous_baseline_run') or {}).get('uv_total'))}</code>; delta vs previous baseline RM PSNR: <code>{format_metric((latest.get('delta_vs_previous_baseline_run') or {}).get('rm_proxy_view_psnr_delta'))}</code></div>",
                 f"<div>Best UV gain event: <code>{best_gain.get('label')}</code> = <code>{format_metric(best_gain.get('uv_gain'))}</code></div>",
                 "</div>",
                 f"<div class='card'><img src='{figure_path.name}' alt='training evidence curves'></div>" if figure_path is not None else "",

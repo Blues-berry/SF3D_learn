@@ -56,7 +56,16 @@ class MaterialRefinementPipeline:
         if model_cfg_overrides:
             cfg.update(model_cfg_overrides)
         model = MaterialRefiner(cfg)
-        model.load_state_dict(checkpoint["model"], strict=True)
+        try:
+            model.load_state_dict(checkpoint["model"], strict=True)
+        except RuntimeError:
+            # Some eval configs include newer optional heads that are absent
+            # from older checkpoints. Retry with the checkpoint-authored model
+            # config so benchmark replay remains architecture-stable.
+            if not model_cfg_overrides:
+                raise
+            model = MaterialRefiner(dict(checkpoint.get("model_cfg", {})))
+            model.load_state_dict(checkpoint["model"], strict=True)
         runtime_device = _infer_device(cuda_device_index=cuda_device_index, fallback=device)
         atlas_size = int(checkpoint.get("atlas_size", 512))
         buffer_resolution = int(checkpoint.get("buffer_resolution", 256))

@@ -265,10 +265,10 @@ def aggregate_suite(suite_dir: Path) -> dict[str, Any]:
                     "evaluation_basis": summary.get("evaluation_basis"),
                     "completed_cases": summary.get("completed_cases"),
                     "failed_cases": summary.get("failed_cases"),
-                    "psnr_delta": ((metrics.get("psnr") or {}).get("delta")),
-                    "mse_delta": ((metrics.get("mse") or {}).get("delta")),
-                    "ssim_delta": ((metrics.get("ssim") or {}).get("delta")),
-                    "lpips_delta": ((metrics.get("lpips") or {}).get("delta")),
+                    "psnr_delta": summary.get("psnr_delta", ((metrics.get("psnr") or {}).get("delta"))),
+                    "mse_delta": summary.get("mse_delta", ((metrics.get("mse") or {}).get("delta"))),
+                    "ssim_delta": summary.get("ssim_delta", ((metrics.get("ssim") or {}).get("delta"))),
+                    "lpips_delta": summary.get("lpips_delta", ((metrics.get("lpips") or {}).get("delta"))),
                     "by_prior_variant_type": summary.get("by_prior_variant_type"),
                     "summary_json": str(summary_path.resolve()),
                 }
@@ -444,7 +444,10 @@ def upload_benchmark_outputs(run: Any | None, *, suite_dir: Path) -> None:
             summary = load_json(realrender_stage)
             metrics = summary.get("real_render_metrics") or {}
             for metric_name in ("psnr", "mse", "ssim", "lpips"):
-                scalar_logs[f"benchmark/{split}_realrender_30/{metric_name}_delta"] = ((metrics.get(metric_name) or {}).get("delta"))
+                scalar_logs[f"benchmark/{split}_realrender_30/{metric_name}_delta"] = summary.get(
+                    f"{metric_name}_delta",
+                    ((metrics.get(metric_name) or {}).get("delta")),
+                )
             if str(summary.get("selection_mode")) == "random_balanced_by_variant" and parse_bool(True):
                 grouped_images: dict[str, list[Any]] = {}
                 for case in summary.get("cases") or []:

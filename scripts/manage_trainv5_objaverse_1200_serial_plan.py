@@ -322,6 +322,10 @@ def write_status(
 
 
 def main() -> None:
+    print(
+        "DEPRECATED: use `python datasetscrip/trainv5_dataset.py ingest` for material-priority source staging.",
+        file=sys.stderr,
+    )
     args = parse_args()
     args.plan_root.mkdir(parents=True, exist_ok=True)
     args.source_dir.mkdir(parents=True, exist_ok=True)

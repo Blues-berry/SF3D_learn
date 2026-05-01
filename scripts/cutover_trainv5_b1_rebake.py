@@ -5,6 +5,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,10 @@ def kill_tmux_session(name: str) -> None:
 
 
 def main() -> None:
+    print(
+        "DEPRECATED: use `python datasetscrip/trainv5_dataset.py launch` with a frozen B-track queue instead of B1-specific cutover.",
+        file=sys.stderr,
+    )
     args = parse_args()
     progress_snapshot = read_json(args.b_root / "progress_live.json", {})
     input_payload = read_json(args.input_manifest, {})

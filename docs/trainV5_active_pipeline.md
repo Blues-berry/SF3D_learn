@@ -5,6 +5,21 @@ Everything under `legacy_paper_diagnostic/` is retained for paper diagnostics,
 historical explanation, or audit traceability, but active scripts must not
 import or call it.
 
+The only recommended operator entrypoint for dataset processing is:
+
+```bash
+python datasetscrip/trainv5_dataset.py <status|ingest|queue|launch|finalize|supervisor>
+```
+
+For continuous automation, use:
+
+```bash
+bash datasetscrip/trainv5_supervisor.sh
+```
+
+Older `scripts/` files remain as internal compatibility helpers unless this
+document explicitly names them as active operator commands.
+
 ## Active Flow
 
 1. Stage or select object candidates and source metadata.
@@ -50,9 +65,11 @@ engineering readiness:
 
 ## Active Files
 
-Core TrainV5 scripts remain in `scripts/`, including dataset preparation,
-TrainV5 initial/A/B builders, B-track finalize/monitor helpers, and TrainV5
-pair auditing. Runtime training and evaluation entrypoints remain in place.
+The operator-facing TrainV5 dataset entrypoint is in `datasetscrip/`. Core
+TrainV5 implementation helpers remain in `scripts/`, including dataset
+preparation, TrainV5 initial/A/B builders, B-track finalize/monitor helpers,
+and TrainV5 pair auditing. Runtime training and evaluation entrypoints remain
+in place.
 
 Core runtime modules remain in `sf3d/material_refine/`, including dataset,
 I/O, experiment utilities, model code, manifest quality helpers required by
@@ -65,6 +82,19 @@ Active TrainV5 outputs are kept in:
 - `train/trainV5_plus_full`
 - `train/trainV5_merged_ab`
 - `output/material_refine_trainV5_abc`
+
+## Deprecated Direct Script Calls
+
+Use `datasetscrip/trainv5_dataset.py` instead of calling these flows directly:
+
+- source staging/download: `python datasetscrip/trainv5_dataset.py ingest`
+- second-pass/repair queue generation: `python datasetscrip/trainv5_dataset.py queue`
+- next batch preflight/launch: `python datasetscrip/trainv5_dataset.py launch`
+- completed batch cumulative update: `python datasetscrip/trainv5_dataset.py finalize --batch <batch_name>`
+
+Do not add new `build_*_iterN.py`, `cutover_*`, or one-batch launcher scripts.
+Add new behavior through `datasetscrip/trainv5_dataset_config.json` or CLI
+parameters.
 
 ## Legacy Boundary
 

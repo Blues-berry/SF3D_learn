@@ -351,6 +351,11 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default=64,
         help="Maximum proxy-render views queued for LPIPS across the run. 0 disables LPIPS queueing.",
     )
+    parser.add_argument("--previous-baseline-uv-total", type=float, default=None)
+    parser.add_argument("--previous-baseline-uv-gain", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mae-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mse-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-psnr-delta", type=float, default=None)
     parser.add_argument(
         "--diagnostic-min-group-count",
         type=int,
@@ -778,6 +783,102 @@ def metric_pair(
     if mode:
         payload["mode"] = mode
     return payload
+
+
+def fixed_prior_percentile(variant: str) -> float:
+    return {
+        "near_gt_prior": 0.95,
+        "mild_gap_prior": 0.75,
+        "medium_gap_prior": 0.50,
+        "large_gap_prior": 0.25,
+        "no_prior_bootstrap": 0.05,
+    }.get(str(variant or "unknown"), 0.5)
+
+
+def build_prior_aware_eval_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    baseline_values = [
+        float(row.get("input_prior_total_mae", row.get("baseline_total_mae", 0.0)) or 0.0)
+        for row in rows
+    ]
+    sorted_baselines = sorted(baseline_values)
+    by_variant: dict[str, list[float]] = {}
+    case_rows = []
+    for row, baseline_total in zip(rows, baseline_values):
+        gain = float(row.get("gain_total", row.get("improvement_total", 0.0)) or 0.0)
+        variant = str(row.get("prior_variant_type") or "unknown")
+        relative_error_reduction = gain / max(baseline_total, 1.0e-6)
+        if sorted_baselines:
+            empirical_percentile = sum(1 for value in sorted_baselines if value >= baseline_total) / max(
+                len(sorted_baselines),
+                1,
+            )
+        else:
+            empirical_percentile = 0.5
+        hybrid_percentile = 0.7 * fixed_prior_percentile(variant) + 0.3 * empirical_percentile
+        potential_weight = 1.0 / max(1.0 - hybrid_percentile, 0.10)
+        potential_normalized_gain = relative_error_reduction * potential_weight
+        by_variant.setdefault(variant, []).append(potential_normalized_gain)
+        case_rows.append(
+            {
+                "case_id": row.get("case_id"),
+                "object_id": row.get("object_id"),
+                "pair_id": row.get("pair_id"),
+                "prior_variant_type": variant,
+                "absolute_gain": gain,
+                "baseline_total_mae": baseline_total,
+                "relative_error_reduction": relative_error_reduction,
+                "fixed_prior_quality_percentile": fixed_prior_percentile(variant),
+                "empirical_prior_quality_percentile": empirical_percentile,
+                "hybrid_prior_quality_percentile": hybrid_percentile,
+                "potential_weight": potential_weight,
+                "potential_normalized_gain": potential_normalized_gain,
+            }
+        )
+    by_variant_mean = {
+        variant: float(sum(values) / max(len(values), 1))
+        for variant, values in sorted(by_variant.items())
+    }
+    return {
+        "case_prior_aware": case_rows,
+        "by_variant_potential_normalized_gain": by_variant_mean,
+        "variant_balanced_potential_gain": (
+            float(sum(by_variant_mean.values()) / max(len(by_variant_mean), 1))
+            if by_variant_mean
+            else 0.0
+        ),
+    }
+
+
+def build_eval_comparison_payload(
+    *,
+    current: dict[str, float | None],
+    input_prior: dict[str, float | None],
+    previous: dict[str, float | None],
+) -> dict[str, Any]:
+    def delta_map(reference: dict[str, float | None]) -> dict[str, float | None]:
+        result = {}
+        for key, value in current.items():
+            ref_value = reference.get(key)
+            if value is None or ref_value is None:
+                result[key] = None
+            else:
+                result[key] = float(ref_value - value) if key == "uv_total" else float(value - ref_value)
+        return result
+
+    delta_vs_prior = delta_map(input_prior)
+    delta_vs_previous = delta_map(previous)
+    return {
+        "current": current,
+        "input_prior": input_prior,
+        "previous_baseline_run": previous,
+        "vs_prior": {"delta": delta_vs_prior, "delta_vs_prior": delta_vs_prior},
+        "vs_baseline_run": {
+            "delta": delta_vs_previous,
+            "delta_vs_previous_baseline_run": delta_vs_previous,
+        },
+        "delta_vs_prior": delta_vs_prior,
+        "delta_vs_previous_baseline_run": delta_vs_previous,
+    }
 
 
 def masked_mean_np(values: np.ndarray, mask: np.ndarray) -> float | None:
@@ -1343,6 +1444,8 @@ def summarize_group_rows(rows: list[dict[str, Any]], key_name: str) -> dict[str,
         "prior_residual_unnecessary_change_rate",
         "prior_reliability_mean",
         "change_gate_mean",
+        "roughness_gate_mean",
+        "metallic_gate_mean",
         "mean_abs_delta",
         "boundary_delta_mean",
         "bootstrap_enabled",
@@ -1495,6 +1598,8 @@ def aggregate_object_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "prior_residual_unnecessary_change_rate",
         "prior_reliability_mean",
         "change_gate_mean",
+        "roughness_gate_mean",
+        "metallic_gate_mean",
         "mean_abs_delta",
         "boundary_delta_mean",
         "bootstrap_enabled",
@@ -2146,6 +2251,21 @@ def main() -> None:
             target_item = target[item_idx]
             prior_reliability_mean = tensor_item_mean(prior_reliability)
             change_gate_mean = tensor_item_mean(change_gate)
+            roughness_gate = None
+            metallic_gate = None
+            if isinstance(change_gate, torch.Tensor):
+                if change_gate.ndim == 4 and change_gate.shape[1] >= 2:
+                    roughness_gate = change_gate[:, 0:1]
+                    metallic_gate = change_gate[:, 1:2]
+                else:
+                    roughness_gate = change_gate
+                    metallic_gate = change_gate
+            roughness_gate_mean = diag_item_value("roughness_gate_mean")
+            if roughness_gate_mean is None:
+                roughness_gate_mean = tensor_item_mean(roughness_gate)
+            metallic_gate_mean = diag_item_value("metallic_gate_mean")
+            if metallic_gate_mean is None:
+                metallic_gate_mean = tensor_item_mean(metallic_gate)
             mean_abs_delta = diag_item_value("mean_abs_delta")
             boundary_delta_mean = diag_item_value("boundary_delta_mean")
             bootstrap_enabled = diag_item_value("bootstrap_enabled")
@@ -2319,6 +2439,8 @@ def main() -> None:
                         "prior_residual_changed_pixel_rate": residual_safety["changed_pixel_rate"],
                         "prior_reliability_mean": prior_reliability_mean,
                         "change_gate_mean": change_gate_mean,
+                        "roughness_gate_mean": roughness_gate_mean,
+                        "metallic_gate_mean": metallic_gate_mean,
                         "mean_abs_delta": mean_abs_delta,
                         "boundary_delta_mean": boundary_delta_mean,
                         "bootstrap_enabled": bootstrap_enabled,
@@ -2594,6 +2716,8 @@ def main() -> None:
                         "prior_residual_changed_pixel_rate": residual_safety["changed_pixel_rate"],
                         "prior_reliability_mean": prior_reliability_mean,
                         "change_gate_mean": change_gate_mean,
+                        "roughness_gate_mean": roughness_gate_mean,
+                        "metallic_gate_mean": metallic_gate_mean,
                         "mean_abs_delta": mean_abs_delta,
                         "boundary_delta_mean": boundary_delta_mean,
                         "bootstrap_enabled": bootstrap_enabled,
@@ -2917,6 +3041,37 @@ def main() -> None:
         lpips_status=lpips_status,
         effective_view_supervision_rate=effective_view_supervision_rate,
     )
+    prior_aware_summary = build_prior_aware_eval_summary(rows)
+    current_comparison_metrics = {
+        "uv_total": uv_refined_total_mae,
+        "uv_gain": uv_improvement_total,
+        "rm_proxy_view_mae_delta": view_improvement_total,
+        "rm_proxy_view_mse_delta": (metrics_main.get("proxy_render_mse") or {}).get("delta"),
+        "rm_proxy_view_psnr_delta": (metrics_main.get("proxy_render_psnr") or {}).get("delta"),
+    }
+    input_prior_comparison_metrics = {
+        "uv_total": uv_baseline_total_mae,
+        "uv_gain": 0.0,
+        "rm_proxy_view_mae_delta": 0.0 if view_improvement_total is not None else None,
+        "rm_proxy_view_mse_delta": (
+            0.0 if (metrics_main.get("proxy_render_mse") or {}).get("delta") is not None else None
+        ),
+        "rm_proxy_view_psnr_delta": (
+            0.0 if (metrics_main.get("proxy_render_psnr") or {}).get("delta") is not None else None
+        ),
+    }
+    previous_baseline_comparison_metrics = {
+        "uv_total": args.previous_baseline_uv_total,
+        "uv_gain": args.previous_baseline_uv_gain,
+        "rm_proxy_view_mae_delta": args.previous_baseline_rm_proxy_view_mae_delta,
+        "rm_proxy_view_mse_delta": args.previous_baseline_rm_proxy_view_mse_delta,
+        "rm_proxy_view_psnr_delta": args.previous_baseline_rm_proxy_view_psnr_delta,
+    }
+    comparison_payload = build_eval_comparison_payload(
+        current=current_comparison_metrics,
+        input_prior=input_prior_comparison_metrics,
+        previous=previous_baseline_comparison_metrics,
+    )
     summary_payload = {
         "manifest": str(args.manifest.resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
@@ -2963,6 +3118,30 @@ def main() -> None:
             else (uv_baseline_roughness_mae - uv_refined_roughness_mae)
             / (uv_baseline_metallic_mae - uv_refined_metallic_mae)
         ),
+        "prior_aware": prior_aware_summary,
+        "withprior_case_relative_error_reduction": [
+            {
+                "case_id": row.get("case_id"),
+                "prior_variant_type": row.get("prior_variant_type"),
+                "relative_error_reduction": row.get("relative_error_reduction"),
+            }
+            for row in prior_aware_summary["case_prior_aware"]
+            if row.get("prior_variant_type") != "no_prior_bootstrap"
+        ],
+        "withprior_case_potential_normalized_gain": [
+            {
+                "case_id": row.get("case_id"),
+                "prior_variant_type": row.get("prior_variant_type"),
+                "potential_normalized_gain": row.get("potential_normalized_gain"),
+            }
+            for row in prior_aware_summary["case_prior_aware"]
+            if row.get("prior_variant_type") != "no_prior_bootstrap"
+        ],
+        "comparison": comparison_payload,
+        "delta_vs_prior": comparison_payload["delta_vs_prior"],
+        "delta_vs_previous_baseline_run": comparison_payload["delta_vs_previous_baseline_run"],
+        "vs_prior": comparison_payload["vs_prior"],
+        "vs_baseline_run": comparison_payload["vs_baseline_run"],
         "improvement_rate": uv_direction_rates["improvement_rate"],
         "regression_rate": uv_direction_rates["regression_rate"],
         "tie_rate": uv_direction_rates["tie_rate"],
@@ -2973,6 +3152,25 @@ def main() -> None:
         ),
         "prior_reliability_mean": optional_mean([row.get("prior_reliability_mean") for row in rows]),
         "change_gate_mean": optional_mean([row.get("change_gate_mean") for row in rows]),
+        "roughness_gate_mean": optional_mean([row.get("roughness_gate_mean") for row in rows]),
+        "metallic_gate_mean": optional_mean([row.get("metallic_gate_mean") for row in rows]),
+        "gate_mean_by_variant": {
+            variant: {
+                "count": metrics.get("count"),
+                "gate_mean": (metrics.get("change_gate_mean") or {}).get("mean"),
+                "roughness_gate_mean": (metrics.get("roughness_gate_mean") or {}).get("mean"),
+                "metallic_gate_mean": (metrics.get("metallic_gate_mean") or {}).get("mean"),
+            }
+            for variant, metrics in sorted(grouped_summaries["by_prior_variant_type"].items())
+        },
+        "roughness_gate_mean_by_variant": {
+            variant: (metrics.get("roughness_gate_mean") or {}).get("mean")
+            for variant, metrics in sorted(grouped_summaries["by_prior_variant_type"].items())
+        },
+        "metallic_gate_mean_by_variant": {
+            variant: (metrics.get("metallic_gate_mean") or {}).get("mean")
+            for variant, metrics in sorted(grouped_summaries["by_prior_variant_type"].items())
+        },
         "mean_abs_delta": optional_mean([row.get("mean_abs_delta") for row in rows]),
         "boundary_delta_mean": optional_mean([row.get("boundary_delta_mean") for row in rows]),
         "bootstrap_enabled_rate": optional_mean([row.get("bootstrap_enabled") for row in rows]),
@@ -3201,6 +3399,8 @@ def main() -> None:
                 "eval/object_level/regression_rate": summary_payload.get("object_level", {}).get("regression_rate"),
                 "eval/diagnostics/prior_reliability_mean": summary_payload.get("prior_reliability_mean"),
                 "eval/diagnostics/change_gate_mean": summary_payload.get("change_gate_mean"),
+                "eval/diagnostics/roughness_gate_mean": summary_payload.get("roughness_gate_mean"),
+                "eval/diagnostics/metallic_gate_mean": summary_payload.get("metallic_gate_mean"),
                 "eval/diagnostics/mean_abs_delta": summary_payload.get("mean_abs_delta"),
                 "eval/diagnostics/boundary_delta_mean": summary_payload.get("boundary_delta_mean"),
                 "eval/diagnostics/bootstrap_enabled_rate": summary_payload.get("bootstrap_enabled_rate"),

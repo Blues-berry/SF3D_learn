@@ -1018,6 +1018,8 @@ class MaterialRefiner(BaseModule):
         min_residual_gate: float = 0.05
         max_residual_gate: float = 1.0
         prior_confidence_gate_strength: float = 0.0
+        prior_confidence_gate_strength_roughness: float = 0.0
+        prior_confidence_gate_strength_metallic: float = 0.0
         enable_boundary_context: bool = False
         boundary_context_strength: float = 0.25
         enable_material_context: bool = False
@@ -1025,6 +1027,11 @@ class MaterialRefiner(BaseModule):
         material_delta_scale: float = 0.06
         enable_render_consistency_gate: bool = False
         render_gate_strength: float = 0.25
+        roughness_suppression_scale: float = 1.0
+        withprior_gate_floor: float = 0.0
+        withprior_roughness_gate_floor: float = 0.0
+        near_gt_gate_floor: float = 0.0
+        render_gate_blend_floor: float = 0.0
         enable_prior_source_embedding: bool = False
         enable_no_prior_bootstrap: bool = False
         enable_boundary_safety: bool = False
@@ -1301,6 +1308,60 @@ class MaterialRefiner(BaseModule):
             boundary = boundary + 0.10 * _gradient_edge(fused_valid)
         return _normalize_per_sample(boundary)
 
+    def _prior_variant_sample_mask(
+        self,
+        batch: dict[str, Any],
+        *,
+        variant_name: str,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        variants = batch.get("prior_variant_type")
+        if isinstance(variants, torch.Tensor):
+            mask = (variants == variant_name).to(device=reference.device, dtype=reference.dtype)
+        elif isinstance(variants, (list, tuple)):
+            values = [1.0 if str(item or "") == variant_name else 0.0 for item in variants]
+            mask = torch.tensor(values, device=reference.device, dtype=reference.dtype)
+        else:
+            value = 1.0 if str(variants or "") == variant_name else 0.0
+            mask = reference.new_full((reference.shape[0],), value)
+        if mask.numel() == 1 and reference.shape[0] > 1:
+            mask = mask.expand(reference.shape[0])
+        return mask[: reference.shape[0]].view(-1, 1, 1, 1)
+
+    def _roughness_scaled_suppression_gate(self, gate: torch.Tensor) -> torch.Tensor:
+        if gate.shape[1] == 2:
+            return gate
+        scale = float(max(0.0, min(1.0, self.cfg.roughness_suppression_scale)))
+        roughness_gate = torch.where(
+            gate < 1.0,
+            1.0 - scale * (1.0 - gate),
+            gate,
+        )
+        return torch.cat([roughness_gate, gate], dim=1)
+
+    def _apply_withprior_gate_floor(
+        self,
+        residual_gate: torch.Tensor,
+        *,
+        prior_confidence: torch.Tensor,
+        uv_mask: torch.Tensor,
+        near_gt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        withprior_mask = ((prior_confidence > 1.0e-4).to(residual_gate.dtype) * uv_mask).clamp(0.0, 1.0)
+        near_mask = (near_gt_mask * withprior_mask).clamp(0.0, 1.0)
+        non_near_withprior = (withprior_mask * (1.0 - near_gt_mask)).clamp(0.0, 1.0)
+        near_floor = float(max(0.0, min(1.0, self.cfg.near_gt_gate_floor)))
+        withprior_floor = float(max(0.0, min(1.0, self.cfg.withprior_gate_floor)))
+        roughness_floor = float(max(0.0, min(1.0, self.cfg.withprior_roughness_gate_floor)))
+        floor = torch.cat(
+            [
+                near_mask * near_floor + non_near_withprior * roughness_floor,
+                near_mask * near_floor + non_near_withprior * withprior_floor,
+            ],
+            dim=1,
+        )
+        return torch.maximum(residual_gate, floor)
+
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         atlas_size = batch["uv_albedo"].shape[-1]
         uv_inputs = self.build_uv_inputs(batch)
@@ -1445,6 +1506,11 @@ class MaterialRefiner(BaseModule):
         input_prior_confidence = batch.get("input_prior_confidence", batch["uv_prior_confidence"])
         prior = torch.cat([input_prior_roughness, input_prior_metallic], dim=1)
         prior_confidence = input_prior_confidence
+        near_gt_prior_mask = self._prior_variant_sample_mask(
+            batch,
+            variant_name="near_gt_prior",
+            reference=batch["uv_albedo"],
+        )
         if self.cfg.disable_prior_inputs:
             prior = torch.cat(
                 [
@@ -1597,7 +1663,7 @@ class MaterialRefiner(BaseModule):
         trunk_material_logits = None
         if self.cfg.disable_residual_head:
             delta = torch.zeros_like(initial)
-            residual_gate = torch.zeros_like(prior_confidence)
+            residual_gate = torch.zeros_like(initial)
         else:
             refine_raw = self.refine_head(refine_features)
             delta = torch.tanh(refine_raw[:, :2]) * self.cfg.delta_scale
@@ -1620,10 +1686,24 @@ class MaterialRefiner(BaseModule):
                 residual_gate = min_gate + (1.0 - min_gate) * residual_gate
             if not self.enable_change_gate:
                 residual_gate = torch.ones_like(prior_confidence)
-            if self.cfg.prior_confidence_gate_strength > 0.0:
-                strength = float(max(0.0, min(1.0, self.cfg.prior_confidence_gate_strength)))
-                confidence_gate = 1.0 - prior_confidence.clamp(0.0, 1.0) * strength
-                residual_gate = residual_gate * confidence_gate.clamp_min(float(self.cfg.min_residual_gate))
+            residual_gate_roughness = residual_gate
+            residual_gate_metallic = residual_gate
+            roughness_strength = float(
+                max(0.0, min(1.0, self.cfg.prior_confidence_gate_strength_roughness))
+            )
+            metallic_strength = float(
+                max(0.0, min(1.0, self.cfg.prior_confidence_gate_strength_metallic))
+            )
+            min_gate = float(max(0.0, min(1.0, self.cfg.min_residual_gate)))
+            if roughness_strength > 0.0:
+                confidence_gate = 1.0 - prior_confidence.clamp(0.0, 1.0) * roughness_strength
+                residual_gate_roughness = residual_gate_roughness * confidence_gate.clamp_min(min_gate)
+            if metallic_strength > 0.0:
+                confidence_gate = 1.0 - prior_confidence.clamp(0.0, 1.0) * metallic_strength
+                residual_gate_metallic = residual_gate_metallic * confidence_gate.clamp_min(min_gate)
+            residual_gate = torch.cat([residual_gate_roughness, residual_gate_metallic], dim=1)
+        if residual_gate.shape[1] == 1:
+            residual_gate = residual_gate.expand(-1, 2, -1, -1)
         residual_gate = residual_gate * residual_channel_gate_uv
         max_gate = float(max(0.0, min(1.0, self.cfg.max_residual_gate)))
         if max_gate < 1.0:
@@ -1638,18 +1718,24 @@ class MaterialRefiner(BaseModule):
                 0.25 + 0.75 * boundary_cues
             )
             boundary_gate = (1.0 + strength * boundary_gain).clamp(1.0 - strength, 1.0 + strength)
-            residual_gate = residual_gate * boundary_gate
+            residual_gate = residual_gate * self._roughness_scaled_suppression_gate(boundary_gate)
         if self.enable_boundary_safety:
             boundary_gate = boundary_gate * boundary_safety_outputs["boundary_gate_uv"]
-            residual_gate = residual_gate * boundary_safety_outputs["boundary_gate_uv"]
-            residual_gate = residual_gate * (0.25 + 0.75 * safe_update_mask_uv)
+            residual_gate = residual_gate * self._roughness_scaled_suppression_gate(
+                boundary_safety_outputs["boundary_gate_uv"]
+            )
+            residual_gate = residual_gate * self._roughness_scaled_suppression_gate(
+                0.25 + 0.75 * safe_update_mask_uv
+            )
             boundary_suppression = float(
                 max(0.0, min(1.0, self.cfg.boundary_residual_suppression_strength))
             )
             if boundary_suppression > 0.0:
-                residual_gate = residual_gate * (1.0 - boundary_suppression * boundary_cues).clamp(
-                    1.0 - boundary_suppression,
-                    1.0,
+                residual_gate = residual_gate * self._roughness_scaled_suppression_gate(
+                    (1.0 - boundary_suppression * boundary_cues).clamp(
+                        1.0 - boundary_suppression,
+                        1.0,
+                    )
                 )
         view_uncertainty_residual_gate_uv = torch.ones_like(prior_confidence)
         view_uncertainty_suppression = float(
@@ -1659,6 +1745,9 @@ class MaterialRefiner(BaseModule):
             view_uncertainty_residual_gate_uv = (
                 1.0 - view_uncertainty_suppression * view_uncertainty_uv.clamp(0.0, 1.0)
             ).clamp(1.0 - view_uncertainty_suppression, 1.0)
+            view_uncertainty_residual_gate_uv = self._roughness_scaled_suppression_gate(
+                view_uncertainty_residual_gate_uv
+            )
             residual_gate = residual_gate * view_uncertainty_residual_gate_uv
         bleed_risk_residual_gate_uv = torch.ones_like(prior_confidence)
         bleed_risk_suppression = float(
@@ -1668,6 +1757,9 @@ class MaterialRefiner(BaseModule):
             bleed_risk_residual_gate_uv = (
                 1.0 - bleed_risk_suppression * bleed_risk_uv.clamp(0.0, 1.0)
             ).clamp(1.0 - bleed_risk_suppression, 1.0)
+            bleed_risk_residual_gate_uv = self._roughness_scaled_suppression_gate(
+                bleed_risk_residual_gate_uv
+            )
             residual_gate = residual_gate * bleed_risk_residual_gate_uv
         topology_residual_gate_uv = torch.ones_like(prior_confidence)
         topology_suppression = float(
@@ -1677,6 +1769,9 @@ class MaterialRefiner(BaseModule):
             topology_residual_gate_uv = (
                 1.0 - topology_suppression * (1.0 - region_consistency_score.clamp(0.0, 1.0))
             ).clamp(1.0 - topology_suppression, 1.0)
+            topology_residual_gate_uv = self._roughness_scaled_suppression_gate(
+                topology_residual_gate_uv
+            )
             residual_gate = residual_gate * topology_residual_gate_uv
 
         evidence_update_budget_uv = torch.ones_like(initial)
@@ -1731,6 +1826,12 @@ class MaterialRefiner(BaseModule):
                 1.0 - budget_strength * (1.0 - evidence_update_budget_uv)
             ).clamp(budget_floor, 1.0)
             residual_gate = residual_gate * evidence_budget_gate
+        residual_gate = self._apply_withprior_gate_floor(
+            residual_gate,
+            prior_confidence=prior_confidence,
+            uv_mask=uv_mask,
+            near_gt_mask=near_gt_prior_mask,
+        )
 
         material_logits = trunk_material_logits if trunk_material_logits is not None else topology_material_logits
         material_delta = torch.zeros_like(initial)
@@ -1763,7 +1864,21 @@ class MaterialRefiner(BaseModule):
                 1.0 - strength,
                 1.0,
             )
+            blend_floor = float(max(0.0, min(1.0, self.cfg.render_gate_blend_floor)))
+            if blend_floor > 0.0:
+                withprior_mask = ((prior_confidence > 1.0e-4).to(render_support_gate.dtype) * uv_mask).clamp(0.0, 1.0)
+                render_support_gate = torch.where(
+                    withprior_mask > 0.0,
+                    blend_floor + (1.0 - blend_floor) * render_support_gate,
+                    render_support_gate,
+                )
             residual_gate = residual_gate * render_support_gate
+            residual_gate = self._apply_withprior_gate_floor(
+                residual_gate,
+                prior_confidence=prior_confidence,
+                uv_mask=uv_mask,
+                near_gt_mask=near_gt_prior_mask,
+            )
             provisional_refined = (initial + delta * residual_gate).clamp(0.0, 1.0)
         inverse_material_gate_uv = torch.ones_like(prior_confidence)
         if self.cfg.enable_inverse_material_check:
@@ -1796,6 +1911,8 @@ class MaterialRefiner(BaseModule):
             "boundary_delta_mean": boundary_delta_mean,
             "prior_reliability_mean": prior_reliability_uv.flatten(1).mean(dim=1),
             "change_gate_mean": residual_gate.flatten(1).mean(dim=1),
+            "roughness_gate_mean": residual_gate[:, 0:1].flatten(1).mean(dim=1),
+            "metallic_gate_mean": residual_gate[:, 1:2].flatten(1).mean(dim=1),
             "bootstrap_enabled": torch.full(
                 (refined.shape[0],),
                 1.0 if self.enable_no_prior_bootstrap else 0.0,
@@ -1818,6 +1935,8 @@ class MaterialRefiner(BaseModule):
             "delta_rm": delta,
             "residual_gate": residual_gate,
             "change_gate": residual_gate,
+            "residual_gate_roughness": residual_gate[:, 0:1],
+            "residual_gate_metallic": residual_gate[:, 1:2],
             "prior_reliability": prior_reliability_uv,
             "uncertainty_uv": uncertainty_uv,
             "boundary_cues": boundary_cues,

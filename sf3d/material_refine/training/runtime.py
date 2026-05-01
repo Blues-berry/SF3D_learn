@@ -374,6 +374,12 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--val-enable-lpips", type=parse_bool, default=True)
     parser.add_argument("--val-lpips-max-images", type=int, default=12)
     parser.add_argument("--max-validation-batches", type=int, default=0, help="0 evaluates the full validation loader.")
+    parser.add_argument(
+        "--monitor-val-target-records",
+        type=int,
+        default=0,
+        help="When >0, cap validation by approximate record count instead of only by max batches.",
+    )
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--checkpointing-steps", type=int, default=0)
     parser.add_argument("--save-only-best-checkpoint", type=parse_bool, default=False)
@@ -413,8 +419,14 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-scope", choices=["epoch", "validation_event"], default="epoch")
     parser.add_argument(
         "--validation-selection-metric",
-        choices=["uv_total", "uv_render_guarded", "gain_render_guarded", "variant_balanced_gain_render_guarded"],
-        default="gain_render_guarded",
+        choices=[
+            "uv_total",
+            "uv_render_guarded",
+            "gain_render_guarded",
+            "variant_balanced_gain_render_guarded",
+            "hybrid_potential_gain_render_guarded",
+        ],
+        default="hybrid_potential_gain_render_guarded",
     )
     parser.add_argument("--selection-view-rm-penalty", type=float, default=0.5)
     parser.add_argument("--selection-mse-penalty", type=float, default=0.5)
@@ -422,6 +434,21 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--selection-residual-regression-penalty", type=float, default=0.1)
     parser.add_argument("--selection-metric-near-gt-regression-multiplier", type=float, default=1.0)
     parser.add_argument("--selection-metric-withprior-regression-multiplier", type=float, default=1.0)
+    parser.add_argument("--previous-baseline-uv-total", type=float, default=None)
+    parser.add_argument("--previous-baseline-uv-gain", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mae-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-mse-delta", type=float, default=None)
+    parser.add_argument("--previous-baseline-rm-proxy-view-psnr-delta", type=float, default=None)
+    parser.add_argument("--hybrid-prior-percentile-fixed-weight", type=float, default=0.7)
+    parser.add_argument("--hybrid-prior-percentile-empirical-weight", type=float, default=0.3)
+    parser.add_argument("--hybrid-prior-min-potential", type=float, default=0.10)
+    parser.add_argument("--prior-confidence-gate-strength-roughness", type=float, default=None)
+    parser.add_argument("--prior-confidence-gate-strength-metallic", type=float, default=None)
+    parser.add_argument("--roughness-suppression-scale", type=float, default=1.0)
+    parser.add_argument("--withprior-gate-floor", type=float, default=0.0)
+    parser.add_argument("--withprior-roughness-gate-floor", type=float, default=0.0)
+    parser.add_argument("--near-gt-gate-floor", type=float, default=0.0)
+    parser.add_argument("--render-gate-blend-floor", type=float, default=0.0)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--init-from-checkpoint",
@@ -591,7 +618,19 @@ def parse_args() -> argparse.Namespace:
     if args.disable_prior_safe_loss:
         args.prior_consistency_weight = 0.0
         args.residual_safety_weight = 0.0
+    if args.prior_confidence_gate_strength_roughness is None:
+        args.prior_confidence_gate_strength_roughness = float(args.prior_confidence_gate_strength)
+    if args.prior_confidence_gate_strength_metallic is None:
+        args.prior_confidence_gate_strength_metallic = float(args.prior_confidence_gate_strength)
     args.max_residual_gate = max(0.0, min(1.0, float(args.max_residual_gate)))
+    args.prior_confidence_gate_strength_roughness = max(
+        0.0,
+        min(1.0, float(args.prior_confidence_gate_strength_roughness)),
+    )
+    args.prior_confidence_gate_strength_metallic = max(
+        0.0,
+        min(1.0, float(args.prior_confidence_gate_strength_metallic)),
+    )
     args.boundary_safety_strength = max(0.0, min(1.0, float(args.boundary_safety_strength)))
     args.boundary_residual_suppression_strength = max(
         0.0,
@@ -625,6 +664,7 @@ def parse_args() -> argparse.Namespace:
     args.min_nontrivial_target_count_for_paper = max(int(args.min_nontrivial_target_count_for_paper), 0)
     args.roughness_channel_weight = max(float(args.roughness_channel_weight), 0.1)
     args.metallic_channel_weight = max(float(args.metallic_channel_weight), 0.1)
+    args.monitor_val_target_records = max(int(args.monitor_val_target_records), 0)
     args.selection_metric_near_gt_regression_multiplier = max(
         float(args.selection_metric_near_gt_regression_multiplier),
         1.0,
@@ -633,6 +673,20 @@ def parse_args() -> argparse.Namespace:
         float(args.selection_metric_withprior_regression_multiplier),
         1.0,
     )
+    fixed_weight = max(float(args.hybrid_prior_percentile_fixed_weight), 0.0)
+    empirical_weight = max(float(args.hybrid_prior_percentile_empirical_weight), 0.0)
+    total_weight = fixed_weight + empirical_weight
+    if total_weight <= 1.0e-8:
+        fixed_weight, empirical_weight = 0.7, 0.3
+        total_weight = 1.0
+    args.hybrid_prior_percentile_fixed_weight = fixed_weight / total_weight
+    args.hybrid_prior_percentile_empirical_weight = empirical_weight / total_weight
+    args.hybrid_prior_min_potential = max(0.01, min(0.5, float(args.hybrid_prior_min_potential)))
+    args.roughness_suppression_scale = max(0.0, min(2.0, float(args.roughness_suppression_scale)))
+    args.withprior_gate_floor = max(0.0, min(1.0, float(args.withprior_gate_floor)))
+    args.withprior_roughness_gate_floor = max(0.0, min(1.0, float(args.withprior_roughness_gate_floor)))
+    args.near_gt_gate_floor = max(0.0, min(1.0, float(args.near_gt_gate_floor)))
+    args.render_gate_blend_floor = max(0.0, min(1.0, float(args.render_gate_blend_floor)))
     args.train_target_quality_weights = parse_weight_map(args.train_target_quality_weights)
     args.train_difficulty_weights = parse_weight_map(args.train_difficulty_weights)
     args.train_failure_tag_weights = parse_weight_map(args.train_failure_tag_weights)
@@ -1515,6 +1569,12 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         "min_residual_gate": float(args.min_residual_gate),
         "max_residual_gate": float(args.max_residual_gate),
         "prior_confidence_gate_strength": float(args.prior_confidence_gate_strength),
+        "prior_confidence_gate_strength_roughness": float(
+            args.prior_confidence_gate_strength_roughness
+        ),
+        "prior_confidence_gate_strength_metallic": float(
+            args.prior_confidence_gate_strength_metallic
+        ),
         "enable_boundary_context": bool(args.enable_boundary_context),
         "boundary_context_strength": float(args.boundary_context_strength),
         "enable_material_context": bool(args.enable_material_context),
@@ -1522,6 +1582,11 @@ def build_model_cfg(args: argparse.Namespace) -> dict[str, Any]:
         "material_delta_scale": float(args.material_delta_scale),
         "enable_render_consistency_gate": bool(args.enable_render_consistency_gate),
         "render_gate_strength": float(args.render_gate_strength),
+        "roughness_suppression_scale": float(args.roughness_suppression_scale),
+        "withprior_gate_floor": float(args.withprior_gate_floor),
+        "withprior_roughness_gate_floor": float(args.withprior_roughness_gate_floor),
+        "near_gt_gate_floor": float(args.near_gt_gate_floor),
+        "render_gate_blend_floor": float(args.render_gate_blend_floor),
         "enable_dual_path_prior_init": bool(args.enable_dual_path_prior_init),
         "enable_domain_prior_calibration": bool(args.enable_domain_prior_calibration),
         "domain_feature_channels": int(args.domain_feature_channels),
@@ -3763,15 +3828,18 @@ def update_object_improvement_store(
     total_improvement: float,
     roughness_improvement: float,
     metallic_improvement: float,
+    baseline_total_mae: float | None = None,
 ) -> None:
     bucket = store.setdefault(
         object_id,
-        {"count": 0.0, "total": 0.0, "roughness": 0.0, "metallic": 0.0},
+        {"count": 0.0, "total": 0.0, "roughness": 0.0, "metallic": 0.0, "baseline_total": 0.0},
     )
     bucket["count"] += 1.0
     bucket["total"] += total_improvement
     bucket["roughness"] += roughness_improvement
     bucket["metallic"] += metallic_improvement
+    if baseline_total_mae is not None:
+        bucket["baseline_total"] += baseline_total_mae
 
 
 def make_material_case_key(
@@ -3800,6 +3868,7 @@ def finalize_improvement_level_metrics(
             {
                 id_key: item_id,
                 "count": int(bucket.get("count", 0.0)),
+                "baseline_total_mae": float(bucket.get("baseline_total", 0.0) / count),
                 "avg_improvement_total": float(bucket.get("total", 0.0) / count),
                 "avg_improvement_roughness": float(bucket.get("roughness", 0.0) / count),
                 "avg_improvement_metallic": float(bucket.get("metallic", 0.0) / count),
@@ -3828,6 +3897,114 @@ def finalize_improvement_level_metrics(
         "regression_rate": regressed / level_count,
         "unchanged_rate": unchanged / level_count,
         "entries": values,
+    }
+
+
+def compute_validation_batch_limit(loader: DataLoader, args: argparse.Namespace) -> int:
+    target_records = int(getattr(args, "monitor_val_target_records", 0) or 0)
+    configured_max_batches = int(getattr(args, "max_validation_batches", 0) or 0)
+    batch_size = int(getattr(args, "val_batch_size", 0) or getattr(args, "batch_size", 1) or 1)
+    if target_records > 0:
+        target_batches = max(int(math.ceil(target_records / max(batch_size, 1))), 1)
+        if configured_max_batches > 0:
+            return min(target_batches, configured_max_batches)
+        return target_batches
+    return configured_max_batches
+
+
+def maybe_comparison_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_validation_comparison_payload(
+    val_payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    render_proxy = val_payload.get("render_proxy_validation") or {}
+    current = {
+        "uv_total": maybe_comparison_float((val_payload.get("uv_mae") or {}).get("total")),
+        "uv_gain": maybe_comparison_float((val_payload.get("improvement_uv_mae") or {}).get("total")),
+        "rm_proxy_view_mae_delta": maybe_comparison_float(render_proxy.get("view_rm_mae_delta")),
+        "rm_proxy_view_mse_delta": maybe_comparison_float(render_proxy.get("proxy_rm_mse_delta")),
+        "rm_proxy_view_psnr_delta": maybe_comparison_float(render_proxy.get("proxy_rm_psnr_delta")),
+    }
+    input_prior = {
+        "uv_total": maybe_comparison_float((val_payload.get("input_prior_uv_mae") or {}).get("total")),
+        "uv_gain": 0.0,
+        "rm_proxy_view_mae_delta": 0.0 if render_proxy.get("available") else None,
+        "rm_proxy_view_mse_delta": 0.0 if render_proxy.get("available") else None,
+        "rm_proxy_view_psnr_delta": 0.0 if render_proxy.get("available") else None,
+    }
+    previous = {
+        "uv_total": maybe_comparison_float(getattr(args, "previous_baseline_uv_total", None)),
+        "uv_gain": maybe_comparison_float(getattr(args, "previous_baseline_uv_gain", None)),
+        "rm_proxy_view_mae_delta": maybe_comparison_float(
+            getattr(args, "previous_baseline_rm_proxy_view_mae_delta", None)
+        ),
+        "rm_proxy_view_mse_delta": maybe_comparison_float(
+            getattr(args, "previous_baseline_rm_proxy_view_mse_delta", None)
+        ),
+        "rm_proxy_view_psnr_delta": maybe_comparison_float(
+            getattr(args, "previous_baseline_rm_proxy_view_psnr_delta", None)
+        ),
+    }
+
+    def delta_map(reference: dict[str, float | None]) -> dict[str, float | None]:
+        result = {}
+        for key, value in current.items():
+            ref_value = reference.get(key)
+            if value is None or ref_value is None:
+                result[key] = None
+                continue
+            # Lower UV total is better; all other comparison fields are gains/deltas.
+            result[key] = float(ref_value - value) if key == "uv_total" else float(value - ref_value)
+        return result
+
+    delta_vs_prior = delta_map(input_prior)
+    delta_vs_previous = delta_map(previous)
+    return {
+        "current": current,
+        "input_prior": input_prior,
+        "previous_baseline_run": previous,
+        "vs_prior": {
+            "delta": delta_vs_prior,
+            "delta_vs_prior": delta_vs_prior,
+            "effective": {
+                "uv_total": (
+                    delta_vs_prior["uv_total"] is not None and delta_vs_prior["uv_total"] > 0.0
+                ),
+                "uv_gain": (
+                    delta_vs_prior["uv_gain"] is not None and delta_vs_prior["uv_gain"] > 0.0
+                ),
+                "rm_proxy_view_psnr_delta": (
+                    delta_vs_prior["rm_proxy_view_psnr_delta"] is not None
+                    and delta_vs_prior["rm_proxy_view_psnr_delta"] > 0.0
+                ),
+            },
+        },
+        "vs_baseline_run": {
+            "delta": delta_vs_previous,
+            "delta_vs_previous_baseline_run": delta_vs_previous,
+            "improved": {
+                "uv_total": (
+                    delta_vs_previous["uv_total"] is not None and delta_vs_previous["uv_total"] > 0.0
+                ),
+                "uv_gain": (
+                    delta_vs_previous["uv_gain"] is not None and delta_vs_previous["uv_gain"] > 0.0
+                ),
+                "rm_proxy_view_psnr_delta": (
+                    delta_vs_previous["rm_proxy_view_psnr_delta"] is not None
+                    and delta_vs_previous["rm_proxy_view_psnr_delta"] > 0.0
+                ),
+            },
+        },
+        "delta_vs_prior": delta_vs_prior,
+        "delta_vs_previous_baseline_run": delta_vs_previous,
     }
 
 
@@ -4258,6 +4435,7 @@ def evaluate(
     validation_label: str,
 ) -> dict[str, Any]:
     model.eval()
+    validation_batch_limit = compute_validation_batch_limit(loader, args)
     totals: dict[str, float] = {
         "total": 0.0,
         "refine_l1": 0.0,
@@ -4272,6 +4450,8 @@ def evaluate(
         "material_context": 0.0,
         "residual_safety": 0.0,
         "residual_gate_mean": 0.0,
+        "roughness_gate_mean": 0.0,
+        "metallic_gate_mean": 0.0,
         "residual_delta_abs": 0.0,
         "view_uncertainty_gate_mean": 0.0,
         "bleed_risk_gate_mean": 0.0,
@@ -4308,11 +4488,12 @@ def evaluate(
     render_proxy_store: dict[str, float] = defaultdict(float)
     residual_gate_store: dict[str, float] = defaultdict(float)
     residual_gate_cases: list[dict[str, Any]] = []
+    gate_mean_by_variant_store: dict[str, dict[str, float]] = {}
     special_metric_store: dict[str, float] = defaultdict(float)
 
     with torch.no_grad():
         for batch in loader:
-            if args.max_validation_batches > 0 and steps >= args.max_validation_batches:
+            if validation_batch_limit > 0 and steps >= validation_batch_limit:
                 break
             batch = move_batch_to_device(batch, device)
             with (
@@ -4429,6 +4610,7 @@ def evaluate(
                     total_improvement=improvement_metric_kwargs["total_mae"],
                     roughness_improvement=improvement_metric_kwargs["roughness_mae"],
                     metallic_improvement=improvement_metric_kwargs["metallic_mae"],
+                    baseline_total_mae=baseline_metric_kwargs["total_mae"],
                 )
                 case_key = make_material_case_key(
                     object_id=object_id,
@@ -4442,6 +4624,7 @@ def evaluate(
                     total_improvement=improvement_metric_kwargs["total_mae"],
                     roughness_improvement=improvement_metric_kwargs["roughness_mae"],
                     metallic_improvement=improvement_metric_kwargs["metallic_mae"],
+                    baseline_total_mae=baseline_metric_kwargs["total_mae"],
                 )
                 update_group_metric_store(group_store, key=f"generator/{generator_id}", **metric_kwargs)
                 update_group_metric_store(group_store, key=f"source/{source_name}", **metric_kwargs)
@@ -4473,6 +4656,13 @@ def evaluate(
                     target=target[item_index].detach(),
                     confidence=confidence[item_index].detach(),
                     margin=float(args.residual_safety_margin),
+                )
+                update_gate_mean_diagnostics(
+                    gate_mean_by_variant_store,
+                    prior_variant_type=prior_variant_type,
+                    outputs=outputs,
+                    item_index=item_index,
+                    confidence=confidence,
                 )
 
                 view_rm_mae_delta_value = None
@@ -4600,6 +4790,13 @@ def evaluate(
         }
         for variant, bucket in sorted(variant_view_store.items())
     }
+    roughness_gain = float(mean_improvement.get("roughness", 0.0) or 0.0)
+    metallic_gain = float(mean_improvement.get("metallic", 0.0) or 0.0)
+    roughness_to_metallic_gain_ratio = (
+        None
+        if abs(metallic_gain) <= 1.0e-9
+        else float(roughness_gain / metallic_gain)
+    )
     return {
         "loss": mean_losses,
         "uv_mae": mean_uv_mae,
@@ -4612,10 +4809,20 @@ def evaluate(
         "object_level": finalize_object_improvement_metrics(object_improvement_store),
         "case_level": finalize_case_improvement_metrics(case_improvement_store),
         "batches": int(steps),
-        "max_validation_batches": int(args.max_validation_batches),
+        "max_validation_batches": int(validation_batch_limit if validation_batch_limit > 0 else args.max_validation_batches),
         "effective_view_supervision_samples": int(uv_mae.get("effective_view_supervision_samples", 0.0)),
         "effective_view_supervision_rate": float(uv_mae.get("effective_view_supervision_samples", 0.0) / max(uv_mae["count"], 1.0)),
         "view_stats_by_variant": view_stats_by_variant,
+        "gate_mean_by_variant": finalize_gate_mean_diagnostics(gate_mean_by_variant_store),
+        "roughness_gate_mean_by_variant": {
+            variant: metrics.get("roughness_gate_mean")
+            for variant, metrics in finalize_gate_mean_diagnostics(gate_mean_by_variant_store).items()
+        },
+        "metallic_gate_mean_by_variant": {
+            variant: metrics.get("metallic_gate_mean")
+            for variant, metrics in finalize_gate_mean_diagnostics(gate_mean_by_variant_store).items()
+        },
+        "roughness_to_metallic_gain_ratio": roughness_to_metallic_gain_ratio,
         "view_consistency_enabled": bool(
             (args.view_consistency_mode != "disabled" or args.enable_sampled_view_rm_loss)
             and max(float(args.view_consistency_weight), float(args.sampled_view_rm_loss_weight)) > 0.0
@@ -4964,6 +5171,33 @@ def run_validation_cycle(
         "mode": str(args.validation_selection_metric),
         **selection_components,
     }
+    val_payload["comparison"] = build_validation_comparison_payload(val_payload, args)
+    prior_aware_case_rows = list(selection_components.get("case_prior_aware") or [])
+    val_payload["prior_aware"] = {
+        "score": selection_components.get("variant_balanced_potential_gain"),
+        "by_variant_potential_normalized_gain": selection_components.get(
+            "by_variant_potential_normalized_gain"
+        ),
+        "case_prior_aware": prior_aware_case_rows,
+    }
+    val_payload["withprior_case_relative_error_reduction"] = [
+        {
+            "case_id": row.get("case_id"),
+            "prior_variant_type": row.get("prior_variant_type"),
+            "relative_error_reduction": row.get("relative_error_reduction"),
+        }
+        for row in prior_aware_case_rows
+        if row.get("prior_variant_type") != "no_prior_bootstrap"
+    ]
+    val_payload["withprior_case_potential_normalized_gain"] = [
+        {
+            "case_id": row.get("case_id"),
+            "prior_variant_type": row.get("prior_variant_type"),
+            "potential_normalized_gain": row.get("potential_normalized_gain"),
+        }
+        for row in prior_aware_case_rows
+        if row.get("prior_variant_type") != "no_prior_bootstrap"
+    ]
     val_payload["validation_label"] = validation_label
     val_payload["epoch"] = int(epoch)
     val_payload["optimizer_step"] = int(optimizer_step)
@@ -5041,6 +5275,7 @@ def run_validation_cycle(
             "val/input_prior_total_mae": (val_payload.get("input_prior_uv_mae") or {}).get("total"),
             "val/refined_total_mae": val_payload["uv_mae"]["total"],
             "val/gain_total": improvement_payload.get("total"),
+            "val/prior_aware/score": selection_components.get("variant_balanced_potential_gain"),
             "val/effective_view_supervision_rate": val_payload.get("effective_view_supervision_rate", 0.0),
             "val/object_level/avg_improvement_total": object_level_payload.get("avg_improvement_total"),
             "val/object_level/regression_rate": object_level_payload.get("regression_rate"),
@@ -5050,15 +5285,30 @@ def run_validation_cycle(
         group_metrics = val_payload.get("group_metrics") or {}
         baseline_group_metrics = val_payload.get("baseline_group_metrics") or {}
         improvement_group_metrics = val_payload.get("improvement_group_metrics") or {}
+        selection_by_variant_gain = selection_components.get("by_variant_gain") or {}
+        selection_by_variant_potential = selection_components.get("by_variant_potential_normalized_gain") or {}
         for group_key, metrics in group_metrics.items():
             if not str(group_key).startswith("prior_variant_type/"):
                 continue
-            variant = safe_wandb_key(str(group_key).split("/", 1)[1])
+            variant_name = str(group_key).split("/", 1)[1]
+            variant = safe_wandb_key(variant_name)
             baseline_metrics = baseline_group_metrics.get(group_key) or {}
             improvement_metrics = improvement_group_metrics.get(group_key) or {}
             log_payload[f"val/by_variant/{variant}/refined_total_mae"] = metrics.get("total_mae")
             log_payload[f"val/by_variant/{variant}/input_prior_total_mae"] = baseline_metrics.get("total_mae")
             log_payload[f"val/by_variant/{variant}/gain_total"] = improvement_metrics.get("total_mae")
+            baseline_total = float((baseline_metrics or {}).get("total_mae", 0.0) or 0.0)
+            variant_gain = selection_by_variant_gain.get(variant_name)
+            if variant_gain is None:
+                variant_gain = improvement_metrics.get("total_mae")
+            log_payload[f"val/by_variant/{variant}/gain_relative"] = (
+                None
+                if baseline_total <= 1.0e-6
+                else float(float(variant_gain or 0.0) / baseline_total)
+            )
+            log_payload[f"val/by_variant/{variant}/gain_potential_normalized"] = (
+                selection_by_variant_potential.get(variant_name)
+            )
         render_proxy = val_payload.get("render_proxy_validation") or {}
         if bool(render_proxy.get("available")):
             log_payload["val/rm_proxy/view_mae/baseline"] = render_proxy.get("baseline_view_rm_mae")
@@ -5950,6 +6200,7 @@ from .metrics import (
     filter_train_wandb_logs,
     filter_validation_wandb_logs,
     finalize_render_proxy_metrics,
+    finalize_gate_mean_diagnostics,
     finalize_residual_gate_diagnostics,
     finalize_validation_special_metrics,
     get_lpips_model,
@@ -5959,6 +6210,7 @@ from .metrics import (
     rm_to_lpips_rgb,
     sample_uv_maps_to_view,
     safe_wandb_key,
+    update_gate_mean_diagnostics,
     update_render_proxy_metrics,
     update_residual_gate_diagnostics,
     update_validation_special_metrics,

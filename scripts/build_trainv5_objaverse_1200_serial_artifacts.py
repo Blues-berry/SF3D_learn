@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-resolution", type=int, default=320)
     parser.add_argument("--cycles-samples", type=int, default=8)
     parser.add_argument("--view-light-protocol", type=str, default="production_32")
+    parser.add_argument("--min-launch-records", type=int, default=256)
+    parser.add_argument("--max-fail-rate", type=float, default=0.30)
     return parser.parse_args()
 
 
@@ -142,16 +144,34 @@ def main() -> None:
     write_json(args.output_dir / "objaverse_1200_second_pass_summary.json", second_pass_summary)
     write_json(args.output_dir / "objaverse_1200_repair_summary.json", repair_summary)
 
-    ready_exact_1200 = len(source_rows) == args.target_total
-    queue_ready_exact_1200 = len(queue_rows) == args.target_total
+    download_stage_complete = len(source_rows) >= args.target_total
+    deferred_records = len(pending_rows) + len(rejected_rows)
+    source_records = len(source_rows)
+    queue_ready_records = len(queue_rows)
+    predicted_fail_rate = (deferred_records / source_records) if source_records > 0 else 1.0
+    launchable_now = (
+        download_stage_complete
+        and queue_ready_records >= int(args.min_launch_records)
+        and predicted_fail_rate <= float(args.max_fail_rate)
+    )
     queue_manifest = args.output_dir / "objaverse_1200_rebake_input_manifest.json"
     preflight_result: dict[str, Any] = {"skipped": True}
-    if ready_exact_1200 and queue_ready_exact_1200:
+    deferred_manifest = args.output_dir / "objaverse_1200_deferred_manifest.json"
+    write_json(
+        deferred_manifest,
+        {
+            "generated_at_utc": utc_now(),
+            "batch_name": args.batch_name,
+            "summary": summarize(pending_rows + rejected_rows),
+            "records": pending_rows + rejected_rows,
+        },
+    )
+    if launchable_now:
         write_json(
             queue_manifest,
             {
                 "generated_at_utc": utc_now(),
-                "queue_policy": "objaverse_1200_serial_frozen_after_download_and_repair",
+                "queue_policy": "objaverse_1200_serial_ready_subset_after_download_and_repair",
                 "batch_name": args.batch_name,
                 "summary": summarize(queue_rows),
                 "records": queue_rows,
@@ -162,12 +182,16 @@ def main() -> None:
         "generated_at_utc": utc_now(),
         "source_manifest": str(args.source_manifest),
         "queue_path": str(active_queue_path),
-        "ready_exact_1200": ready_exact_1200,
-        "queue_ready_exact_1200": queue_ready_exact_1200,
-        "source_records": len(source_rows),
-        "queue_ready_records": len(queue_rows),
+        "download_stage_complete": download_stage_complete,
+        "source_records": source_records,
+        "queue_ready_records": queue_ready_records,
+        "deferred_records": deferred_records,
+        "predicted_fail_rate": predicted_fail_rate,
+        "launchable_now": launchable_now,
+        "frozen_launch_record_count": queue_ready_records if launchable_now else 0,
         "batch_name": args.batch_name,
         "rebake_input_manifest": str(queue_manifest),
+        "deferred_manifest": str(deferred_manifest),
         "abc_b_root": str(args.abc_root / "B_track" / args.batch_name),
         "preflight_result": preflight_result,
     }
@@ -181,9 +205,12 @@ def main() -> None:
                 f"- generated_at_utc: `{decision['generated_at_utc']}`",
                 f"- source_records: `{decision['source_records']}`",
                 f"- queue_ready_records: `{decision['queue_ready_records']}`",
-                f"- ready_exact_1200: `{str(decision['ready_exact_1200']).lower()}`",
-                f"- queue_ready_exact_1200: `{str(decision['queue_ready_exact_1200']).lower()}`",
+                f"- deferred_records: `{decision['deferred_records']}`",
+                f"- download_stage_complete: `{str(decision['download_stage_complete']).lower()}`",
+                f"- launchable_now: `{str(decision['launchable_now']).lower()}`",
+                f"- predicted_fail_rate: `{decision['predicted_fail_rate']}`",
                 f"- rebake_input_manifest: `{decision['rebake_input_manifest']}`",
+                f"- deferred_manifest: `{decision['deferred_manifest']}`",
                 f"- abc_b_root: `{decision['abc_b_root']}`",
                 f"- preflight_returncode: `{preflight_result.get('returncode')}`",
             ]

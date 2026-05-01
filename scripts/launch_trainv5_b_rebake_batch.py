@@ -47,6 +47,8 @@ def main() -> None:
     rebake_root = args.b_root / "B_track" / batch_slug
     preflight = read_json(rebake_root / "B_track_preflight.json", {})
     if not preflight:
+        preflight = read_json(args.b_root / "B_track_preflight.json", {})
+    if not preflight:
         raise SystemExit(f"missing_preflight:{rebake_root / 'B_track_preflight.json'}")
     records = int(preflight.get("records") or 0)
     if records <= 0:

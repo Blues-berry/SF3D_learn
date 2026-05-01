@@ -460,6 +460,28 @@ def main() -> None:
             case_rows.append(case_row)
         except Exception as exc:  # noqa: BLE001
             failures.append({"case_key": case.get("case_key"), "reason": f"{type(exc).__name__}: {exc}"})
+    real_render_metrics = {
+        "psnr": metric_pair(
+            [row["prior_metrics"]["psnr"] for row in case_rows],
+            [row["ours_metrics"]["psnr"] for row in case_rows],
+            higher_is_better=True,
+        ),
+        "mse": metric_pair(
+            [row["prior_metrics"]["mse"] for row in case_rows],
+            [row["ours_metrics"]["mse"] for row in case_rows],
+            higher_is_better=False,
+        ),
+        "ssim": metric_pair(
+            [row["prior_metrics"]["ssim"] for row in case_rows],
+            [row["ours_metrics"]["ssim"] for row in case_rows],
+            higher_is_better=True,
+        ),
+        "lpips": metric_pair(
+            [row["prior_metrics"]["lpips"] for row in case_rows if row["prior_metrics"]["lpips"] is not None],
+            [row["ours_metrics"]["lpips"] for row in case_rows if row["ours_metrics"]["lpips"] is not None],
+            higher_is_better=False,
+        ),
+    }
     summary_payload = {
         "manifest": str(args.manifest.resolve()),
         "metrics": str(args.metrics.resolve()),
@@ -471,28 +493,11 @@ def main() -> None:
         "failed_cases": len(failures),
         "hdri_preset": args.hdri_preset,
         "hdri_path": str(hdri_path.resolve()),
-        "real_render_metrics": {
-            "psnr": metric_pair(
-                [row["prior_metrics"]["psnr"] for row in case_rows],
-                [row["ours_metrics"]["psnr"] for row in case_rows],
-                higher_is_better=True,
-            ),
-            "mse": metric_pair(
-                [row["prior_metrics"]["mse"] for row in case_rows],
-                [row["ours_metrics"]["mse"] for row in case_rows],
-                higher_is_better=False,
-            ),
-            "ssim": metric_pair(
-                [row["prior_metrics"]["ssim"] for row in case_rows],
-                [row["ours_metrics"]["ssim"] for row in case_rows],
-                higher_is_better=True,
-            ),
-            "lpips": metric_pair(
-                [row["prior_metrics"]["lpips"] for row in case_rows if row["prior_metrics"]["lpips"] is not None],
-                [row["ours_metrics"]["lpips"] for row in case_rows if row["ours_metrics"]["lpips"] is not None],
-                higher_is_better=False,
-            ),
-        },
+        "real_render_metrics": real_render_metrics,
+        "psnr_delta": (real_render_metrics.get("psnr") or {}).get("delta"),
+        "mse_delta": (real_render_metrics.get("mse") or {}).get("delta"),
+        "ssim_delta": (real_render_metrics.get("ssim") or {}).get("delta"),
+        "lpips_delta": (real_render_metrics.get("lpips") or {}).get("delta"),
         "by_prior_variant_type": summarize_by_variant(case_rows),
         "cases": case_rows,
         "failures": failures,

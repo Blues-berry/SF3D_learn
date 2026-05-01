@@ -660,6 +660,7 @@ def b_preflight(
         },
     )
     write_json(b_root / "B_track_preflight.json", preflight)
+    write_json(rebake_root / "B_track_preflight.json", preflight)
     prepare_output_root = rebake_root / "prepared"
     prepared_manifest = rebake_root / f"{batch_slug}_manifest.json"
     command = [
@@ -714,8 +715,8 @@ def b_preflight(
     write_text(command_path, script_text)
     command_path.chmod(0o755)
     blockers = []
-    if expected_record_count > 0 and len(records) != expected_record_count:
-        blockers.append(f"expected_{expected_record_count}_records_got_{len(records)}")
+    if expected_record_count > 0 and len(records) <= 0:
+        blockers.append(f"expected_positive_records_got_{len(records)}")
     if missing:
         blockers.append(f"missing_or_unreadable_paths_{len(missing)}")
     if not preflight["output_is_symlink"]:

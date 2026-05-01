@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,10 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    print(
+        "DEPRECATED: keep A-track training config changes in configs/ or TrainV5 training parameters; do not add new iterN dataset scripts.",
+        file=sys.stderr,
+    )
     args = parse_args()
     cfg = OmegaConf.load(args.base_config)
     fallback_reason: list[str] = []
@@ -66,10 +71,12 @@ def main() -> None:
     updates = {
         "cuda_device_index": 1,
         "output_dir": DEFAULT_ITER1_OUTPUT_DIR,
-        "validation_selection_metric": "variant_balanced_gain_render_guarded",
+        "validation_selection_metric": "hybrid_potential_gain_render_guarded",
         "selection_metric_near_gt_regression_multiplier": 2.0,
         "selection_metric_withprior_regression_multiplier": 1.5,
         "prior_confidence_gate_strength": 0.50,
+        "prior_confidence_gate_strength_roughness": 0.15,
+        "prior_confidence_gate_strength_metallic": 0.50,
         "prior_dropout_start_prob": 0.02,
         "prior_dropout_end_prob": 0.08,
         "prior_dropout_warmup_epochs": 6,
@@ -84,6 +91,20 @@ def main() -> None:
         "view_uncertainty_residual_suppression_strength": 0.25,
         "bleed_risk_residual_suppression_strength": 0.35,
         "topology_residual_suppression_strength": 0.15,
+        "roughness_suppression_scale": 0.5,
+        "withprior_gate_floor": 0.10,
+        "withprior_roughness_gate_floor": 0.18,
+        "near_gt_gate_floor": 0.06,
+        "render_gate_blend_floor": 0.35,
+        "monitor_val_target_records": 160,
+        "hybrid_prior_percentile_fixed_weight": 0.7,
+        "hybrid_prior_percentile_empirical_weight": 0.3,
+        "hybrid_prior_min_potential": 0.10,
+        "previous_baseline_uv_total": 0.25475716814398763,
+        "previous_baseline_uv_gain": 0.1101572948275134,
+        "previous_baseline_rm_proxy_view_mae_delta": 0.060564438506714946,
+        "previous_baseline_rm_proxy_view_mse_delta": 0.07566712377925434,
+        "previous_baseline_rm_proxy_view_psnr_delta": 5.038672034913205,
         "roughness_channel_weight": 1.35,
         "metallic_channel_weight": 1.0,
         "edge_aware_weight": 0.32,
@@ -135,7 +156,7 @@ def main() -> None:
         "objective": {
             "with_prior_gain": "increase mild/medium/large gains without regressing near_gt_prior",
             "roughness_balance": "raise roughness improvement so it no longer trails metallic improvement by a large margin",
-            "selection": "choose checkpoints using equal-weight by-variant gain with extra near-gt / with-prior regression penalties",
+            "selection": "choose checkpoints using equal-weight prior-aware potential-normalized gain with render and regression penalties",
         },
     }
     save_json(args.output_rationale, rationale)

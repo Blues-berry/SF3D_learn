@@ -1,0 +1,29 @@
+{
+  "repo_root": "/home/ubuntu/ssd_work/projects/stable-fast-3d",
+  "status_dir": "output/material_refine_trainV5_auto/status",
+  "last_cycle_state": "output/material_refine_trainV5_auto/last_cycle_state.json",
+  "abc_root": "output/material_refine_trainV5_abc",
+  "expansion_second_pass_dir": "output/material_refine_trainV5/expansion_second_pass",
+  "merged_expansion_manifest": "output/material_refine_expansion_candidates/merged_expansion_candidate_manifest.json",
+  "rolling_queue": "output/material_refine_trainV5/expansion_second_pass/batch_1_512_material_first.json",
+  "min_launch_records": 256,
+  "max_fail_rate": 0.3,
+  "gpu_id": 0,
+  "parallel_workers": 2,
+  "render_resolution": 320,
+  "cycles_samples": 8,
+  "view_light_protocol": "production_32",
+  "download_mode": "direct",
+  "download_probe_size": 100,
+  "min_download_success_rate": 0.2,
+  "objaverse_target": 1200,
+  "objaverse_sources": "smithsonian,thingiverse,sketchfab",
+  "material_priority": [
+    "glass_metal",
+    "ceramic_glazed_lacquer",
+    "metal_dominant",
+    "glossy_non_metal",
+    "mixed_thin_boundary"
+  ],
+  "target_material_family_ratios": "mixed_thin_boundary=0.28,glass_metal=0.24,ceramic_glazed_lacquer=0.22,metal_dominant=0.18,glossy_non_metal=0.08"
+}
