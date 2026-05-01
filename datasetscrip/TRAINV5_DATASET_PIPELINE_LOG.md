@@ -89,6 +89,19 @@ Use these operator commands instead of calling old `scripts/` files directly:
 The old supervisor scripts now delegate to `datasetscrip/` and should not be
 edited with independent business logic again.
 
+## Phase 2 Replacement Status
+
+- Operator-facing replacement is complete: use `datasetscrip/trainv5_dataset.py`
+  and `datasetscrip/trainv5_supervisor.sh`.
+- Active ingest no longer calls
+  `scripts/manage_trainv5_objaverse_1200_serial_plan.py`.
+- Objaverse material-priority selection, retry, topup, and status writing are
+  now parameterized through `scripts/stage_material_refine_material_priority_sources.py`
+  as an internal helper called by `datasetscrip/trainv5_dataset.py ingest`.
+- The Objaverse 1200 file names are still emitted for compatibility with the
+  current status/brief tools, but the active path is no longer tied to the old
+  batch-specific manager script.
+
 ## Calling Principles
 
 - Prefer `datasetscrip/trainv5_dataset.py` over adding new one-off scripts.
@@ -130,10 +143,12 @@ Do not add more batch-specific launcher scripts such as:
 If the behavior is still useful, expose it as a parameter or config option on
 `datasetscrip/trainv5_dataset.py`.
 
-Existing batch-specific scripts are compatibility-only. In particular, these
-are deprecated as direct entrypoints:
+The first batch of deprecated one-off scripts has been removed from active code:
 
 - `scripts/maybe_launch_objaverse_1200_serial_after_b1.py`
 - `scripts/manage_trainv5_objaverse_1200_serial_plan.py`
 - `scripts/cutover_trainv5_b1_rebake.py`
 - `scripts/build_material_refine_trainV5_plus_a_withprior_iter1.py`
+
+Use `datasetscrip/TRAINV5_SCRIPT_DELETION_PLAN.md` for the current
+keep/migrate/delete classification before removing additional `scripts/` files.

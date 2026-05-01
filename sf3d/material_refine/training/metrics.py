@@ -1063,6 +1063,11 @@ def compute_validation_selection_metric(
         "large_gap_prior",
         "no_prior_bootstrap",
     ]
+    withprior_gap_variants = [
+        "mild_gap_prior",
+        "medium_gap_prior",
+        "large_gap_prior",
+    ]
     fixed_percentiles = {
         "near_gt_prior": 0.95,
         "mild_gap_prior": 0.75,
@@ -1114,6 +1119,14 @@ def compute_validation_selection_metric(
         float(sum(available_variant_gains) / max(len(available_variant_gains), 1))
         if available_variant_gains
         else uv_gain
+    )
+    available_withprior_gap_gains = [
+        variant_gain_rows[name] for name in withprior_gap_variants if name in variant_gain_rows
+    ]
+    withprior_gap_uv_gain = (
+        float(sum(available_withprior_gap_gains) / max(len(available_withprior_gap_gains), 1))
+        if available_withprior_gap_gains
+        else variant_balanced_uv_gain
     )
     case_entries = list(((val_payload.get("case_level") or {}).get("entries") or []))
     near_gt_entries = []
@@ -1200,6 +1213,14 @@ def compute_validation_selection_metric(
         if available_variant_potential
         else 0.0
     )
+    available_withprior_gap_potential = [
+        variant_potential_rows[name] for name in withprior_gap_variants if variant_potential_rows.get(name) is not None
+    ]
+    withprior_gap_potential_gain = (
+        float(sum(available_withprior_gap_potential) / max(len(available_withprior_gap_potential), 1))
+        if available_withprior_gap_potential
+        else variant_balanced_potential_gain
+    )
     penalty_total = (
         float(args.selection_view_rm_penalty) * view_penalty
         + float(getattr(args, "selection_mse_penalty", 0.5)) * mse_penalty
@@ -1208,6 +1229,8 @@ def compute_validation_selection_metric(
     )
     if args.validation_selection_metric == "hybrid_potential_gain_render_guarded":
         selection_metric = -variant_balanced_potential_gain + penalty_total + near_gt_penalty + withprior_penalty
+    elif args.validation_selection_metric == "withprior_gap_gain_render_guarded":
+        selection_metric = -withprior_gap_potential_gain + penalty_total + near_gt_penalty + withprior_penalty
     elif args.validation_selection_metric == "variant_balanced_gain_render_guarded":
         selection_metric = -variant_balanced_uv_gain + penalty_total + near_gt_penalty + withprior_penalty
     elif args.validation_selection_metric == "gain_render_guarded":
@@ -1219,10 +1242,12 @@ def compute_validation_selection_metric(
         "input_prior_total": input_prior_total,
         "uv_gain": uv_gain,
         "variant_balanced_uv_gain": variant_balanced_uv_gain,
+        "withprior_gap_uv_gain": withprior_gap_uv_gain,
         "by_variant_gain": {name: variant_gain_rows.get(name) for name in variant_order},
         "by_variant_potential_normalized_gain": variant_potential_rows,
         "case_prior_aware": case_prior_aware_rows,
         "variant_balanced_potential_gain": variant_balanced_potential_gain,
+        "withprior_gap_potential_gain": withprior_gap_potential_gain,
         "view_penalty": view_penalty,
         "mse_penalty": mse_penalty,
         "psnr_penalty": psnr_penalty,

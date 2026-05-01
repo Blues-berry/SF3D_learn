@@ -104,6 +104,10 @@ def cmd_ingest(args: argparse.Namespace, config: dict[str, Any]) -> None:
         str(args.download_probe_size or config.get("download_probe_size", 100)),
         "--min-download-success-rate",
         str(args.min_download_success_rate or config.get("min_download_success_rate", 0.2)),
+        "--max-retry-rounds",
+        str(args.max_retry_rounds or config.get("max_retry_rounds", 2)),
+        "--max-actions-per-run",
+        str(args.max_actions_per_run or config.get("max_actions_per_run", 4)),
         "--objaverse-target",
         str(args.objaverse_target or config.get("objaverse_target", 1200)),
         "--objaverse-sources",
@@ -340,6 +344,8 @@ def parse_args() -> argparse.Namespace:
     ingest.add_argument("--download-mode", choices=["direct", "proxy-probe", "mirror-probe", "off"])
     ingest.add_argument("--download-probe-size", type=int)
     ingest.add_argument("--min-download-success-rate", type=float)
+    ingest.add_argument("--max-retry-rounds", type=int)
+    ingest.add_argument("--max-actions-per-run", type=int)
     ingest.add_argument("--objaverse-target", type=int)
     ingest.add_argument("--sources")
     ingest.add_argument("--priority-material-families")
@@ -402,6 +408,8 @@ def parse_args() -> argparse.Namespace:
     supervisor.add_argument("--download-mode", choices=["direct", "proxy-probe", "mirror-probe", "off"])
     supervisor.add_argument("--download-probe-size", type=int)
     supervisor.add_argument("--min-download-success-rate", type=float)
+    supervisor.add_argument("--max-retry-rounds", type=int)
+    supervisor.add_argument("--max-actions-per-run", type=int)
     supervisor.add_argument("--objaverse-target", type=int)
     supervisor.add_argument("--sources")
     supervisor.add_argument("--priority-material-families")

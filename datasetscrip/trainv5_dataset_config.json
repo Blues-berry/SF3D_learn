@@ -16,6 +16,8 @@
   "download_mode": "direct",
   "download_probe_size": 100,
   "min_download_success_rate": 0.2,
+  "max_retry_rounds": 2,
+  "max_actions_per_run": 4,
   "objaverse_target": 1200,
   "objaverse_sources": "smithsonian,thingiverse,sketchfab",
   "material_priority": [

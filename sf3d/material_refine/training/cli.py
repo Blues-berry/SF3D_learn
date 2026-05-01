@@ -366,6 +366,7 @@ def build_parser(config_defaults: dict[str, Any]) -> argparse.ArgumentParser:
             "gain_render_guarded",
             "variant_balanced_gain_render_guarded",
             "hybrid_potential_gain_render_guarded",
+            "withprior_gap_gain_render_guarded",
         ],
         default="hybrid_potential_gain_render_guarded",
     )
